@@ -76,8 +76,11 @@ jobs:
         include:
           # lib: the library file this job builds; out: what it publishes (the file, or
           # the whole framework on macOS), relative to addons/goo2d/bin/.
+          # ubuntu-22.04, not ubuntu-latest: the library needs the glibc of the image it
+          # is built on (2.35 here), and one built on a newer image does not load on
+          # older systems. tools/check_kernel_image.py refuses a newer need.
           - name: linux-x86_64
-            os: ubuntu-latest
+            os: ubuntu-22.04
             lib: libgoo2d_kernel.linux.x86_64-unknown-linux-gnu.so
             out: libgoo2d_kernel.linux.x86_64-unknown-linux-gnu.so
           - name: windows-x86_64

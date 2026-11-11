@@ -9,12 +9,16 @@ the dynamic loader on Linux. Such an image betrays itself at its ends. A PE
 file must end where its last section ends and, with --built-after (seconds
 since the epoch; the job's start), be linked no earlier than that. An ELF file
 must hold its section header table within the file, ending at its last byte,
-and have a dynamic section. A Mach-O file (a universal binary or a single
+and have a dynamic section, and must not ask for a glibc newer than
+MAX_GLIBC (a library built on a newer runner image than that does not load on
+older systems: "version `GLIBC_2.43' not found"; kernel.yml builds on
+ubuntu-22.04 for that reason). A Mach-O file (a universal binary or a single
 slice) must carry a Mach-O magic. Anything else only has to be non-empty.
 
     python3 tools/check_kernel_image.py --built-after $(date +%s) path/to/library
 """
 import argparse
+import re
 import struct
 import sys
 import time
@@ -43,6 +47,16 @@ def check_pe(data: bytes, built_after: float, path: str) -> list[str]:
     return problems
 
 
+# The newest glibc a published Linux library may need: ubuntu-22.04's.
+MAX_GLIBC = (2, 35)
+
+
+def glibc_needed(data: bytes) -> tuple[int, int]:
+    """The newest GLIBC_x.y symbol version named in an ELF image, (0, 0) for none."""
+    versions = [(int(a), int(b)) for a, b in re.findall(rb"GLIBC_(\d+)\.(\d+)", data)]
+    return max(versions, default=(0, 0))
+
+
 def check_elf(data: bytes, path: str) -> list[str]:
     problems: list[str] = []
     if data[4] != 2 or data[5] != 1:
@@ -63,6 +77,12 @@ def check_elf(data: bytes, path: str) -> list[str]:
                 has_dynamic = True
     if not has_dynamic:
         problems.append(f"{path}: no dynamic section")
+    needed = glibc_needed(data)
+    if needed > MAX_GLIBC:
+        problems.append(
+            f"{path}: needs glibc {needed[0]}.{needed[1]}, newer than {MAX_GLIBC[0]}.{MAX_GLIBC[1]}:"
+            " build it on an older image"
+        )
     return problems
 
 
