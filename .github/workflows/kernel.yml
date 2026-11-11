@@ -1,0 +1,333 @@
+name: Native kernel
+
+# Builds Goo2D's native kernel (addons/goo2d/native/, a Rust GDExtension) for every desktop
+# platform on every push, and publishes the libraries as goo2d-kernel.zip (holding
+# addons/goo2d/bin/, the names addons/goo2d/goo2d.gdextension loads) plus its SHA-256:
+#
+# - a push to a branch updates that branch's rolling pre-release, tagged
+#   kernel-<branch> (every character outside [A-Za-z0-9._-] becomes '-', so
+#   claude/feature becomes kernel-claude-feature), whose tag is moved to the commit;
+# - a push of a tag v<crate version> (addons/goo2d/native/Cargo.toml) publishes a proper
+#   release of that tag;
+# - a manual run (workflow_dispatch) builds the zip as a workflow artifact, or publishes to
+#   the tag it is given.
+#
+# A branch build also commits the libraries back to the branch (addons/goo2d/bin/, one bot
+# commit, skipped when nothing changed), so a clone carries every platform's library and
+# needs no cargo unless it changes the Rust. tools/install_native.sh is the way to get the
+# zip into a checkout that does not have them (an old one, or one where cargo overwrote
+# them): by default the current branch's rolling build (falling back to kernel-main), or
+# the tag written in .goo2d-kernel-version. Every build also uploads the per-platform
+# libraries and the zip as workflow artifacts (90 days, for the run's commit).
+#
+# Only pushes that touch the kernel's sources, its .gdextension, the build script, the
+# check and load-test scripts, the Godot installer or this workflow build (paths below): a
+# commit that leaves them alone leaves the branch's pre-release as it was, which is still
+# the right library for it. Tag pushes always build.
+#
+# Every job uploads only the library it built (staged alone under out/), and the jobs
+# that gather them start from an empty addons/goo2d/bin/ and verify each library's
+# SHA-256 against the one its build job wrote (tools/verify_kernel_bin.sh). When every
+# job uploaded its whole checkout of addons/goo2d/bin/, three artifacts overlapping on
+# every file were extracted into one directory at once and the writers interleaved: the
+# committed libraries were mixtures of a fresh library and a stale one ("Error 1114" on
+# Windows, a crash in the dynamic loader on Linux). Each library is also checked as an
+# image (tools/check_kernel_image.py) and loaded by the real Godot of .godot-version on
+# its runner (tools/kernel_smoke.gd), so one that would not load fails the build instead.
+#
+# Web (wasm32-unknown-emscripten with godot-rust's experimental-wasm feature) is not built
+# yet: see docs/upstream-notes.md, "Native kernel builds".
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+    paths:
+      - "addons/goo2d/native/**"
+      - "addons/goo2d/goo2d.gdextension"
+      - "tools/build_native.sh"
+      - "tools/install_godot.sh"
+      - "tools/check_kernel_image.py"
+      - "tools/verify_kernel_bin.sh"
+      - "tools/kernel_smoke.gd"
+      - ".github/workflows/kernel.yml"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to create or update (empty: build the zip as a workflow artifact only)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+# One build per ref at a time; a newer push cancels the one in flight.
+concurrency:
+  group: kernel-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          # lib: the library file this job builds; out: what it publishes (the file, or
+          # the whole framework on macOS), relative to addons/goo2d/bin/.
+          - name: linux-x86_64
+            os: ubuntu-latest
+            lib: libgoo2d_kernel.linux.x86_64-unknown-linux-gnu.so
+            out: libgoo2d_kernel.linux.x86_64-unknown-linux-gnu.so
+          - name: windows-x86_64
+            os: windows-latest
+            lib: libgoo2d_kernel.windows.x86_64-pc-windows-msvc.dll
+            out: libgoo2d_kernel.windows.x86_64-pc-windows-msvc.dll
+          - name: macos-universal
+            os: macos-latest
+            lib: libgoo2d_kernel.macos.framework/libgoo2d_kernel.macos.dylib
+            out: libgoo2d_kernel.macos.framework
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.name == 'macos-universal' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - name: Cache cargo registry and target/
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: addons/goo2d/native -> target
+          key: kernel-${{ matrix.name }}
+
+      # The crate's own outputs from the restored cache go: the dependencies stay
+      # cached, the kernel itself is compiled and linked from nothing.
+      - name: Forget the crate's cached outputs
+        id: start
+        run: |
+          set -euo pipefail
+          echo "epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
+          if [ -d addons/goo2d/native/target ]; then
+            find addons/goo2d/native/target -depth \( -name 'goo2d_kernel*' -o -name 'libgoo2d_kernel*' \) -print -exec rm -rf {} +
+          fi
+
+      # build_native.sh builds this runner's library and copies it into addons/goo2d/bin/
+      # under the .gdextension's name (on Windows, Git Bash's uname is MINGW64_NT-*-x86_64
+      # and cargo's default target is x86_64-pc-windows-msvc).
+      - name: Build the kernel
+        run: bash tools/build_native.sh
+
+      # macOS: build_native.sh made the framework (dylib + Info.plist) for the runner's arch
+      # (arm64); add the x86_64 slice so one framework serves both.
+      - name: Make the macOS framework universal
+        if: matrix.name == 'macos-universal'
+        run: |
+          set -euo pipefail
+          cd addons/goo2d/native
+          cargo build --release --target aarch64-apple-darwin
+          cargo build --release --target x86_64-apple-darwin
+          cd "$GITHUB_WORKSPACE"
+          DYLIB=addons/goo2d/bin/libgoo2d_kernel.macos.framework/libgoo2d_kernel.macos.dylib
+          lipo -create \
+            addons/goo2d/native/target/aarch64-apple-darwin/release/libgoo2d_kernel.dylib \
+            addons/goo2d/native/target/x86_64-apple-darwin/release/libgoo2d_kernel.dylib \
+            -output "$DYLIB"
+          install_name_tool -id "@rpath/libgoo2d_kernel.macos.dylib" "$DYLIB"
+          codesign --force --sign - --timestamp=none "$DYLIB"
+          lipo -info "$DYLIB"
+
+      - name: List the library
+        run: ls -laR addons/goo2d/bin
+
+      # Only the library this job built: the checkout still holds the other platforms'.
+      - name: Check the image
+        run: python3 tools/check_kernel_image.py --built-after "${{ steps.start.outputs.epoch }}" "addons/goo2d/bin/${{ matrix.lib }}"
+
+      # The real Godot loads it: the GDExtension registers GooKernel, a ring steps.
+      - name: Load the kernel in Godot
+        run: |
+          set -euo pipefail
+          GODOT="$(bash tools/install_godot.sh | tail -n 1)"
+          # The extension list seeded first (a fresh .godot/ crashes at the end of an import
+          # that discovers one, see CLAUDE.md), then the import: the class cache the
+          # scripts' class_names need.
+          mkdir -p .godot
+          echo "res://addons/goo2d/goo2d.gdextension" > .godot/extension_list.cfg
+          "$GODOT" --headless --path . --import
+          "$GODOT" --headless --path . -s tools/kernel_smoke.gd
+
+      # Only this job's library goes up, with its checksum, staged alone so the artifact
+      # holds nothing of the checkout's other platforms.
+      - name: Stage the library
+        run: |
+          set -euo pipefail
+          rm -rf out && mkdir -p out/addons/goo2d/bin
+          cp -R "addons/goo2d/bin/${{ matrix.out }}" out/addons/goo2d/bin/
+          cd out/addons/goo2d/bin
+          sha256sum "${{ matrix.lib }}" > "${{ matrix.name }}.sha256"
+          cat "${{ matrix.name }}.sha256"
+          ls -laR .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: goo2d-kernel-${{ matrix.name }}
+          path: out/addons/goo2d/bin/
+          if-no-files-found: error
+
+  package:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # Where this build goes: a release of the pushed tag, the tag given by hand, or the
+      # branch's rolling pre-release (empty: artifact only).
+      - name: Pick the tag
+        id: tag
+        run: |
+          set -euo pipefail
+          ROLLING=false
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ inputs.tag }}"
+          elif [ "${{ github.ref_type }}" = "tag" ]; then
+            TAG="${{ github.ref_name }}"
+          else
+            TAG="kernel-$(printf '%s' "${{ github.ref_name }}" | tr -c 'A-Za-z0-9._-' '-')"
+            ROLLING=true
+          fi
+          if [ -n "$TAG" ] && [ "$ROLLING" = false ]; then
+            CRATE="v$(sed -n 's/^version = "\(.*\)"/\1/p' addons/goo2d/native/Cargo.toml | head -n 1)"
+            if [ "$TAG" != "$CRATE" ]; then
+              echo "::error::tag $TAG does not match the crate's version $CRATE (addons/goo2d/native/Cargo.toml)"
+              exit 1
+            fi
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "rolling=$ROLLING" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG rolling=$ROLLING"
+
+      # The checkout's libraries go first: the artifacts must land in an empty directory.
+      - name: Empty addons/goo2d/bin/
+        run: rm -rf addons/goo2d/bin && mkdir -p addons/goo2d/bin
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: goo2d-kernel-*
+          path: addons/goo2d/bin
+          merge-multiple: true
+
+      - name: Verify the libraries
+        run: bash tools/verify_kernel_bin.sh
+
+      - name: Zip addons/goo2d/bin/
+        run: |
+          set -euo pipefail
+          echo "$GITHUB_SHA" > addons/goo2d/bin/kernel-commit.txt
+          ls -laR addons/goo2d/bin
+          zip -r -X goo2d-kernel.zip addons/goo2d/bin
+          sha256sum goo2d-kernel.zip > goo2d-kernel.zip.sha256
+          cat goo2d-kernel.zip.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: goo2d-kernel
+          path: |
+            goo2d-kernel.zip
+            goo2d-kernel.zip.sha256
+
+      # A branch's rolling pre-release: move its tag to this commit, then replace the assets.
+      - name: Update the branch's rolling pre-release
+        if: steps.tag.outputs.rolling == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          NOTES="Rolling build of the native kernel for branch \`$BRANCH\`, from commit $GITHUB_SHA. Replaced on every push that touches the kernel. Download with \`bash tools/install_native.sh\` on that branch."
+          # The tag is moved through the Releases API, not `git push -f refs/tags/...`: GitHub
+          # refuses a GITHUB_TOKEN push of a ref whose new commits touch .github/workflows/
+          # ("without `workflows` permission"), which every workflow edit on the branch would
+          # trigger. Deleting the rolling release with its tag and creating it again at this
+          # commit has no such check; the release is a rolling one, nothing of it is kept.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release delete "$TAG" --cleanup-tag --yes
+          fi
+          gh release create "$TAG" goo2d-kernel.zip goo2d-kernel.zip.sha256 \
+            --target "$GITHUB_SHA" --prerelease --title "Goo2D kernel: $BRANCH" --notes "$NOTES"
+
+      # A versioned release (a v* tag, or a tag given by hand).
+      - name: Attach to the release
+        if: steps.tag.outputs.tag != '' && steps.tag.outputs.rolling != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" goo2d-kernel.zip goo2d-kernel.zip.sha256 --clobber
+          else
+            gh release create "$TAG" goo2d-kernel.zip goo2d-kernel.zip.sha256 \
+              --target "$GITHUB_SHA" --title "Goo2D kernel $TAG" --generate-notes
+          fi
+
+  # A branch push: commit the libraries back to the branch so the repository carries them.
+  # The commit touches only addons/goo2d/bin/, which this workflow's path filter ignores, and
+  # carries the skip-ci marker so ci.yml does not run a second time for the same sources.
+  # (That marker skips every workflow of a push whose head commit mentions it: never write
+  # it in a commit message by hand.)
+  commit:
+    name: commit the libraries to the branch
+    needs: package
+    if: github.event_name == 'push' && github.ref_type == 'branch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+
+      # The checkout's libraries go first: the artifacts must land in an empty directory.
+      - name: Empty addons/goo2d/bin/
+        run: rm -rf addons/goo2d/bin && mkdir -p addons/goo2d/bin
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: goo2d-kernel-*
+          path: addons/goo2d/bin
+          merge-multiple: true
+
+      - name: Verify the libraries
+        run: bash tools/verify_kernel_bin.sh
+
+      - name: Commit addons/goo2d/bin/ when it changed
+        env:
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          echo "$GITHUB_SHA" > addons/goo2d/bin/kernel-commit.txt
+          git add -A addons/goo2d/bin
+          if git diff --cached --quiet; then
+            echo "the libraries are unchanged; nothing to commit"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "kernel: libraries built from ${GITHUB_SHA:0:12} [skip ci]"
+          for attempt in 1 2 3 4 5; do
+            if git push origin "HEAD:$BRANCH"; then
+              exit 0
+            fi
+            echo "push rejected (the branch moved); rebasing and retrying ($attempt)"
+            git pull --rebase origin "$BRANCH"
+          done
+          echo "::error::could not push the libraries to $BRANCH"
+          exit 1

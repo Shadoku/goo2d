@@ -1,0 +1,142 @@
+[gd_scene format=3]
+
+[ext_resource type="Script" path="res://examples/shaders/shaders.gd" id="1_example"]
+[ext_resource type="Script" path="res://examples/shaders/shaders_world.gd" id="2_world"]
+[ext_resource type="Shader" path="res://assets/goo/cel.gdshader" id="3_cel"]
+[ext_resource type="Shader" path="res://assets/goo/gem.gdshader" id="4_gem"]
+[ext_resource type="Shader" path="res://assets/shaders/backdrop.gdshader" id="5_backdrop"]
+
+[sub_resource type="ShaderMaterial" id="ShaderMaterial_backdrop"]
+shader = ExtResource("5_backdrop")
+
+[sub_resource type="PhysicsMaterial" id="PhysicsMaterial_walls"]
+friction = 0.4
+bounce = 0.3
+
+[sub_resource type="RectangleShape2D" id="RectangleShape2D_floor"]
+size = Vector2(608, 40)
+
+[sub_resource type="RectangleShape2D" id="RectangleShape2D_wall"]
+size = Vector2(24, 860)
+
+[node name="Shaders" type="Node2D"]
+script = ExtResource("1_example")
+
+[node name="Backdrop" type="ColorRect" parent="."]
+top_level = true
+z_index = -1
+material = SubResource("ShaderMaterial_backdrop")
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+mouse_filter = 2
+color = Color(0.06, 0.06, 0.1, 1)
+
+[node name="GooWalls" type="StaticBody2D" parent="."]
+collision_mask = 0
+physics_material_override = SubResource("PhysicsMaterial_walls")
+
+[node name="Floor" type="CollisionShape2D" parent="GooWalls"]
+position = Vector2(330, 1020)
+shape = SubResource("RectangleShape2D_floor")
+
+[node name="LeftWall" type="CollisionShape2D" parent="GooWalls"]
+position = Vector2(38, 570)
+shape = SubResource("RectangleShape2D_wall")
+
+[node name="RightWall" type="CollisionShape2D" parent="GooWalls"]
+position = Vector2(622, 570)
+shape = SubResource("RectangleShape2D_wall")
+
+[node name="Visual" type="Polygon2D" parent="GooWalls"]
+color = Color(0.32, 0.29, 0.38, 1)
+polygon = PackedVector2Array(26, 140, 50, 140, 50, 1000, 610, 1000, 610, 140, 634, 140, 634, 1040, 26, 1040)
+
+[node name="CelWalls" type="StaticBody2D" parent="."]
+collision_mask = 0
+physics_material_override = SubResource("PhysicsMaterial_walls")
+
+[node name="Floor" type="CollisionShape2D" parent="CelWalls"]
+position = Vector2(960, 1020)
+shape = SubResource("RectangleShape2D_floor")
+
+[node name="LeftWall" type="CollisionShape2D" parent="CelWalls"]
+position = Vector2(668, 570)
+shape = SubResource("RectangleShape2D_wall")
+
+[node name="RightWall" type="CollisionShape2D" parent="CelWalls"]
+position = Vector2(1252, 570)
+shape = SubResource("RectangleShape2D_wall")
+
+[node name="Visual" type="Polygon2D" parent="CelWalls"]
+color = Color(0.32, 0.29, 0.38, 1)
+polygon = PackedVector2Array(656, 140, 680, 140, 680, 1000, 1240, 1000, 1240, 140, 1264, 140, 1264, 1040, 656, 1040)
+
+[node name="GemWalls" type="StaticBody2D" parent="."]
+collision_mask = 0
+physics_material_override = SubResource("PhysicsMaterial_walls")
+
+[node name="Floor" type="CollisionShape2D" parent="GemWalls"]
+position = Vector2(1590, 1020)
+shape = SubResource("RectangleShape2D_floor")
+
+[node name="LeftWall" type="CollisionShape2D" parent="GemWalls"]
+position = Vector2(1298, 570)
+shape = SubResource("RectangleShape2D_wall")
+
+[node name="RightWall" type="CollisionShape2D" parent="GemWalls"]
+position = Vector2(1882, 570)
+shape = SubResource("RectangleShape2D_wall")
+
+[node name="Visual" type="Polygon2D" parent="GemWalls"]
+color = Color(0.32, 0.29, 0.38, 1)
+polygon = PackedVector2Array(1286, 140, 1310, 140, 1310, 1000, 1870, 1000, 1870, 140, 1894, 140, 1894, 1040, 1286, 1040)
+
+[node name="GooWorld" type="Node2D" parent="."]
+script = ExtResource("2_world")
+
+[node name="CelWorld" type="Node2D" parent="."]
+script = ExtResource("2_world")
+skin_shader = ExtResource("3_cel")
+
+[node name="GemWorld" type="Node2D" parent="."]
+script = ExtResource("2_world")
+skin_shader = ExtResource("4_gem")
+
+[node name="UI" type="CanvasLayer" parent="."]
+
+[node name="Label" type="Label" parent="UI"]
+offset_left = 16.0
+offset_top = 16.0
+offset_right = 1904.0
+offset_bottom = 40.0
+text = "Left: the addon's goo (addons/goo2d/goo.gdshader)   Middle: assets/goo/cel.gdshader   Right: assets/goo/gem.gdshader   Click: drop in a column   R: reset"
+
+[node name="GooTitle" type="Label" parent="UI"]
+offset_left = 50.0
+offset_top = 92.0
+offset_right = 610.0
+offset_bottom = 128.0
+theme_override_font_sizes/font_size = 26
+text = "goo (the addon's)"
+horizontal_alignment = 1
+
+[node name="CelTitle" type="Label" parent="UI"]
+offset_left = 680.0
+offset_top = 92.0
+offset_right = 1240.0
+offset_bottom = 128.0
+theme_override_font_sizes/font_size = 26
+text = "cel"
+horizontal_alignment = 1
+
+[node name="GemTitle" type="Label" parent="UI"]
+offset_left = 1310.0
+offset_top = 92.0
+offset_right = 1870.0
+offset_bottom = 128.0
+theme_override_font_sizes/font_size = 26
+text = "gem"
+horizontal_alignment = 1

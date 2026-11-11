@@ -1,0 +1,17 @@
+{
+  "skill_name": "godot-project",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "Start a new Godot 4 project for a 2D top-down game called Dungeon Delve in ./dungeon_delve. I want to be able to have you write features and verify them without me opening the editor every time.",
+      "expected_output": "A scaffolded project with project.godot, tests/framework, tools/check.py, CLAUDE.md, CI workflow; check.py run and reported as CHECK: PASS.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "Add an Inventory class to my godot project: fixed capacity, add/remove items by name, count(name), and a signal when it changes. Make sure it actually works.",
+      "expected_output": "src/inventory.gd plus tests/unit/test_inventory.gd covering capacity, add/remove, count, signal; check.py run ending in CHECK: PASS with the TESTS line quoted.",
+      "files": []
+    }
+  ]
+}

@@ -1,0 +1,17 @@
+[package]
+name = "goo2d_kernel"
+version = "0.2.0"
+edition = "2021"
+description = "Goo2D's native kernel: the goo's per-frame math as a Godot GDExtension (godot-rust)."
+license = "MIT"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+godot = { version = "0.5", features = ["api-4-7"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"

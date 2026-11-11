@@ -1,0 +1,27 @@
+; Goo2D's native kernel (GooKernel), built from addons/goo2d/native/ by tools/build_native.sh.
+; bin/ is not committed: tools/build_native.sh builds this machine's library (linux x86_64 or
+; arm64, macos, windows x86_64), tools/install_native.sh downloads the ones
+; .github/workflows/release.yml attaches to a release (linux x86_64, windows x86_64, a macos
+; universal framework). Only the running platform's library has to exist. Names follow
+; lib<name>.<os>.<rust target triple>.<ext>. The web entries are for a build not made yet.
+
+[configuration]
+
+entry_symbol = "gdext_rust_init"
+compatibility_minimum = 4.7
+
+
+[libraries]
+
+linux.debug.x86_64 = "bin/libgoo2d_kernel.linux.x86_64-unknown-linux-gnu.so"
+linux.release.x86_64 = "bin/libgoo2d_kernel.linux.x86_64-unknown-linux-gnu.so"
+linux.debug.arm64 = "bin/libgoo2d_kernel.linux.aarch64-unknown-linux-gnu.so"
+linux.release.arm64 = "bin/libgoo2d_kernel.linux.aarch64-unknown-linux-gnu.so"
+windows.debug.x86_64 = "bin/libgoo2d_kernel.windows.x86_64-pc-windows-msvc.dll"
+windows.release.x86_64 = "bin/libgoo2d_kernel.windows.x86_64-pc-windows-msvc.dll"
+macos.debug = "bin/libgoo2d_kernel.macos.framework"
+macos.release = "bin/libgoo2d_kernel.macos.framework"
+web.debug.threads.wasm32 = "bin/goo2d_kernel.wasm"
+web.release.threads.wasm32 = "bin/goo2d_kernel.wasm"
+web.debug.wasm32 = "bin/wasm-nothreads/goo2d_kernel.wasm"
+web.release.wasm32 = "bin/wasm-nothreads/goo2d_kernel.wasm"

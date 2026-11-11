@@ -1,0 +1,91 @@
+[gd_scene format=3]
+
+[ext_resource type="Script" path="res://examples/tower/tower.gd" id="1_scene"]
+[ext_resource type="Script" path="res://examples/tower/tower_world.gd" id="2_world"]
+[ext_resource type="Script" path="res://examples/tower/slab.gd" id="3_slab"]
+[ext_resource type="Script" path="res://examples/tower/goal_line.gd" id="4_goal"]
+[ext_resource type="Script" path="res://examples/tower/hopper.gd" id="5_hopper"]
+[ext_resource type="Shader" path="res://assets/shaders/backdrop.gdshader" id="6_backdrop"]
+
+[sub_resource type="ShaderMaterial" id="ShaderMaterial_backdrop"]
+shader = ExtResource("6_backdrop")
+
+[sub_resource type="RectangleShape2D" id="RectangleShape2D_floor"]
+size = Vector2(1600, 60)
+
+[sub_resource type="RectangleShape2D" id="RectangleShape2D_platform"]
+size = Vector2(200, 220)
+
+[node name="Tower" type="Node2D"]
+script = ExtResource("1_scene")
+
+[node name="Backdrop" type="ColorRect" parent="."]
+top_level = true
+z_index = -1
+material = SubResource("ShaderMaterial_backdrop")
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+mouse_filter = 2
+color = Color(0.06, 0.06, 0.1, 1)
+
+[node name="Floor" type="StaticBody2D" parent="."]
+collision_mask = 0
+script = ExtResource("3_slab")
+color = Color(0.2, 0.18, 0.25, 1)
+edge_color = Color(0.36, 0.33, 0.44, 1)
+
+[node name="Shape" type="CollisionShape2D" parent="Floor"]
+position = Vector2(960, 1050)
+shape = SubResource("RectangleShape2D_floor")
+
+[node name="Platform" type="StaticBody2D" parent="."]
+collision_mask = 0
+script = ExtResource("3_slab")
+
+[node name="Shape" type="CollisionShape2D" parent="Platform"]
+position = Vector2(960, 910)
+shape = SubResource("RectangleShape2D_platform")
+
+[node name="World" type="Node2D" parent="."]
+script = ExtResource("2_world")
+platform_path = NodePath("../Platform")
+goal_line_path = NodePath("../GoalLine")
+
+[node name="GoalLine" type="Node2D" parent="."]
+position = Vector2(960, 450)
+script = ExtResource("4_goal")
+width = 700.0
+
+[node name="Hopper" type="Node2D" parent="."]
+position = Vector2(960, 230)
+script = ExtResource("5_hopper")
+
+[node name="UI" type="CanvasLayer" parent="."]
+
+[node name="Label" type="Label" parent="UI"]
+offset_left = 24.0
+offset_top = 16.0
+offset_right = 1896.0
+offset_bottom = 80.0
+theme_override_colors/font_color = Color(0.92, 0.92, 0.97, 1)
+theme_override_colors/font_outline_color = Color(0.03, 0.03, 0.06, 1)
+theme_override_constants/outline_size = 6
+theme_override_font_sizes/font_size = 22
+text = "Tower"
+
+[node name="Banner" type="Label" parent="UI"]
+visible = false
+offset_left = 360.0
+offset_top = 300.0
+offset_right = 1560.0
+offset_bottom = 380.0
+theme_override_colors/font_color = Color(0.55, 1, 0.62, 1)
+theme_override_colors/font_outline_color = Color(0.03, 0.03, 0.06, 1)
+theme_override_constants/outline_size = 12
+theme_override_font_sizes/font_size = 56
+text = "The tower stands!"
+horizontal_alignment = 1
+vertical_alignment = 1

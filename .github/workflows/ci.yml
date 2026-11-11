@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache Godot
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/godot
+          key: godot-${{ runner.os }}-${{ hashFiles('.godot-version') }}
+
+      - name: Install Godot
+        run: bash tools/install_godot.sh
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and the native kernel's target/
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: addons/goo2d/native -> target
+
+      - name: Install Xvfb and Mesa (for the render stage's real OpenGL renderer)
+        run: sudo apt-get update && sudo apt-get install -y xvfb libgl1-mesa-dri
+
+      - name: Run checks (build the native kernel, import, validate scripts, unit tests, smoke test, render under Xvfb)
+        run: python3 tools/check.py --junit junit.xml
+
+      - name: Upload test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit
+          path: junit.xml
+          if-no-files-found: ignore

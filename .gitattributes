@@ -1,0 +1,31 @@
+# Normalize line endings; Godot writes LF and diffs stay clean across OSes.
+* text=auto eol=lf
+*.gd text eol=lf
+*.tscn text eol=lf
+*.tres text eol=lf
+*.import text eol=lf
+*.uid text eol=lf
+*.cfg text eol=lf
+*.godot text eol=lf
+# Windows batch files need CRLF.
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
+# Binary assets
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.webp binary
+*.ogg binary
+*.mp3 binary
+*.wav binary
+*.ttf binary
+*.otf binary
+*.glb binary
+*.gltf binary
+
+# Goo2D's native kernel libraries (addons/goo2d/bin/, committed by kernel.yml)
+*.so binary
+*.dll binary
+*.dylib binary
+*.wasm binary

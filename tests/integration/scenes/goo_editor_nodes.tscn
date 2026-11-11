@@ -1,0 +1,29 @@
+[gd_scene format=3]
+
+[ext_resource type="Script" path="res://addons/goo2d/goo2d.gd" id="1_goo2d"]
+[ext_resource type="Script" path="res://addons/goo2d/goo_world_2d.gd" id="2_world"]
+
+[sub_resource type="RectangleShape2D" id="RectangleShape2D_floor"]
+size = Vector2(1200, 40)
+
+[node name="GooEditorNodes" type="Node2D"]
+
+[node name="Floor" type="StaticBody2D" parent="."]
+position = Vector2(600, 600)
+
+[node name="Shape" type="CollisionShape2D" parent="Floor"]
+shape = SubResource("RectangleShape2D_floor")
+
+[node name="World" type="Node2D" parent="."]
+script = ExtResource("2_world")
+
+[node name="Round" type="Node2D" parent="World"]
+position = Vector2(400, 300)
+script = ExtResource("1_goo2d")
+radius = 40.0
+
+[node name="Square" type="Node2D" parent="World"]
+position = Vector2(700, 300)
+script = ExtResource("1_goo2d")
+radius = 40.0
+sides = 4

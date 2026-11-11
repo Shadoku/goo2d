@@ -1,0 +1,66 @@
+[gd_scene format=3]
+
+[ext_resource type="Script" path="res://src/arena.gd" id="1_arena"]
+[ext_resource type="Script" path="res://src/blade.gd" id="2_blade"]
+
+[sub_resource type="PhysicsMaterial" id="PhysicsMaterial_walls"]
+friction = 0.4
+bounce = 0.3
+
+[sub_resource type="RectangleShape2D" id="RectangleShape2D_floor"]
+size = Vector2(1680, 40)
+
+[sub_resource type="RectangleShape2D" id="RectangleShape2D_wall"]
+size = Vector2(40, 880)
+
+[sub_resource type="ConvexPolygonShape2D" id="ConvexPolygonShape2D_wedge"]
+points = PackedVector2Array(-40, 0, 40, 0, 0, -140)
+
+[node name="Arena" type="StaticBody2D"]
+collision_mask = 0
+physics_material_override = SubResource("PhysicsMaterial_walls")
+script = ExtResource("1_arena")
+
+[node name="Floor" type="CollisionShape2D" parent="."]
+position = Vector2(960, 1020)
+shape = SubResource("RectangleShape2D_floor")
+
+[node name="LeftWall" type="CollisionShape2D" parent="."]
+position = Vector2(140, 560)
+shape = SubResource("RectangleShape2D_wall")
+
+[node name="RightWall" type="CollisionShape2D" parent="."]
+position = Vector2(1780, 560)
+shape = SubResource("RectangleShape2D_wall")
+
+[node name="Wedge" type="CollisionShape2D" parent="."]
+position = Vector2(1300, 1000)
+shape = SubResource("ConvexPolygonShape2D_wedge")
+
+[node name="FloorVisual" type="Polygon2D" parent="."]
+color = Color(0.32, 0.29, 0.38, 1)
+polygon = PackedVector2Array(120, 1000, 1800, 1000, 1800, 1040, 120, 1040)
+
+[node name="LeftWallVisual" type="Polygon2D" parent="."]
+color = Color(0.32, 0.29, 0.38, 1)
+polygon = PackedVector2Array(120, 120, 160, 120, 160, 1000, 120, 1000)
+
+[node name="RightWallVisual" type="Polygon2D" parent="."]
+color = Color(0.32, 0.29, 0.38, 1)
+polygon = PackedVector2Array(1760, 120, 1800, 120, 1800, 1000, 1760, 1000)
+
+[node name="WedgeVisual" type="Polygon2D" parent="."]
+color = Color(0.32, 0.29, 0.38, 1)
+polygon = PackedVector2Array(1260, 1000, 1340, 1000, 1300, 860)
+
+[node name="FloorBlade" type="StaticBody2D" parent="."]
+position = Vector2(700, 1000)
+collision_mask = 0
+script = ExtResource("2_blade")
+
+[node name="WallBlade" type="StaticBody2D" parent="."]
+position = Vector2(160, 600)
+rotation = 1.5707964
+collision_mask = 0
+script = ExtResource("2_blade")
+length = 100.0

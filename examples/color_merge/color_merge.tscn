@@ -1,0 +1,77 @@
+[gd_scene format=3]
+
+[ext_resource type="Script" path="res://examples/color_merge/color_merge.gd" id="1_scene"]
+[ext_resource type="Script" path="res://examples/color_merge/color_merge_world.gd" id="2_world"]
+[ext_resource type="Shader" path="res://assets/shaders/backdrop.gdshader" id="3_backdrop"]
+
+[sub_resource type="ShaderMaterial" id="ShaderMaterial_backdrop"]
+shader = ExtResource("3_backdrop")
+
+[sub_resource type="PhysicsMaterial" id="PhysicsMaterial_walls"]
+friction = 0.4
+bounce = 0.3
+
+[sub_resource type="RectangleShape2D" id="RectangleShape2D_floor"]
+size = Vector2(1480, 40)
+
+[sub_resource type="RectangleShape2D" id="RectangleShape2D_wall"]
+size = Vector2(40, 780)
+
+[node name="ColorMerge" type="Node2D"]
+script = ExtResource("1_scene")
+
+[node name="Backdrop" type="ColorRect" parent="."]
+top_level = true
+z_index = -1
+material = SubResource("ShaderMaterial_backdrop")
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+mouse_filter = 2
+color = Color(0.06, 0.06, 0.1, 1)
+
+[node name="Walls" type="StaticBody2D" parent="."]
+collision_mask = 0
+physics_material_override = SubResource("PhysicsMaterial_walls")
+
+[node name="Floor" type="CollisionShape2D" parent="Walls"]
+position = Vector2(960, 1020)
+shape = SubResource("RectangleShape2D_floor")
+
+[node name="LeftWall" type="CollisionShape2D" parent="Walls"]
+position = Vector2(240, 650)
+shape = SubResource("RectangleShape2D_wall")
+
+[node name="RightWall" type="CollisionShape2D" parent="Walls"]
+position = Vector2(1680, 650)
+shape = SubResource("RectangleShape2D_wall")
+
+[node name="FloorVisual" type="Polygon2D" parent="Walls"]
+color = Color(0.32, 0.29, 0.38, 1)
+polygon = PackedVector2Array(220, 1000, 1700, 1000, 1700, 1040, 220, 1040)
+
+[node name="LeftWallVisual" type="Polygon2D" parent="Walls"]
+color = Color(0.32, 0.29, 0.38, 1)
+polygon = PackedVector2Array(220, 260, 260, 260, 260, 1000, 220, 1000)
+
+[node name="RightWallVisual" type="Polygon2D" parent="Walls"]
+color = Color(0.32, 0.29, 0.38, 1)
+polygon = PackedVector2Array(1660, 260, 1700, 260, 1700, 1000, 1660, 1000)
+
+[node name="World" type="Node2D" parent="."]
+script = ExtResource("2_world")
+
+[node name="UI" type="CanvasLayer" parent="."]
+
+[node name="Label" type="Label" parent="UI"]
+offset_left = 24.0
+offset_top = 16.0
+offset_right = 1896.0
+offset_bottom = 80.0
+theme_override_colors/font_color = Color(0.92, 0.92, 0.97, 1)
+theme_override_colors/font_outline_color = Color(0.03, 0.03, 0.06, 1)
+theme_override_constants/outline_size = 6
+theme_override_font_sizes/font_size = 22
+text = "Color merge"
