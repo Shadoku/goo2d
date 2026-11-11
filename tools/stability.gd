@@ -51,6 +51,15 @@ extends SceneTree
 ##   game (seed 1: 165 merges and 29 explosions, or 96 and none), so compare
 ##   `births` run alone (it then starts on the same frame as the old
 ##   tools/births.gd did), over several seeds.
+## - resize (only when named): the births game (same seed, RESIZE_FRAMES frames)
+##   with the bodies resized and deformed while it plays: every RESIZE_EVERY
+##   frames one body, picked with the seeded rng, is told a new size anywhere in
+##   the goo's range up to RESIZE_LARGEST of the largest (Goo2D.resize(), a
+##   random time), and every frame every RESIZE_DEFORMED-th body squashes along
+##   its rest horizontal and pulses its area (Goo2D.set_rest_deform()). Counts
+##   what births counts (explosions, tangled bodies, births gone wrong), plus
+##   the resizes asked, the rings rebuilt (GooWorld2D.body_rebuilt) and the
+##   splits and merges.
 ## - scale (only when named): the length unit's gate (docs/tiled-boards-plan.md,
 ##   step 1): the smallest blob's rebound from a 500 px drop, the time blobs take
 ##   to settle on the floor after it, and whether launch-size blobs dropped on
@@ -116,6 +125,7 @@ func _run(scenarios: Array[String]) -> void:
 			"impale_pile": await _impale_pile()
 			"births": await _births()
 			"scale": await _scale()
+			"resize": await _resize_game()
 			_: push_error("stability: unknown scenario %s" % scenario)
 		_print_skin_counts()
 	quit(0)
@@ -863,3 +873,62 @@ static func _lowest_bead(body: Goo2D) -> float:
 	for point: Vector2 in body.bead_points():
 		lowest = maxf(lowest, point.y + body.bead_radius())
 	return lowest
+
+# ---- resize ----
+
+## Frames the resize scenario plays.
+const RESIZE_FRAMES: int = 3000
+## Frames between two resizes of a random body.
+const RESIZE_EVERY: int = 10
+## Largest size a resize asks for, as a fraction of GooTuning.max_radius(): the
+## arena holds a few bodies that big, not forty.
+const RESIZE_LARGEST: float = 0.6
+## Every this many-th body (by id) is deformed every frame.
+const RESIZE_DEFORMED: int = 3
+
+func _resize_game() -> void:
+	await _reset()
+	var watcher := StepWatcher.new()
+	watcher.check = _check_births
+	watcher.process_physics_priority = 1000
+	root.add_child(watcher)
+	var on_merged := func(r: float, p: Vector2) -> void: _on_birth_event("merge", "merged radius %.0f at %s" % [r, p])
+	var on_split := func(a: float, b: float, p: Vector2) -> void: _on_birth_event("split", "split into %.0f and %.0f at %s" % [a, b, p])
+	var on_trimmed := func(r: float, p: Vector2) -> void: _on_birth_event("trim", "trimmed to %.0f at %s" % [r, p])
+	var rebuilt := [0]
+	var on_rebuilt := func(_body: Goo2D) -> void: rebuilt[0] += 1
+	_game.merged.connect(on_merged)
+	_game.split.connect(on_split)
+	_game.trimmed.connect(on_trimmed)
+	_game.body_rebuilt.connect(on_rebuilt)
+	_reset_birth_counts()
+	_watching_births = true
+	var rng := RandomNumberGenerator.new()
+	rng.seed = _birth_seed
+	var resizes := 0
+	for f: int in RESIZE_FRAMES:
+		await physics_frame
+		if f % 24 == 0 and _game.bodies().size() < 30:
+			var radius := rng.randf_range(DropController.drop_min_radius(), DropController.drop_max_radius())
+			var roll := rng.randf()
+			var shape: GooShape = GooShape.regular(4, radius) if roll < 0.2 else (GooShape.regular(3, radius) if roll < 0.35 else null)
+			_game.spawn(radius, _at(Vector2(rng.randf_range(Arena.INNER_LEFT + 100.0, Arena.INNER_RIGHT - 100.0), Arena.DROP_Y)), shape)
+		var bodies := _game.bodies()
+		if f % RESIZE_EVERY == 0 and not bodies.is_empty():
+			var body: Goo2D = bodies[rng.randi_range(0, bodies.size() - 1)]
+			body.resize(rng.randf_range(GooTuning.min_radius(), RESIZE_LARGEST * GooTuning.max_radius()), rng.randf_range(0.0, 1.0))
+			resizes += 1
+		for body: Goo2D in bodies:
+			if body.id % RESIZE_DEFORMED == 0:
+				var phase := f / 60.0 * TAU * 1.5 + body.id
+				body.set_rest_deform(1.0 + 0.35 * sin(phase), Vector2.RIGHT, 1.0 + 0.2 * cos(phase))
+	_watching_births = false
+	_game.merged.disconnect(on_merged)
+	_game.split.disconnect(on_split)
+	_game.trimmed.disconnect(on_trimmed)
+	_game.body_rebuilt.disconnect(on_rebuilt)
+	watcher.queue_free()
+	print("resize: seed %d, %d frames, %d resizes asked, %d rings rebuilt, %d bodies at the end, %d merges, %d splits, %d trims; %d bodies tangled at some point; %d explosions (%d with a bead over %.0f px/s, %d with a jump over %.0f px/s in a frame); %d births gone wrong; speed cap acted in %d frames, %d velocities clamped"
+		% [_birth_seed, RESIZE_FRAMES, resizes, rebuilt[0], _game.bodies().size(), _merges, _splits, _trims, _tangled_bodies,
+			_explosions, _explosions_speed, _u(EXPLODE_SPEED), _explosions_jump, _u(EXPLODE_JUMP), _births_wrong.size(),
+			_capped_frames, _capped_velocities])
