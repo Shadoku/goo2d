@@ -410,6 +410,118 @@ impl Kernel {
         self.find(key).map(move |i| &mut self.rings[i])
     }
 
+    // ---- Resizing and rest deformation (Goo2D.resize(), Goo2D.set_rest_deform()) ----
+
+    /// Gives ring `key` a new rest shape in place, without rebuilding it: `rest` (one point
+    /// per bead, about its centroid, as add_ring() takes it) becomes what shape matching
+    /// pulls toward, its neighbour and next-but-one distances the skin and bending rest
+    /// lengths of the rest shape (still blended with the placed loop's by `rest_blend`), its
+    /// hull depths the pinch scan's rest depths (only for a ring built with some: a round
+    /// ring has none), and with a `bead_radius` above 0 every bead's collision radius is
+    /// that, `min_neck_rest` following it in proportion. The particles stay where they are:
+    /// the constraints pull them into the new shape over the next steps. Cheap (one pass over
+    /// the ring), so a game may call it every frame. False, with an error, for a rest of
+    /// another length.
+    pub fn set_rest(&mut self, key: i64, rest: Vec<Vector2>, bead_radius: f64) -> bool {
+        let Some(idx) = self.find(key) else { return false };
+        let r = &mut self.rings[idx];
+        let n = r.n;
+        if rest.len() != n || n < 3 {
+            godot::global::godot_error!("GooKernel.set_rest(): {} rest points for a ring of {} beads", rest.len(), n);
+            return false;
+        }
+        r.shape_edges = (0..n).map(|i| dist(rest[i], rest[(i + 1) % n])).collect();
+        r.shape_bend = (0..n).map(|i| dist(rest[i], rest[(i + 2) % n])).collect();
+        if !r.rest_depths.is_empty() {
+            r.rest_depths = pinch::hull_depths(&rest);
+        }
+        r.rest = rest;
+        let start = r.start;
+        if bead_radius > 0.0 {
+            if r.p.bead_radius > 0.0 {
+                r.p.min_neck_rest *= bead_radius / r.p.bead_radius;
+            }
+            r.p.bead_radius = bead_radius;
+            self.ps.r[start..start + n].iter_mut().for_each(|b| *b = bead_radius as f32);
+        }
+        let blend = self.rings[idx].rest_blend as f64;
+        self.set_rest_blend(key, blend);
+        true
+    }
+
+    /// Sets one of ring `key`'s tuning values in place (Goo2D's resize ease, every frame of
+    /// it): "radius", "bead_mass" (the inverse mass follows), "pressure_k",
+    /// "shape_match_k", "internal_damp", "settle_speed", "settle_time", "split_neck",
+    /// "splat_area_ratio", "min_neck_rest", "skin_stiffness", "skin_damping",
+    /// "bending_stiffness", "bending_damping", "linear_damp", "bounce", "friction". False for
+    /// another name (or no such ring).
+    pub fn set_ring_value(&mut self, key: i64, name: &str, value: f64) -> bool {
+        let Some(r) = self.ring_mut(key) else { return false };
+        if name == "bead_mass" {
+            r.p.bead_mass = value;
+            r.w = if value > 0.0 { (1.0 / value) as f32 } else { 0.0 };
+            return true;
+        }
+        let p = &mut r.p;
+        match name {
+            "radius" => p.radius = value,
+            "pressure_k" => p.pressure_k = value,
+            "shape_match_k" => p.shape_k = value,
+            "internal_damp" => p.internal_damp = value,
+            "settle_speed" => p.settle_speed = value,
+            "settle_time" => p.settle_time = value,
+            "split_neck" => p.split_neck = value,
+            "splat_area_ratio" => p.splat_area_ratio = value,
+            "min_neck_rest" => p.min_neck_rest = value,
+            "skin_stiffness" => p.skin_stiffness = value,
+            "skin_damping" => p.skin_damping = value,
+            "bending_stiffness" => p.bending_stiffness = value,
+            "bending_damping" => p.bending_damping = value,
+            "linear_damp" => p.linear_damp = value,
+            "bounce" => p.bounce = value,
+            "friction" => p.friction = value,
+            _ => return false,
+        }
+        true
+    }
+
+    /// One of ring `key`'s values by the names add_ring()'s params and set_ring_value() use
+    /// (also "bead_radius", "target_area", "split_lock", "rest_blend"); NaN for another
+    /// name or no such ring. For the tests.
+    pub fn ring_value(&self, key: i64, name: &str) -> f64 {
+        let Some(r) = self.ring(key) else { return f64::NAN };
+        let p = &r.p;
+        match name {
+            "radius" => p.radius,
+            "bead_mass" => p.bead_mass,
+            "bead_radius" => p.bead_radius,
+            "pressure_k" => p.pressure_k,
+            "shape_match_k" => p.shape_k,
+            "internal_damp" => p.internal_damp,
+            "settle_speed" => p.settle_speed,
+            "settle_time" => p.settle_time,
+            "split_neck" => p.split_neck,
+            "splat_area_ratio" => p.splat_area_ratio,
+            "min_neck_rest" => p.min_neck_rest,
+            "skin_stiffness" => p.skin_stiffness,
+            "skin_damping" => p.skin_damping,
+            "bending_stiffness" => p.bending_stiffness,
+            "bending_damping" => p.bending_damping,
+            "linear_damp" => p.linear_damp,
+            "bounce" => p.bounce,
+            "friction" => p.friction,
+            "target_area" => r.target_area,
+            "split_lock" => r.split_lock,
+            "rest_blend" => r.rest_blend as f64,
+            _ => f64::NAN,
+        }
+    }
+
+    /// The skin rest lengths ring `key`'s solver holds now (edge i → i+1), and its rest shape.
+    pub fn rest_edges(&self, key: i64) -> Vec<f32> {
+        self.ring(key).map(|r| r.rest_edges.clone()).unwrap_or_default()
+    }
+
     fn reindex(&mut self) {
         self.index.clear();
         for (i, r) in self.rings.iter().enumerate() {

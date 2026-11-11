@@ -429,3 +429,53 @@ func _assert_tuning_scaled(at_one: Dictionary, half: Callable, label: String) ->
 		var factor := 0.5 if key in UNIT_LENGTH_KEYS else (0.25 if key == "target_area" else 1.0)
 		var want := float(at_one[key]) * factor
 		assert_almost_eq(float(scaled[key]), want, 0.00001 * maxf(absf(want), 1.0), "%s %s" % [label, key])
+
+# ---- Resizing ----
+
+# The shapes a resize test sweeps: round, a square, a triangle and a long bar.
+static func _resize_shapes() -> Array[GooShape]:
+	return [GooShape.round(40.0), GooShape.regular(4, 40.0), GooShape.regular(3, 40.0),
+		GooShape.polygon(PackedVector2Array([Vector2(-90, -20), Vector2(90, -20), Vector2(90, 20), Vector2(-90, 20)]))]
+
+func test_resize_count_is_the_count_tuning_for_gives() -> void:
+	for shape: GooShape in _resize_shapes():
+		for step: int in 40:
+			# Off the exact boundaries (every 0.05 of size_t for a round ring),
+			# where a radius and the radius of the shape scaled to it round apart.
+			var radius := GooTuning.radius_at((step + 0.37) / 40.0)
+			var sized := shape.scaled(radius)
+			assert_eq(GooTuning.resize_count(shape, radius), int(GooTuning.tuning_for(sized)["bead_count"]),
+				"%d-point shape at %.1f px" % [shape.outline.size(), radius])
+
+func test_resize_count_holds_a_count_near_its_boundary() -> void:
+	var round := GooShape.round(40.0)
+	# A round ring's count steps from 12 to 13 at size_t 0.05.
+	var boundary := 0.05
+	var h := GooTuning.RESIZE_COUNT_HYSTERESIS
+	assert_eq(GooTuning.resize_count(round, GooTuning.radius_at(boundary + 0.01)), 13, "precondition")
+	assert_eq(GooTuning.resize_count_held(round, GooTuning.radius_at(boundary + 0.5 * h), 12), 12,
+		"just past the boundary a ring of 12 keeps its 12")
+	assert_eq(GooTuning.resize_count_held(round, GooTuning.radius_at(boundary + 1.5 * h), 12), 13,
+		"past the band it takes 13")
+	assert_eq(GooTuning.resize_count_held(round, GooTuning.radius_at(boundary - 0.5 * h), 13), 13,
+		"coming back, a ring of 13 keeps its 13 just under the boundary")
+	assert_eq(GooTuning.resize_count_held(round, GooTuning.radius_at(boundary - 1.5 * h), 13), 12)
+	assert_eq(GooTuning.resize_count_held(round, GooTuning.radius_at(0.5), 12), GooTuning.bead_count(GooTuning.radius_at(0.5)),
+		"far from the count it holds, the size's own count")
+	# A radius hovering across the boundary keeps one count all the way.
+	for k: int in 20:
+		var t := boundary + 0.9 * h * sin(k * 0.7)
+		assert_eq(GooTuning.resize_count_held(round, GooTuning.radius_at(t), 12), 12, "hovering at %.4f" % t)
+
+func test_resize_time_is_rate_limited() -> void:
+	var smallest := GooTuning.min_radius()
+	var largest := GooTuning.max_radius()
+	assert_almost_eq(GooTuning.resize_time(smallest, largest, 0.1), log(largest / smallest) / GooTuning.RESIZE_MAX_LOG_RATE,
+		0.00001, "a fast growth takes the rate limit's time")
+	assert_almost_eq(GooTuning.resize_time(largest, smallest, 0.1), log(largest / smallest) / GooTuning.RESIZE_MAX_LOG_RATE,
+		0.00001, "so does a fast shrink")
+	assert_almost_eq(GooTuning.resize_time(40.0, 42.0, 0.5), 0.5, 0.00001, "a slow one its own time")
+	assert_almost_eq(GooTuning.resize_time(40.0, 40.0, 0.0), 0.0, 0.00001)
+	GooTuning.unit = 0.5
+	assert_almost_eq(GooTuning.resize_time(14.0, 88.0, 0.1), log(88.0 / 14.0) / GooTuning.RESIZE_MAX_LOG_RATE,
+		0.00001, "the unit changes no time")

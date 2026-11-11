@@ -413,3 +413,89 @@ static func chord(loop: PackedVector2Array, tip: Vector2, axis: Vector2) -> Vect
 		if (second + 1) % count == first:
 			return Vector2i(second, (first + 1) % count)
 	return NO_CHORD if a == b else Vector2i(a, b)
+
+# ---- Resizing ----
+
+## `points` scaled by `factor` about their centroid (centroid()): the
+## centroid stays, every turn of the loop is kept, the area is factor² times.
+static func scaled(points: PackedVector2Array, factor: float) -> PackedVector2Array:
+	var centre := centroid(points)
+	var result := PackedVector2Array()
+	result.resize(points.size())
+	for i: int in points.size():
+		result[i] = centre + (points[i] - centre) * factor
+	return result
+
+## `points` about their centroid scaled by `squash` along the unit vector
+## `axis` and by 1 / squash across it (an area-keeping squash: squash < 1
+## flattens the loop along the axis), then by `factor` as a whole.
+static func squashed(points: PackedVector2Array, squash: float, axis: Vector2,
+		factor: float = 1.0) -> PackedVector2Array:
+	var centre := centroid(points)
+	var along := axis.normalized() if axis.length_squared() > 0.0 else Vector2.RIGHT
+	var across := along.orthogonal()
+	var result := PackedVector2Array()
+	result.resize(points.size())
+	for i: int in points.size():
+		var d := points[i] - centre
+		result[i] = centre + (along * (d.dot(along) * squash) + across * (d.dot(across) / squash)) * factor
+	return result
+
+## One point on the closed loop `loop` per point of the loop `rest` (any
+## positions: the loop it should be placed like, in the same space), at the
+## same fraction of the perimeter from a start as that rest point is from
+## rest[0], the start being the point of `loop` (on an edge, not only at a
+## vertex) nearest rest[0]; and with it `values` (one per point of `loop`, a
+## velocity each) interpolated along the loop the same way. Returns [points,
+## values]. A ring rebuilt with another bead count on its own beads (Goo2D's
+## re-ring) keeps its outline, its pose and its motion, and its rest corners
+## land on the loop where its corners are.
+static func place_like(loop: PackedVector2Array, values: PackedVector2Array,
+		rest: PackedVector2Array) -> Array[PackedVector2Array]:
+	var count := rest.size()
+	var size := loop.size()
+	var points := PackedVector2Array()
+	var placed := PackedVector2Array()
+	if size == 0 or count == 0:
+		return [points, placed]
+	var has_values := values.size() == size
+	# The start: the closest point of the loop's edges to rest[0].
+	var start_edge := 0
+	var start_along := 0.0
+	var best := INF
+	for i: int in size:
+		var a := loop[i]
+		var b := loop[(i + 1) % size]
+		var on := Geometry2D.get_closest_point_to_segment(rest[0], a, b)
+		var distance := on.distance_squared_to(rest[0])
+		if distance < best:
+			best = distance
+			start_edge = i
+			var length := a.distance_to(b)
+			start_along = a.distance_to(on) / length if length > 0.0 else 0.0
+	var lengths := PackedFloat32Array()
+	lengths.resize(size)
+	var total := 0.0
+	for i: int in size:
+		lengths[i] = loop[i].distance_to(loop[(i + 1) % size])
+		total += lengths[i]
+	var rest_total := perimeter(rest)
+	var rest_walked := 0.0
+	# Walking from the start: the edge, how far along the loop its start lies
+	# from the start point.
+	var edge := start_edge
+	var walked := -start_along * lengths[start_edge]
+	var steps := 0
+	for k: int in count:
+		if k > 0:
+			rest_walked += rest[k - 1].distance_to(rest[k])
+		var target := total * rest_walked / rest_total if rest_total > 0.0 else 0.0
+		while steps < size and walked + lengths[edge] < target:
+			walked += lengths[edge]
+			edge = (edge + 1) % size
+			steps += 1
+		var t := clampf((target - walked) / lengths[edge], 0.0, 1.0) if lengths[edge] > 0.0 else 0.0
+		var next := (edge + 1) % size
+		points.append(loop[edge].lerp(loop[next], t))
+		placed.append(values[edge].lerp(values[next], t) if has_values else Vector2.ZERO)
+	return [points, placed]

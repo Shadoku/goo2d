@@ -592,3 +592,86 @@ static func tuning_for(shape: GooShape) -> Dictionary:
 	values["bending_damping"] = BENDING_RATIO * damping
 	values["shape_match_k"] = shape_match_k(radius) * POLYGON_SHAPE_MATCH_RATIO
 	return values
+
+# ---- Resizing and rest deformation ----
+# A live body changes size with Goo2D.resize() and deforms its rest outline with
+# Goo2D.set_rest_deform(). Every number here is a time, a ratio or a fraction of
+# size_t(), so `unit` leaves them all alone.
+
+## Seconds Goo2D.resize() eases a body into its new size over when it is given
+## no time of its own: its target area, rest lengths, bead radius, rest outline
+## and size-dependent tuning go from where they are to the new size's.
+const RESIZE_TIME: float = 0.5
+## The fastest a body's size may change, as a rate of its log radius per
+## second: resize() eases over at least |ln(new / old)| / this seconds
+## (resize_time()), whatever time it is given. At 1.5 the smallest body grows
+## to the largest (× 6.3, ln 1.84) in no less than 1.23 s. Growth is what it
+## limits: the rest lengths and target area lead and the pressure and skin
+## pull the beads after them, and a ring told to be much larger than it is in
+## one frame would push on its neighbours and walls as hard as its constraints
+## can (the kernel's MAX_BEAD_SPEED caps the result, but the ring may still
+## wedge or tunnel into what is next to it).
+const RESIZE_MAX_LOG_RATE: float = 1.5
+## How far past a bead count's boundary, in size_t() (0 smallest .. 1 largest),
+## a resizing body's eased radius must go before its ring is rebuilt with the
+## new count (Goo2D re-rings it): a round ring's count steps every 0.1 of
+## size_t(), so 0.03 keeps a radius hovering at a boundary (a game's breathing
+## creature) from rebuilding its ring every frame.
+const RESIZE_COUNT_HYSTERESIS: float = 0.03
+## Seconds a body whose ease ended inside that band (holding a count GooTuning
+## would not give its size) waits before it re-rings to the count it would be
+## built with (resize_count()), so a body left at a size ends up exactly as
+## one spawned at it.
+const RESIZE_SETTLE_TIME: float = 0.5
+## Seconds of split lock (Goo2D.split_lock()) a body is given every frame its
+## size eases or its rest deformation changes: the kernel's pinch and splat
+## checks compare the beads with a rest shape and a target area that are ahead
+## of them while they move (a growing ring is below its target area, as an
+## impact would leave it), so neither may split it then or this long after.
+## Blades and tips (GooWorld2D.cut_along(), cut_at_tips(), pierce()) and cut()
+## still cut it.
+const RESIZE_SPLIT_GUARD: float = 0.3
+## Range of Goo2D.set_rest_deform()'s squash: the rest outline is scaled by
+## squash along its axis and 1 / squash across it. At 0.5 the edges across the
+## axis are twice their length, so the beads (BEAD_RADIUS_RATIO 0.6 of the
+## spacing) leave gaps between them of 0.4 spacing: further would open the ring
+## to a small neighbour's beads.
+const DEFORM_SQUASH_MIN: float = 0.5
+const DEFORM_SQUASH_MAX: float = 2.0
+## Range of set_rest_deform()'s area scale: the rest outline, the bead radius
+## and the target area are scaled to this times the body's area.
+const DEFORM_AREA_MIN: float = 0.6
+const DEFORM_AREA_MAX: float = 1.6
+
+## The bead count tuning_for() gives a body of `shape`'s proportions at the
+## equivalent radius `radius` (shape.scaled(radius)), without building the
+## tuning: bead_count(radius) for a round shape, the scaled perimeter over
+## spacing(radius) for a polygon (clamped to MIN_BEADS … MAX_POLYGON_BEADS).
+static func resize_count(shape: GooShape, radius: float) -> int:
+	if shape == null or shape.is_round():
+		return bead_count(radius)
+	var own := shape.radius()
+	var perimeter := shape.perimeter() * (radius / own) if own > 0.0 else 0.0
+	return clampi(roundi(perimeter / spacing(radius)), MIN_BEADS, MAX_POLYGON_BEADS)
+
+## The bead count a resizing body of `shape` at `radius` should have when it has
+## `current` beads now: `current` while resize_count() at `radius`, or at the
+## radius RESIZE_COUNT_HYSTERESIS of size_t() back toward the size `current`
+## belongs to, still gives `current`; resize_count() at `radius` once the radius
+## is past that band.
+static func resize_count_held(shape: GooShape, radius: float, current: int) -> int:
+	var wanted := resize_count(shape, radius)
+	if wanted == current:
+		return current
+	var back := -RESIZE_COUNT_HYSTERESIS if wanted > current else RESIZE_COUNT_HYSTERESIS
+	var held := resize_count(shape, radius_at(size_t(radius) + back))
+	if (wanted > current and held <= current) or (wanted < current and held >= current):
+		return current
+	return wanted
+
+## Seconds a resize from `from_radius` to `to_radius` asked to take `time`
+## seconds takes: `time`, or longer when that would change the radius faster
+## than RESIZE_MAX_LOG_RATE allows.
+static func resize_time(from_radius: float, to_radius: float, time: float) -> float:
+	var change := absf(log(to_radius / from_radius)) if from_radius > 0.0 and to_radius > 0.0 else 0.0
+	return maxf(maxf(time, 0.0), change / RESIZE_MAX_LOG_RATE)

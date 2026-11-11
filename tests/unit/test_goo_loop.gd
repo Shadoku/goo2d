@@ -457,3 +457,75 @@ func test_split_at_crossings_of_a_folded_ring_gives_simple_loops_covering_the_fo
 			if Geometry2D.is_point_in_polygon(folded[i], lp) or lp.has(folded[i]):
 				covered = true
 		assert_true(covered, "folded bead %d is in a loop" % i)
+
+# ---- Resizing ----
+
+func test_scaled_keeps_centroid_turns_and_scales_area() -> void:
+	var loop := GooShape.regular(4, 40.0).bead_loop(16, 6.0)
+	for i: int in loop.size():
+		loop[i] += CENTRE
+	var big := GooLoop.scaled(loop, 1.7)
+	assert_lt(GooLoop.centroid(big).distance_to(GooLoop.centroid(loop)), 0.001, "the centroid stays")
+	assert_almost_eq(GooLoop.area(big) / GooLoop.area(loop), 1.7 * 1.7, 0.0001, "the area is factor² times")
+	for i: int in loop.size():
+		assert_almost_eq(GooShape.turn(big, i), GooShape.turn(loop, i), 0.0001, "turn %d kept" % i)
+	assert_eq(Goo2D.find_corners(big), Goo2D.find_corners(loop), "the corners stay corners")
+
+func test_squashed_keeps_area_and_stretches_across() -> void:
+	var loop := GooLoop.circle_points(CENTRE, 50.0, 64)
+	var flat := GooLoop.squashed(loop, 0.6, Vector2.RIGHT)
+	assert_almost_eq(GooLoop.area(flat) / GooLoop.area(loop), 1.0, 0.0001, "a squash keeps the area")
+	assert_lt(GooLoop.centroid(flat).distance_to(CENTRE), 0.001, "about the centroid")
+	var box := Rect2(flat[0], Vector2.ZERO)
+	for point: Vector2 in flat:
+		box = box.expand(point)
+	assert_almost_eq(box.size.x, 100.0 * 0.6, 0.5, "0.6 times as wide along the axis")
+	assert_almost_eq(box.size.y, 100.0 / 0.6, 0.5, "1 / 0.6 times as tall across it")
+	var turned := GooLoop.squashed(loop, 0.6, Vector2.DOWN, 1.2)
+	box = Rect2(turned[0], Vector2.ZERO)
+	for point: Vector2 in turned:
+		box = box.expand(point)
+	assert_almost_eq(box.size.y, 100.0 * 0.6 * 1.2, 0.5, "along another axis, scaled as a whole too")
+	assert_almost_eq(GooLoop.area(turned) / GooLoop.area(loop), 1.44, 0.001)
+
+func test_place_like_resamples_a_loop_keeping_area_corners_and_values() -> void:
+	var square := GooShape.regular(4, 40.0)
+	var loop := square.bead_loop(16, 6.0)
+	var rest := square.bead_loop(24, 4.5)
+	var shift := Vector2(300.0, 200.0)
+	for i: int in loop.size():
+		loop[i] += shift
+	for i: int in rest.size():
+		rest[i] += shift
+	# Velocities equal to the positions: interpolated along the loop, each
+	# placed point's value is the point itself.
+	var placed := GooLoop.place_like(loop, loop, rest)
+	var points: PackedVector2Array = placed[0]
+	var values: PackedVector2Array = placed[1]
+	assert_eq(points.size(), 24)
+	assert_almost_eq(GooLoop.area(points) / GooLoop.area(loop), 1.0, 0.03, "the outline's area within 3%")
+	for i: int in 24:
+		assert_lt(values[i].distance_to(points[i]), 0.01, "value %d interpolated like its point" % i)
+	var loop_corners := Goo2D.find_corners(loop)
+	var rest_corners := Goo2D.find_corners(rest)
+	for i: int in 24:
+		if rest_corners[i] == 0:
+			continue
+		var nearest := INF
+		for j: int in 16:
+			if loop_corners[j] == 1:
+				nearest = minf(nearest, loop[j].distance_to(points[i]))
+		assert_lt(nearest, 1.0, "rest corner %d lands on a corner of the loop" % i)
+	# Fewer points, and a loop turned and moved: still its outline.
+	var circle := GooLoop.circle_points(Vector2(50.0, 60.0), 40.0, 22)
+	var fewer := GooLoop.place_like(circle, PackedVector2Array(), GooLoop.circle_points(Vector2(50.0, 60.0), 30.0, 12))
+	assert_eq((fewer[0] as PackedVector2Array).size(), 12)
+	assert_almost_eq(GooLoop.area(fewer[0]) / GooLoop.area(circle), 1.0, 0.05)
+	# A rest loop turned half a step of the loop's: its point 0 faces the middle
+	# of the loop's edge 0, where placing starts (not at a vertex).
+	var turned := PackedVector2Array()
+	for point: Vector2 in GooLoop.circle_points(Vector2.ZERO, 40.0, 12):
+		turned.append(Vector2(50.0, 60.0) + point.rotated(-PI / 22.0))
+	var start: Vector2 = (GooLoop.place_like(circle, PackedVector2Array(), turned)[0] as PackedVector2Array)[0]
+	assert_lt(start.distance_to((circle[0] + circle[1]) * 0.5), 0.01,
+		"starting at the point of the loop nearest rest point 0, not at a vertex")

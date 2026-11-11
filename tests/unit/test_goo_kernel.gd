@@ -732,3 +732,59 @@ func test_a_ring_joins_its_world_kernel_and_leaves_it_with_the_tree() -> void:
 	assert_true(goo.has_ring(key), "and joins it again when it comes back")
 	body.free()
 	assert_eq(goo.ring_count(), 0)
+
+# ---- Resizing (Goo2D.resize(), set_rest_deform()) ----
+
+func test_set_rest_changes_the_rings_rest_lengths_in_place() -> void:
+	var goo := GooTuning.make_kernel()
+	var tuning := _add_round(goo, 1, 40.0, Vector2.ZERO)
+	var count: int = tuning["bead_count"]
+	var rest := GooLoop.circle_points(Vector2.ZERO, tuning["ring_radius"], count)
+	var before := goo.rest_edges(1)
+	assert_almost_eq(before[0], rest[0].distance_to(rest[1]), 0.001, "precondition: the rest edges")
+	var bead: float = tuning["bead_radius"]
+	assert_true(goo.set_rest(1, GooLoop.scaled(rest, 1.5), bead * 1.5))
+	var after := goo.rest_edges(1)
+	for i: int in count:
+		assert_almost_eq(after[i], before[i] * 1.5, 0.001, "edge %d × 1.5" % i)
+	assert_almost_eq(goo.ring_param(1, &"bead_radius"), bead * 1.5, 0.0001, "the bead radius follows")
+	assert_eq(goo.rest_points(1).size(), count)
+	assert_almost_eq(goo.rest_points(1)[0].x, rest[0].x * 1.5, 0.001, "shape matching's rest shape")
+	assert_eq(goo.particle_count(), count, "the ring was not rebuilt")
+	# With the rest blend half way the solver holds half way between the placed
+	# loop's lengths (here the original rest) and the new rest shape's.
+	goo.set_ring_param(1, &"rest_blend", 0.5)
+	assert_almost_eq(goo.rest_edges(1)[0], before[0] * 1.25, 0.001, "blended with the placed loop")
+	goo.set_ring_param(1, &"rest_blend", 1.0)
+	# The ring then grows into it: its target area set to the bigger circle's.
+	goo.set_ring_param(1, &"target_area", float(tuning["target_area"]) * 2.25)
+	goo.set_solver({ "gravity": Vector2.ZERO })
+	for frame: int in 60:
+		goo.step(1.0 / 60.0)
+	var grown := goo.area(1) / float(tuning["target_area"])
+	print("    area after set_rest × 1.5 and a second: %.3f × the old target (2.25 wanted)" % grown)
+	assert_almost_eq(grown, 2.25, 0.05, "the beads follow the new rest shape")
+
+func test_set_rest_refuses_another_count() -> void:
+	allow_errors = true
+	var goo := GooTuning.make_kernel()
+	var tuning := _add_round(goo, 1, 40.0, Vector2.ZERO)
+	var rest := GooLoop.circle_points(Vector2.ZERO, tuning["ring_radius"], int(tuning["bead_count"]) + 1)
+	assert_false(goo.set_rest(1, rest, 0.0), "a rest of another length is refused")
+
+func test_set_ring_params_sets_the_tuning_in_place() -> void:
+	var goo := GooTuning.make_kernel()
+	_add_round(goo, 1, 40.0, Vector2.ZERO)
+	var values := { "bead_mass": 2.5, "pressure_k": 77.0, "shape_match_k": 12.0, "skin_stiffness": 900.0,
+		"skin_damping": 3.0, "bending_stiffness": 270.0, "bending_damping": 0.9, "internal_damp": 6.0,
+		"linear_damp": 0.2, "bounce": 0.3, "friction": 0.15, "split_neck": 9.0, "splat_area_ratio": 0.7,
+		"settle_speed": 3.0, "settle_time": 0.4, "radius": 55.0, "spacing": 1.0, "bead_count": 99 }
+	goo.set_ring_params(1, values)
+	for key: String in values:
+		if key in ["spacing", "bead_count"]:
+			continue
+		assert_almost_eq(goo.ring_param(1, StringName(key)), float(values[key]), 0.0001, key)
+	assert_eq(goo.particle_count(), int(GooTuning.bead_count(40.0)), "shaping keys are skipped")
+	# The inverse mass follows the bead mass: an impulse moves heavier beads less.
+	goo.apply_impulse(1, Vector2(10.0, 0.0))
+	assert_almost_eq(goo.average_velocity(1).x, 10.0 / 2.5, 0.001)

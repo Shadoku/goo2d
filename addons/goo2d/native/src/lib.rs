@@ -179,6 +179,74 @@ impl GooKernel {
         }
     }
 
+    /// Sets several of ring `key`'s tuning values at once (Goo2D's resize ease sends them
+    /// every frame of it), by the names add_ring()'s params use: "radius", "bead_mass",
+    /// "pressure_k", "shape_match_k", "internal_damp", "settle_speed", "settle_time",
+    /// "split_neck", "splat_area_ratio", "min_neck_rest", "skin_stiffness", "skin_damping",
+    /// "bending_stiffness", "bending_damping", "linear_damp", "bounce", "friction";
+    /// "target_area", "split_lock" and "rest_blend" as set_ring_param() takes them. Other
+    /// keys (a whole GooTuning dictionary's "bead_count", "spacing"...) are skipped
+    /// quietly: the geometry changes through set_rest().
+    #[func]
+    fn set_ring_params(&mut self, key: i64, params: VarDictionary) {
+        if self.k.find(key).is_none() {
+            return;
+        }
+        for (name, value) in params.iter_shared() {
+            let name = name.to_string();
+            let number = value.try_to::<f64>().or_else(|_| value.try_to::<i64>().map(|i| i as f64)).unwrap_or(0.0);
+            match name.as_str() {
+                "rest_blend" => self.k.set_rest_blend(key, number),
+                "target_area" | "split_lock" => {
+                    if let Some(r) = self.k.ring_mut(key) {
+                        if name == "target_area" {
+                            r.target_area = number;
+                        } else {
+                            r.split_lock = number;
+                        }
+                    }
+                }
+                _ => {
+                    self.k.set_ring_value(key, &name, number);
+                }
+            }
+        }
+    }
+
+    /// Gives ring `key` a new rest shape in place, without rebuilding it (Goo2D.resize(),
+    /// Goo2D.set_rest_deform(): cheap enough for every frame): `rest`, one point per bead
+    /// about its centroid, is what shape matching pulls toward and what the skin and
+    /// bending rest lengths are measured on (still blended with the placed loop's by
+    /// "rest_blend"), and the pinch scan's rest depths of a ring built with some; with a
+    /// `bead_radius` above 0, every bead's collision radius (and "min_neck_rest" in
+    /// proportion). The beads stay where they are and the constraints pull them into the
+    /// new shape. The target area is set_ring_param()'s. Returns false, with an error, for a
+    /// rest of another length than the ring.
+    #[func]
+    fn set_rest(&mut self, key: i64, rest: PackedVector2Array, bead_radius: f64) -> bool {
+        self.k.set_rest(key, v2(&rest), bead_radius)
+    }
+
+    /// One of ring `key`'s values by add_ring()'s param names (and "target_area",
+    /// "split_lock", "rest_blend"); NaN for another name or no such ring. For the tests.
+    #[func]
+    fn ring_param(&self, key: i64, name: StringName) -> f64 {
+        self.k.ring_value(key, &name.to_string())
+    }
+
+    /// The skin rest lengths ring `key`'s solver holds now (edge i → i+1: the rest shape's
+    /// blended with the placed loop's by its rest blend). For the tests.
+    #[func]
+    fn rest_edges(&self, key: i64) -> PackedFloat32Array {
+        PackedFloat32Array::from(self.k.rest_edges(key).as_slice())
+    }
+
+    /// Ring `key`'s rest shape as shape matching holds it (about its centroid).
+    #[func]
+    fn rest_points(&self, key: i64) -> PackedVector2Array {
+        self.k.ring(key).map(|r| pv2(&r.rest)).unwrap_or_default()
+    }
+
     /// Whether step() runs the pair passes (the overlap push and the Untangler): on for a
     /// GooWorld2D's kernel, off (the default) for lone rings.
     #[func]
