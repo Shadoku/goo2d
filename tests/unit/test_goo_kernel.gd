@@ -732,3 +732,102 @@ func test_a_ring_joins_its_world_kernel_and_leaves_it_with_the_tree() -> void:
 	assert_true(goo.has_ring(key), "and joins it again when it comes back")
 	body.free()
 	assert_eq(goo.ring_count(), 0)
+
+# ---- Links ----
+
+# Two rings of `radius` added to a gravity-free kernel side by side, their
+# facing beads `gap` px apart, linked as link `id` at `strength` (GooLink.patch()
+# and kernel_params()); returns the link's patch.
+func _linked_pair(goo: GooKernel, radius: float, strength: float, gap_beads: float = 1.0) -> Dictionary:
+	goo.set_solver({ "gravity": Vector2.ZERO })
+	var tuning := GooTuning.tuning(radius)
+	var ring: float = tuning["ring_radius"]
+	var bead: float = tuning["bead_radius"]
+	var apart := 2.0 * ring + gap_beads * 2.0 * bead
+	_add_round(goo, 1, radius, Vector2(0.0, 0.0))
+	_add_round(goo, 2, radius, Vector2(apart, 0.0))
+	var rest := GooLoop.circle_points(Vector2.ZERO, ring, int(tuning["bead_count"]))
+	var patch := GooLink.patch(rest, Vector2(ring, 0.0), rest, Vector2(-ring, 0.0), strength, radius, radius)
+	assert_true(goo.add_link(7, 1, 2, patch["pairs"], patch["through_a"], patch["through_b"],
+		GooLink.kernel_params(bead, bead, strength, 0.0)), "the kernel takes the link")
+	return patch
+
+func test_a_link_holds_its_beads_at_their_rest_lengths() -> void:
+	var goo := GooTuning.make_kernel()
+	var patch := _linked_pair(goo, 40.0, 1.0, 2.0)
+	assert_true(goo.has_link(7))
+	assert_eq(goo.link_ids(), PackedInt64Array([7]))
+	# Pulled apart for a moment, then let go.
+	goo.set_velocities(1, PackedVector2Array([Vector2(-300.0, 0.0)]))
+	goo.set_velocities(2, PackedVector2Array([Vector2(300.0, 0.0)]))
+	for frame: int in 120:
+		goo.step(1.0 / 60.0)
+	var info := goo.link_info(7)
+	assert_almost_eq(float(info["ease"]), 1.0, 0.0001, "eased in")
+	var pairs: PackedInt32Array = info["pairs"]
+	var rest: PackedFloat32Array = info["rest_lengths"]
+	assert_eq(pairs, patch["pairs"])
+	var worst := 0.0
+	for k: int in rest.size():
+		var length := goo.bead_position(1, pairs[2 * k]).distance_to(goo.bead_position(2, pairs[2 * k + 1]))
+		worst = maxf(worst, absf(length - rest[k]))
+	print("    %d pairs, rest %.1f px, worst off by %.2f px after a pull" % [rest.size(), rest[rest.size() / 2], worst])
+	assert_gt(rest.size(), 2, "a wide patch")
+	assert_lt(worst, 2.0, "every pair within 2 px of its rest length")
+
+func test_removing_a_ring_removes_its_links() -> void:
+	var goo := GooTuning.make_kernel()
+	_linked_pair(goo, 40.0, 0.5)
+	goo.remove_ring(2)
+	assert_false(goo.has_link(7))
+	assert_eq(goo.link_ids().size(), 0)
+	goo.step(1.0 / 60.0)
+	assert_false(goo.add_link(8, 1, 2, PackedInt32Array([0, 0]), PackedInt32Array(), PackedInt32Array(), {}),
+		"no link to a missing ring")
+	assert_false(goo.add_link(8, 1, 1, PackedInt32Array([0, 1]), PackedInt32Array(), PackedInt32Array(), {}),
+		"nor from a ring to itself")
+
+func test_a_links_beads_pass_through_until_it_is_removed() -> void:
+	var goo := GooTuning.make_kernel()
+	var patch := _linked_pair(goo, 40.0, 0.5)
+	var through_a: PackedInt32Array = patch["through_a"]
+	var through_b: PackedInt32Array = patch["through_b"]
+	var tied: int = (patch["pairs"] as PackedInt32Array)[0]
+	assert_true(through_a.has(tied), "the tied beads pass through")
+	assert_eq(through_a.size(), (patch["pairs"] as PackedInt32Array).size() / 2 + 2 * GooTuning.LINK_THROUGH_BEADS,
+		"and LINK_THROUGH_BEADS beyond either end")
+	for bead: int in through_a:
+		assert_true(goo.bead_passes_through(1, bead, 2), "bead %d of a" % bead)
+	for bead: int in through_b:
+		assert_true(goo.bead_passes_through(2, bead, 1), "bead %d of b" % bead)
+	var far := posmod(tied + 10, 18)
+	assert_false(goo.bead_passes_through(1, far, 2), "a bead far from the patch collides")
+	assert_false(goo.bead_passes_through(1, posmod(tied - 1 - GooTuning.LINK_THROUGH_BEADS, 18), 2),
+		"so does one just beyond it")
+	goo.remove_link(7)
+	for bead: int in through_a:
+		assert_false(goo.bead_passes_through(1, bead, 2), "bead %d collides again" % bead)
+
+func test_a_rest_angle_turns_the_second_ring_its_way() -> void:
+	for angle: float in [0.5, -0.5]:
+		var goo := GooTuning.make_kernel()
+		_linked_pair(goo, 40.0, 1.0)
+		for frame: int in 30:
+			goo.step(1.0 / 60.0)
+		var before: float = goo.link_info(7)["bend"]
+		goo.set_link_param(7, &"rest_angle", angle)
+		for frame: int in 120:
+			goo.step(1.0 / 60.0)
+		var info := goo.link_info(7)
+		var bend: float = info["bend"]
+		print("    rest angle %+.1f: bend %+.3f -> %+.3f rad" % [angle, before, bend])
+		assert_lt(absf(before), 0.05, "unbent at rest angle 0")
+		assert_almost_eq(bend, angle, 0.15, "the joint bends to its rest angle")
+		# The second ring turned by the angle about the neck: seen from the
+		# first ring's frame (its patch facing +x), its centre swung off the
+		# axis, below it (+y) for a positive (clockwise on screen) turn.
+		var rest := GooLoop.circle_points(Vector2.ZERO, GooTuning.ring_radius(40.0), GooTuning.bead_count(40.0))
+		var turn_a := GooLoop.best_fit_rotation(rest, goo.points(1))
+		var seen := (goo.center(2) - goo.center(1)).rotated(-turn_a)
+		assert_eq(signf(seen.y), signf(angle), "b swings the turn's way")
+		assert_almost_eq(seen.angle(), angle * 0.5, 0.15, "about the neck (half the turn seen from a's centre)")
