@@ -124,6 +124,15 @@ signal body_trimmed(old_id: int, body: Goo2D)
 ## to every body it gets (a perk's spin, a kind's look); outside the physics
 ## flush, so a handler may change the body (its velocity, its colour).
 signal body_spawned(body: Goo2D)
+## Emitted after one of the world's bodies rebuilt its ring in place with
+## another bead count (Goo2D.resize() carried its size past a bead count's
+## boundary: Goo2D.rebuilt): the same node, id, tags, colours, skin and
+## children, but new beads, so whatever holds it by bead index or by its
+## kernel ring must re-attach (by a point, or a rest-space anchor:
+## Goo2D.rest_shape and ring_rotation() map one onto the beads). The world's
+## own grabs are re-attached at the point they held before it fires. Outside
+## the physics flush.
+signal body_rebuilt(body: Goo2D)
 
 ## Acceleration, in px/s² at GooTuning.unit 1, pulling a merging pair towards
 ## each other (merge_pull() scales it by the unit).
@@ -429,6 +438,7 @@ func _register(body: Goo2D, lock_merging: bool = false) -> Goo2D:
 	if lock_merging:
 		_lock_merging(body)
 	body.pinched.connect(_on_pinched.bind(body))
+	body.rebuilt.connect(_on_body_rebuilt.bind(body))
 	body_spawned.emit(body)
 	count_changed.emit(bodies().size())
 	return body
@@ -1063,6 +1073,24 @@ func body_at(point: Vector2) -> Goo2D:
 			return all[k]
 	return null
 
+# `body` rebuilt its ring with another bead count (Goo2D.rebuilt; its beads
+# were at `old_points`): each grab on it is made again at the point its held
+# beads carried there, pulled toward the same point, under the same handle;
+# then body_rebuilt.
+func _on_body_rebuilt(old_points: PackedVector2Array, body: Goo2D) -> void:
+	for handle: int in _grabs.keys():
+		var held: Grab = _grabs[handle]
+		if held.body != body:
+			continue
+		var fresh := Grab.new(body, held.held_point_on(old_points))
+		if fresh.beads.is_empty():
+			_grabs.erase(handle)
+			continue
+		fresh.target = held.target
+		fresh.last_target = held.last_target
+		_grabs[handle] = fresh
+	body_rebuilt.emit(body)
+
 # Pulls every held body toward its grab's point (see "Grabbing" above),
 # keeping it awake; forgets grabs whose body is gone.
 func _hold_grabs(delta: float) -> void:
@@ -1091,11 +1119,15 @@ class Grab extends RefCounted:
 	## last frame pulled (its motion is the spring's rest velocity).
 	var target: Vector2
 	var last_target: Vector2
+	## The body's size when grabbed (Goo2D.eased_radius()): a body resized
+	## while held has its offsets scaled by its size now over this (scale()).
+	var size: float = 0.0
 
 	func _init(grabbed_body: Goo2D, point: Vector2) -> void:
 		body = grabbed_body
 		target = point
 		last_target = point
+		size = grabbed_body.eased_radius()
 		var points := grabbed_body.bead_points()
 		held.resize(points.size())
 		var nearest := INF
@@ -1115,9 +1147,22 @@ class Grab extends RefCounted:
 	func held_point() -> Vector2:
 		var sum := Vector2.ZERO
 		var total := 0.0
+		var factor := scale()
 		for k: int in beads.size():
-			sum += (body.bead_position(beads[k]) - offsets[k]) * weights[k]
+			sum += (body.bead_position(beads[k]) - offsets[k] * factor) * weights[k]
 			total += weights[k]
+		return sum / total if total > 0.0 else target
+
+	## held_point() with the body's beads at `points` (its bead loop before it
+	## was rebuilt with another count: GooWorld2D re-attaches the grab there).
+	func held_point_on(points: PackedVector2Array) -> Vector2:
+		var sum := Vector2.ZERO
+		var total := 0.0
+		var factor := scale()
+		for k: int in beads.size():
+			if beads[k] < points.size():
+				sum += (points[beads[k]] - offsets[k] * factor) * weights[k]
+				total += weights[k]
 		return sum / total if total > 0.0 else target
 
 	## One frame of the grab (see "Grabbing" above): each held bead's velocity
@@ -1132,12 +1177,13 @@ class Grab extends RefCounted:
 		var velocities := body.bead_velocities()
 		if points.size() != held.size():
 			return
+		var factor := scale()
 		if GooTuning.GRAB_CARRY > 0.0:
 			var point := Vector2.ZERO
 			var velocity := Vector2.ZERO
 			var total := 0.0
 			for k: int in beads.size():
-				point += (points[beads[k]] - offsets[k]) * weights[k]
+				point += (points[beads[k]] - offsets[k] * factor) * weights[k]
 				velocity += velocities[beads[k]] * weights[k]
 				total += weights[k]
 			point /= total
@@ -1149,8 +1195,13 @@ class Grab extends RefCounted:
 					body.set_bead_velocity(i, velocities[i] + carried)
 		for k: int in beads.size():
 			var i := beads[k]
-			body.set_bead_velocity(i, spring(points[i] - offsets[k], velocities[i], target, target_velocity,
+			body.set_bead_velocity(i, spring(points[i] - offsets[k] * factor, velocities[i], target, target_velocity,
 				GooTuning.GRAB_STIFFNESS * weights[k], GooTuning.GRAB_DAMPING * sqrt(weights[k]), delta))
+
+	## How much the held beads' offsets are scaled now: the body's size over its
+	## size when grabbed (1 for a body never resized).
+	func scale() -> float:
+		return body.eased_radius() / size if size > 0.0 else 1.0
 
 	## The velocity one backward Euler step of `delta` s of a damped spring of
 	## `stiffness` (1/s²) and `damping` (1/s) gives a point at `position` moving

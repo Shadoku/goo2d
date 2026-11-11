@@ -422,6 +422,8 @@ func _init() -> void:
 # a builder (or Goo2D.new()) is added to the tree first and built after, so it
 # does not build here.
 func _ready() -> void:
+	# Physics processing runs only while a resize eases (resize()).
+	set_physics_process(false)
 	if _count == 0 and not Engine.is_editor_hint() and _placed_in_scene():
 		shape = GooShape.round(radius)
 		var placed := _placed_shape()
@@ -631,6 +633,7 @@ func rebuild_from(bodies: Array[Goo2D], radius: float, ring_tuning: Dictionary,
 	target_area = area()
 	rest_blend = 0.0
 	var tween := create_tween()
+	_inflate_tween = tween
 	tween.set_process_mode(Tween.TWEEN_PROCESS_PHYSICS)
 	tween.set_parallel()
 	tween.tween_property(self, "target_area", float(tuning["target_area"]), float(tuning["inflate_time"]))
@@ -677,6 +680,7 @@ func build_from_loop(points: PackedVector2Array, velocities: PackedVector2Array,
 	target_area = area()
 	rest_blend = 0.0
 	var tween := create_tween()
+	_inflate_tween = tween
 	tween.set_process_mode(Tween.TWEEN_PROCESS_PHYSICS)
 	tween.set_parallel()
 	tween.tween_property(self, "target_area", float(tuning["target_area"]), float(tuning["inflate_time"]))
@@ -1665,6 +1669,483 @@ static func _clipper_largest(loop: PackedVector2Array) -> PackedVector2Array:
 	if not GooLoop.is_ccw(best):
 		best.reverse()
 	return best
+
+# ---- Resizing and rest deformation ----
+#
+# resize() changes a live body's size: `radius` becomes the new one at once (what
+# the merge-by-size rules and a cut read), and the body eases into it over the
+# resize's time (at least GooTuning.resize_time()), every physics frame
+# (_physics_process(), on only while it eases): its eased radius
+# (eased_radius()) runs from where it was to the new one on a log scale, its rest
+# outline, bead radius and target area are its base ring's (the ring it was last
+# built with, _base_*) scaled by eased radius / base radius, which at a fixed bead
+# count is exactly the ring GooTuning builds at that size (the spacing, the bead
+# radius and the polygon bead loop's inset all scale with the radius), and its
+# size-dependent tuning (masses, stiffnesses, pressure, damping, shape matching,
+# split thresholds) runs from what it was to its world's tuning_for() of the new
+# size. All of it reaches the kernel in place (GooKernel.set_rest(),
+# set_ring_params()): the ring is not rebuilt and the beads follow through their
+# constraints, pushing on what they touch. Only when the eased radius passes a
+# bead count's boundary by GooTuning.RESIZE_COUNT_HYSTERESIS is the ring rebuilt
+# with the new count (_rering(): on its own beads resampled, their velocities
+# interpolated, keeping the node, its id, kernel key, tags, colours, skin and
+# children), which emits `rebuilt`. set_rest_deform() deforms the rest outline on
+# top of the eased one (a squash along an axis of the rest space, an area scale),
+# sent the same way, cheap enough for every frame.
+
+## Emitted by resize(): `radius` changed from `old_radius` to `new_radius`
+## (the body eases into it over the resize's time; eased_radius() is where it is).
+signal resized(old_radius: float, new_radius: float)
+## Emitted when the ring was rebuilt in place with another bead count (a resize
+## carried it past a bead count's boundary, see resize()): the same node, id,
+## kernel key, tags, colours, skin and children, its beads resampled from
+## `old_points` (the bead loop just before, global, of the old count), so
+## anything that held the body by bead index must re-attach (GooWorld2D
+## re-attaches its grabs and then emits GooWorld2D.body_rebuilt). The kernel
+## forgets the ring's pair exclusions (set_pass_through()) as it does for a ring
+## that leaves it.
+signal rebuilt(old_points: PackedVector2Array)
+
+## The tuning keys a resize eases from one size's value to the other's
+## (_physics_at()); the others (bead_count, spacing, bead_radius, ring_radius,
+## target_area, radius) shape the ring and follow its scale.
+const RESIZE_EASED_KEYS: PackedStringArray = ["blob_mass", "bead_mass", "pressure_k", "skin_stiffness",
+	"skin_damping", "bending_stiffness", "bending_damping", "shape_match_k", "internal_damp", "linear_damp",
+	"bounce", "friction", "settle_speed", "settle_time", "inflate_time", "split_neck", "splat_area_ratio"]
+## The eased keys that are per bead (a ring of n beads shares its mass, and its
+## springs are built from that mass): a value tuned for a ring of m beads is
+## m / n times as much on a ring of n (_per_count()).
+const RESIZE_PER_BEAD_KEYS: PackedStringArray = ["bead_mass", "skin_stiffness", "skin_damping",
+	"bending_stiffness", "bending_damping"]
+
+# The eased radius (eased_radius()); 0 until a resize or a deformation first
+# needed the base (_ensure_base()).
+var _size_now: float = 0.0
+# True while a resize eases; the ease runs from _size_from to `radius` over
+# _size_time seconds, _size_elapsed so far.
+var _resizing: bool = false
+var _size_from: float = 0.0
+var _size_time: float = 0.0
+var _size_elapsed: float = 0.0
+# The eased keys at the ease's start and end (the end converted to this ring's
+# bead count), the world's whole tuning of the new size, and the target area's
+# lag behind the rest outline's at the start (target_area / _rest_target(): a
+# merged or cut ring still inflating, or an earlier ease), eased to 1.
+var _tuning_from: Dictionary = {}
+var _tuning_to: Dictionary = {}
+var _tuning_goal: Dictionary = {}
+var _lag_from: float = 1.0
+# rest_blend's rise per second while a resize carries on an inflate it took
+# over (or after a re-ring); 0 when none.
+var _blend_rate: float = 0.0
+# The bead count the size asks for (GooTuning.resize_count_held()), -1 before
+# the base; and how long an ease that ended has held a count its size would not
+# be built with (RESIZE_SETTLE_TIME).
+var _count_goal: int = -1
+var _hold_time: float = 0.0
+# The ring the eased one is scaled from: its radius, rest shape (about its
+# centroid), tuning, the area its rest shape's collision outline encloses, and
+# its rest outline (GooShape) at that radius.
+var _base_radius: float = 0.0
+var _base_rest: PackedVector2Array = PackedVector2Array()
+var _base_tuning: Dictionary = {}
+var _base_outline_area: float = 0.0
+var _base_shape: GooShape = null
+# The rest deformation (set_rest_deform()).
+var _squash: float = 1.0
+var _squash_axis: Vector2 = Vector2.RIGHT
+var _area_scale: float = 1.0
+# The inflate of a merged or cut ring (rebuild_from(), build_from_loop()), which
+# a resize takes over (kills, and eases on itself).
+var _inflate_tween: Tween = null
+
+## Makes the body `new_radius` px (for a polygon, its equivalent radius: the
+## rest outline scaled uniformly about its centroid), easing into it over
+## `time` seconds, or longer where GooTuning.RESIZE_MAX_LOG_RATE asks
+## (GooTuning.resize_time()): its target area, rest lengths, bead radius, rest
+## outline and size-dependent tuning (its world's tuning_for() of the new size)
+## follow the eased radius every physics frame, sent to the kernel in place;
+## where the eased radius passes a bead count's boundary (by
+## GooTuning.RESIZE_COUNT_HYSTERESIS) the ring is rebuilt with the new count on
+## its own beads (`rebuilt`). `radius` is the new size at once, the colour of a
+## body by size with it; eased_radius() follows. A call while an ease runs
+## starts from where it is (no jump), so a new target every frame is fine (the
+## size then follows it with a lag of about `time`). Wakes a settled body, takes
+## over a merged or cut ring's inflate, and keeps the kernel from splitting the
+## body by a pinch or a crush while it eases (GooTuning.RESIZE_SPLIT_GUARD).
+## Clamped, with a warning, to GooTuning.min_radius() … max_radius(). An unbuilt
+## body only takes the radius it will be built at. Emits `resized`.
+func resize(new_radius: float, time: float = GooTuning.RESIZE_TIME) -> void:
+	if not is_finite(new_radius):
+		push_warning("Goo2D.resize(): %s is not a radius" % new_radius)
+		return
+	var smallest := GooTuning.min_radius()
+	var largest := GooTuning.max_radius()
+	var wanted := clampf(new_radius, smallest, largest)
+	if absf(wanted - new_radius) > 0.0001 * largest:
+		push_warning("Goo2D.resize(): %.2f px is outside %.2f … %.2f px; clamped" % [new_radius, smallest, largest])
+	var old := radius
+	if _count == 0:
+		radius = wanted
+		resized.emit(old, wanted)
+		return
+	_begin_resize(wanted, time)
+	resized.emit(old, wanted)
+
+## The radius the body's ring is at now while a resize eases (resize()): from
+## the old size to `radius`. `radius` once the ease is over.
+func eased_radius() -> float:
+	return _size_now if _size_now > 0.0 else radius
+
+## True while a resize eases the body's size (resize()).
+func is_resizing() -> bool:
+	return _resizing
+
+## Deforms the body's rest outline, without rebuilding the ring: scaled by
+## `squash` along the unit vector `axis_rest` of its rest space (turned into
+## the world by ring_rotation()) and by 1 / squash across it, so its area is
+## kept (below 1 it flattens along the axis), and then by √`area_scale` as a
+## whole, with its bead radius, so its target area is `area_scale` times. On top
+## of an ongoing resize's eased outline. The beads follow through their
+## constraints, pushing on what they touch. squash is clamped to
+## GooTuning.DEFORM_SQUASH_MIN … DEFORM_SQUASH_MAX, area_scale to
+## DEFORM_AREA_MIN … DEFORM_AREA_MAX. Cheap: call it every physics frame (one
+## pass over the ring and one kernel call; nothing when nothing changed). A
+## change wakes a settled body and keeps the kernel from splitting it by a
+## pinch or a crush for GooTuning.RESIZE_SPLIT_GUARD. ring_rotation() and the
+## skin's rotation are measured against the undeformed rest shape, which a
+## squash along an axis does not turn.
+func set_rest_deform(squash: float, axis_rest: Vector2 = Vector2.RIGHT, area_scale: float = 1.0) -> void:
+	var s := clampf(squash if is_finite(squash) else 1.0, GooTuning.DEFORM_SQUASH_MIN, GooTuning.DEFORM_SQUASH_MAX)
+	var a := clampf(area_scale if is_finite(area_scale) else 1.0, GooTuning.DEFORM_AREA_MIN,
+		GooTuning.DEFORM_AREA_MAX)
+	var axis := _unit_or_right(axis_rest)
+	if s == _squash and a == _area_scale and axis == _squash_axis:
+		return
+	_squash = s
+	_area_scale = a
+	_squash_axis = axis
+	if _count == 0:
+		return
+	_ensure_base()
+	if _inflate_tween != null and _inflate_tween.is_valid() and _inflate_tween.is_running():
+		# A merged or cut ring still inflating: a resize to its own size carries
+		# the inflate on with the deformation over it.
+		_begin_resize(radius, maxf(float(tuning.get("inflate_time", GooTuning.INFLATE_TIME)), 0.0))
+	if not _resizing:
+		_push_rest(1.0, false)
+	_guard_splits()
+	if settled:
+		wake()
+
+## Takes the rest deformation away (set_rest_deform(1, RIGHT, 1)).
+func clear_rest_deform() -> void:
+	set_rest_deform(1.0, Vector2.RIGHT, 1.0)
+
+## The rest deformation set_rest_deform() set: { "squash", "axis", "area_scale" }.
+func rest_deform() -> Dictionary:
+	return { "squash": _squash, "axis": _squash_axis, "area_scale": _area_scale }
+
+# Starts (or restarts, from where it is) the ease to `wanted` over `time`
+# (resize()), without the signal.
+func _begin_resize(wanted: float, time: float) -> void:
+	_ensure_base()
+	var start := _physics_at(_size_progress())
+	var lag := _area_lag()
+	_size_from = _size_now
+	_tuning_goal = _parent_tuning(_sized(wanted))
+	_tuning_from = start
+	_tuning_to = _per_count(_tuning_goal, _count)
+	_lag_from = lag
+	_size_time = GooTuning.resize_time(_size_from, wanted, time)
+	_size_elapsed = 0.0
+	_hold_time = 0.0
+	if _inflate_tween != null and _inflate_tween.is_valid():
+		_inflate_tween.kill()
+		_inflate_tween = null
+	if rest_blend < 1.0:
+		_blend_rate = 1.0 / maxf(float(tuning.get("inflate_time", GooTuning.INFLATE_TIME)), 0.001)
+	radius = wanted
+	_resizing = true
+	reset_tint()
+	wake()
+	set_physics_process(true)
+	if _size_time <= 0.0:
+		_advance_resize(0.0)
+
+func _physics_process(delta: float) -> void:
+	if Engine.is_editor_hint() or _count == 0:
+		set_physics_process(false)
+		return
+	_advance_resize(delta)
+
+# One physics frame of the ease (see "Resizing and rest deformation" above):
+# the eased radius, a re-ring when it passed a bead count's boundary, the
+# tuning, the rest outline and target area sent to the kernel; after an ease
+# that left the body holding a count its size would not be built with, the
+# re-ring to that count once it held RESIZE_SETTLE_TIME. Stops processing
+# when there is nothing left to do.
+func _advance_resize(delta: float) -> void:
+	if rest_blend < 1.0 and _blend_rate > 0.0:
+		rest_blend = minf(rest_blend + _blend_rate * delta, 1.0)
+	if _resizing:
+		_size_elapsed += delta
+		var progress := _size_progress()
+		_size_now = _size_from * pow(radius / _size_from, progress) if _size_from > 0.0 else radius
+		var goal := GooTuning.resize_count_held(_base_shape, _size_now, _count_goal)
+		if goal != _count_goal and _rering(_size_now, goal):
+			return
+		_apply_tuning(_physics_at(progress))
+		_push_rest(lerpf(_lag_from, 1.0, progress), true)
+		_guard_splits()
+		if _kernel != null:
+			_kernel.wake(_key)
+		if progress >= 1.0:
+			_finish_resize()
+	elif _count_goal != GooTuning.resize_count(_base_shape, radius):
+		_hold_time += delta
+		if _hold_time >= GooTuning.RESIZE_SETTLE_TIME:
+			_hold_time = 0.0
+			_begin_resize(radius, GooTuning.RESIZE_TIME)
+			_rering(radius, GooTuning.resize_count(_base_shape, radius))
+		return
+	if not _resizing and rest_blend >= 1.0:
+		_blend_rate = 0.0
+		set_physics_process(false)
+
+# How far the ease has come, 0..1 (1 when none runs).
+func _size_progress() -> float:
+	if not _resizing or _size_time <= 0.0:
+		return 1.0
+	return clampf(_size_elapsed / _size_time, 0.0, 1.0)
+
+# The eased keys at `progress` of the ease, or the ring's tuning's when none runs.
+func _physics_at(progress: float) -> Dictionary:
+	var values := {}
+	for key: String in RESIZE_EASED_KEYS:
+		if not tuning.has(key):
+			continue
+		if _resizing and _tuning_from.has(key) and _tuning_to.has(key):
+			values[key] = lerpf(float(_tuning_from[key]), float(_tuning_to[key]), progress)
+		else:
+			values[key] = float(tuning[key])
+	return values
+
+# The eased keys of `values` (a tuning dictionary of its own bead count) for a
+# ring of `count` beads (RESIZE_PER_BEAD_KEYS scaled by the counts' ratio).
+static func _per_count(values: Dictionary, count: int) -> Dictionary:
+	var result := {}
+	var own := int(values.get("bead_count", count))
+	for key: String in RESIZE_EASED_KEYS:
+		if values.has(key):
+			result[key] = float(values[key])
+			if own != count and count > 0 and key in RESIZE_PER_BEAD_KEYS:
+				result[key] = float(values[key]) * own / count
+	return result
+
+# The rest outline of `at_radius` this body's proportions have: round, or its
+# polygon scaled.
+func _sized(at_radius: float) -> GooShape:
+	if _base_shape == null or _base_shape.is_round():
+		return GooShape.round(at_radius)
+	return _base_shape.scaled(at_radius)
+
+# Records the ring as built as the base the ease and the deformation scale from
+# (once: a re-ring or the end of an ease records the new one).
+func _ensure_base() -> void:
+	if _base_radius > 0.0:
+		return
+	var built := float(tuning.get("radius", radius))
+	_set_base(built if built > 0.0 else radius, rest_shape, tuning,
+		shape if shape != null and not shape.is_round() else GooShape.round(radius))
+	_size_now = _base_radius
+	_count_goal = GooTuning.resize_count(_base_shape, _base_radius)
+
+func _set_base(at_radius: float, rest: PackedVector2Array, ring_tuning: Dictionary, outline: GooShape) -> void:
+	_base_radius = at_radius
+	_base_rest = rest.duplicate()
+	_base_tuning = ring_tuning.duplicate()
+	_base_outline_area = GooTuning.outline_area(_base_rest, float(ring_tuning["bead_radius"]))
+	_base_shape = outline
+
+# The rest loop sent to the kernel now: the base rest shape scaled to the eased
+# radius and by √ the area scale, squashed along its axis; and the bead radius
+# scaled alike (_deformed_bead_radius()).
+func _deformed_rest() -> PackedVector2Array:
+	var linear := _size_now / _base_radius * sqrt(_area_scale)
+	if _squash == 1.0:
+		return GooLoop.scaled(_base_rest, linear)
+	return GooLoop.squashed(_base_rest, _squash, _squash_axis, linear)
+
+func _deformed_bead_radius() -> float:
+	return float(_base_tuning["bead_radius"]) * _size_now / _base_radius * sqrt(_area_scale)
+
+# The target area of the deformed rest loop `rest` with beads of `bead`:
+# what its collision outline encloses, in the base ring's proportion (its
+# tuning's target over what its rest loop's outline encloses: exactly 1 for a
+# ring GooTuning built).
+func _rest_target(rest: PackedVector2Array, bead: float) -> float:
+	if _base_outline_area <= 0.0:
+		return target_area
+	return float(_base_tuning["target_area"]) * GooTuning.outline_area(rest, bead) / _base_outline_area
+
+# How far target_area lags the rest outline's target now (1: not at all).
+func _area_lag() -> float:
+	var full := _rest_target(_deformed_rest(), _deformed_bead_radius())
+	return target_area / full if full > 0.0 else 1.0
+
+# Sends the eased, deformed rest outline, its bead radius and its target area
+# (× `lag`) to the kernel; rest_shape becomes the eased undeformed one (what
+# ring_rotation() and a cut fit), and with `scaled` a polygon's `shape` its
+# outline at the eased radius.
+func _push_rest(lag: float, scaled: bool) -> void:
+	var rest := _deformed_rest()
+	var bead := _deformed_bead_radius()
+	var factor := _size_now / _base_radius
+	rest_shape = GooLoop.scaled(_base_rest, factor)
+	_bead_radius = bead
+	if scaled and not _base_shape.is_round():
+		shape = _base_shape.scaled(_size_now)
+	if _kernel != null:
+		_kernel.set_rest(_key, rest, bead)
+	target_area = _rest_target(rest, bead) * lag
+
+# The ring's tuning at the eased radius: the eased keys `values`, the shaping
+# keys the base's scaled; sent to the kernel.
+func _apply_tuning(values: Dictionary) -> void:
+	var factor := _size_now / _base_radius
+	var ring_tuning := tuning.duplicate()
+	for key: String in values:
+		ring_tuning[key] = values[key]
+	ring_tuning["radius"] = _size_now
+	ring_tuning["bead_count"] = _count
+	for key: String in ["spacing", "bead_radius", "ring_radius"]:
+		if _base_tuning.has(key):
+			ring_tuning[key] = float(_base_tuning[key]) * factor
+	ring_tuning["target_area"] = float(_base_tuning["target_area"]) * factor * factor
+	tuning = ring_tuning
+	_bead_mass = float(ring_tuning["bead_mass"])
+	_body_mass = _bead_mass * _count
+	if _kernel != null:
+		var params := values.duplicate()
+		params["radius"] = _size_now
+		_kernel.set_ring_params(_key, params)
+
+# The ease reached its end: when the ring has the count its world builds the
+# new size with, it becomes exactly that ring (its tuning, rest shape and
+# corners as a body spawned at that size would have them, the deformation
+# over them); else it holds its count until RESIZE_SETTLE_TIME re-rings it.
+func _finish_resize() -> void:
+	_resizing = false
+	_size_now = radius
+	_hold_time = 0.0
+	if int(_tuning_goal.get("bead_count", -1)) != _count:
+		return
+	var sized := _sized(radius)
+	var rest := _rest_loop_of(sized, _tuning_goal)
+	if rest.size() != _count:
+		return
+	_set_base(radius, rest, _tuning_goal, sized)
+	_configure(_tuning_goal.duplicate())
+	_body_mass = _bead_mass * _count
+	_set_rest_geometry(rest)
+	if _kernel != null:
+		var params := _per_count(_tuning_goal, _count)
+		params["radius"] = radius
+		_kernel.set_ring_params(_key, params)
+	_push_rest(1.0, true)
+
+# The rest loop, about its centroid, of a ring of `outline` with `ring_tuning`
+# (as setup() and make() build it): the circle of its ring_radius, or the
+# polygon's bead loop; empty if the polygon is too thin for its beads.
+static func _rest_loop_of(outline: GooShape, ring_tuning: Dictionary) -> PackedVector2Array:
+	var count := int(ring_tuning["bead_count"])
+	var loop := GooLoop.circle_points(Vector2.ZERO, float(ring_tuning["ring_radius"]), count) if outline.is_round() \
+		else outline.bead_loop(count, float(ring_tuning["bead_radius"]))
+	if loop.size() != count:
+		return PackedVector2Array()
+	var centre := GooLoop.centroid(loop)
+	for i: int in loop.size():
+		loop[i] -= centre
+	return loop
+
+# What _build() derives from a rest loop (about its centroid) and the tuning:
+# rest_shape, its rest depths (a polygon's), edges, corners and the shortest
+# rest distance of a neck.
+func _set_rest_geometry(rest: PackedVector2Array) -> void:
+	var count := rest.size()
+	rest_shape = rest.duplicate()
+	_rest_depths = PackedFloat32Array() if _base_shape == null or _base_shape.is_round() else hull_depths(rest_shape)
+	_rest_edges.resize(count)
+	for i: int in count:
+		_rest_edges[i] = rest_shape[i].distance_to(rest_shape[(i + 1) % count])
+	_corner_flags = find_corners(rest_shape)
+	_has_corners = _corner_flags.has(1)
+	_min_neck_rest = 2.0 * float(tuning["ring_radius"]) * sin(PI * maxi(count / 4, 2) / count)
+
+# Rebuilds the ring in place with the bead count `goal` asks for at the eased
+# radius `at_radius` (see `rebuilt`): its world's tuning of that size, the rest
+# loop of it, the beads placed on the current bead loop at the rest loop's
+# fractions of its perimeter from the point nearest where rest bead 0 sits in
+# the ring's pose (GooLoop.place_like()), their velocities interpolated along
+# it; the same node and kernel key, its skin, tags, colours and children
+# untouched; its rest lengths eased in from the loop it is placed on (rest_blend
+# from 0, over inflate_time) and its target area kept, then eased on. The rest
+# of the ease carries on from here. False (and nothing changed but the goal,
+# so it is not tried every frame) when the polygon is too thin for that count.
+func _rering(at_radius: float, goal: int) -> bool:
+	var sized := _sized(at_radius)
+	var ring_tuning := _parent_tuning(sized)
+	var count := int(ring_tuning["bead_count"])
+	var rest := _rest_loop_of(sized, ring_tuning)
+	if rest.is_empty() or count < 3:
+		_count_goal = goal
+		return false
+	var old_points := _frame_points()
+	var loop := old_points.duplicate()
+	var velocities := bead_velocities()
+	if not GooLoop.is_ccw(loop):
+		loop.reverse()
+		velocities.reverse()
+	var turn := ring_rotation()
+	var centre := center()
+	var pose := PackedVector2Array()
+	for point: Vector2 in rest:
+		pose.append(centre + point.rotated(turn))
+	var placed := GooLoop.place_like(loop, velocities, pose)
+	var remaining := (1.0 - _size_progress()) * _size_time if _resizing else 0.0
+	_unregister_ring()
+	_configure(ring_tuning)
+	if not sized.is_round():
+		shape = sized
+	_set_base(at_radius, rest, ring_tuning, sized)
+	_set_rest_geometry(rest)
+	_count = count
+	_points = placed[0]
+	_velocities = placed[1]
+	_body_mass = _bead_mass * count
+	_size_now = at_radius
+	_count_goal = goal
+	_tuning_from = _per_count(ring_tuning, count)
+	_tuning_to = _per_count(_tuning_goal, count) if not _tuning_goal.is_empty() else _tuning_from
+	_size_from = at_radius
+	_size_elapsed = 0.0
+	_size_time = remaining
+	rest_blend = 0.0
+	_blend_rate = 1.0 / maxf(float(ring_tuning.get("inflate_time", GooTuning.INFLATE_TIME)), 0.001)
+	_register_ring(_points)
+	_lag_from = _area_lag()
+	_push_rest(_lag_from, true)
+	_guard_splits()
+	set_physics_process(true)
+	rebuilt.emit(old_points)
+	return true
+
+# Keeps the kernel from splitting the ring by a pinch or a crush for
+# GooTuning.RESIZE_SPLIT_GUARD (or the lock it has, if longer).
+func _guard_splits() -> void:
+	if _kernel != null:
+		_kernel.set_ring_param(_key, &"split_lock", maxf(_kernel.split_lock(_key), GooTuning.RESIZE_SPLIT_GUARD))
 
 # ---- Editor preview ----
 
