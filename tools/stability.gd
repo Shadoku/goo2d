@@ -60,6 +60,16 @@ extends SceneTree
 ##   what births counts (explosions, tangled bodies, births gone wrong), plus
 ##   the resizes asked, the rings rebuilt (GooWorld2D.body_rebuilt) and the
 ##   splits and merges.
+## - links: a 2400-frame random game of links (seeded by --seed=N): every
+##   LINK_SPAWN_EVERY frames a body (round, square or triangle) is dropped and,
+##   most of the time, linked to a random body already there (bodies apart are
+##   drawn together), now and then a random link is released and a random body
+##   thrown, all in the arena under gravity, its blades cutting. Prints the links
+##   made, released by unlink() and by a body leaving (a split, a merge, a trim),
+##   the frames a linked body was unsound (a bead not finite, or its area off
+##   LINK_AREA_RANGE of its target), the most beads of a linked body inside its
+##   partner's loop, and how far a link stretched at most (its pairs' longest
+##   over their rest length, px at unit 1).
 ## - scale (only when named): the length unit's gate (docs/tiled-boards-plan.md,
 ##   step 1): the smallest blob's rebound from a 500 px drop, the time blobs take
 ##   to settle on the floor after it, and whether launch-size blobs dropped on
@@ -89,7 +99,7 @@ func _initialize() -> void:
 		elif not arg.begins_with("--"):
 			scenarios.append(arg)
 	if scenarios.is_empty():
-		scenarios = ["passthrough", "inside", "skin", "impale", "impale_pile", "births"]
+		scenarios = ["passthrough", "inside", "skin", "impale", "impale_pile", "births", "links"]
 	# Before the world exists: its kernel takes the solver's settings when made.
 	GooTuning.unit = _unit
 	_main = (load(MAIN_SCENE) as PackedScene).instantiate()
@@ -124,6 +134,7 @@ func _run(scenarios: Array[String]) -> void:
 			"impale": await _impale()
 			"impale_pile": await _impale_pile()
 			"births": await _births()
+			"links": await _links()
 			"scale": await _scale()
 			"resize": await _resize_game()
 			_: push_error("stability: unknown scenario %s" % scenario)
@@ -805,6 +816,82 @@ func _on_birth_merge() -> void:
 			print("    child beads %s" % [child.bead_points()])
 			for parent: Dictionary in parents:
 				print("    parent beads %s" % [parent["loop"]])
+
+# ---- links ----
+
+## Frames the links game lasts, and how often it drops a body.
+const LINK_FRAMES: int = 2400
+const LINK_SPAWN_EVERY: int = 30
+## Chances, per drop, that the body is linked to one already there; that a
+## random link is released; that a random body is thrown.
+const LINK_CHANCE: float = 0.75
+const UNLINK_CHANCE: float = 0.15
+const THROW_CHANCE: float = 0.3
+## The most bodies the game keeps.
+const LINK_MAX_BODIES: int = 24
+## A linked body's area outside this range of its target area counts as unsound.
+const LINK_AREA_RANGE := Vector2(0.6, 1.5)
+
+func _links() -> void:
+	await _reset()
+	var rng := RandomNumberGenerator.new()
+	rng.seed = _birth_seed
+	var made := 0
+	# Counted by the lambda below (a lambda captures plain locals by value).
+	var counts := { "released": 0, "by_call": 0 }
+	var unsound_frames := 0
+	var worst_inside := 0
+	var worst_stretch := 0.0
+	var by_call := [false]
+	var on_unlinked := func(_h: int, _a: int, _b: int) -> void:
+		counts["released"] += 1
+		if by_call[0]:
+			counts["by_call"] += 1
+	_game.bodies_unlinked.connect(on_unlinked)
+	for f: int in LINK_FRAMES:
+		if f % LINK_SPAWN_EVERY == 0 and _game.bodies().size() < LINK_MAX_BODIES:
+			var radius := rng.randf_range(DropController.drop_min_radius(), DropController.drop_max_radius())
+			var roll := rng.randf()
+			var sides := 4 if roll < 0.2 else (3 if roll < 0.35 else 0)
+			var bodies := _game.bodies()
+			var body := _game.spawn(radius, _at(Vector2(rng.randf_range(Arena.INNER_LEFT + 150.0, Arena.INNER_RIGHT - 150.0),
+				Arena.DROP_Y)), _shape_of(sides, radius))
+			if not bodies.is_empty() and rng.randf() < LINK_CHANCE:
+				var other: Goo2D = bodies[rng.randi_range(0, bodies.size() - 1)]
+				if _game.link(body, other, rng.randf_range(0.1, 1.0)) >= 0:
+					made += 1
+			var handles := _game.links()
+			if not handles.is_empty() and rng.randf() < UNLINK_CHANCE:
+				by_call[0] = true
+				_game.unlink(handles[rng.randi_range(0, handles.size() - 1)])
+				by_call[0] = false
+			if rng.randf() < THROW_CHANCE:
+				var thrown: Goo2D = _game.bodies()[rng.randi_range(0, _game.bodies().size() - 1)]
+				thrown.set_velocity(Vector2(rng.randf_range(-1.0, 1.0), rng.randf_range(-1.0, 0.2)).normalized()
+					* _u(rng.randf_range(300.0, 1200.0)))
+		await physics_frame
+		var sound := true
+		for handle: int in _game.links():
+			var pair := _game.link_bodies(handle)
+			for body: Goo2D in pair:
+				var ratio := body.area() / maxf(body.target_area, 0.000001)
+				if ratio < LINK_AREA_RANGE.x or ratio > LINK_AREA_RANGE.y or not body.center().is_finite():
+					sound = false
+			worst_inside = maxi(worst_inside, maxi(pair[0].beads_inside(pair[1], 0.0), pair[1].beads_inside(pair[0], 0.0)))
+			var info := _game.kernel().link_info(handle)
+			if float(info.get("ease", 0.0)) < 1.0:
+				continue
+			var held := _game.link_info(handle)
+			var rest: PackedFloat32Array = info["rest_lengths"]
+			for k: int in rest.size():
+				var length := pair[0].bead_position(held.pairs[2 * k]).distance_to(pair[1].bead_position(held.pairs[2 * k + 1]))
+				worst_stretch = maxf(worst_stretch, (length - rest[k]) / _unit)
+		if not sound:
+			unsound_frames += 1
+	_game.bodies_unlinked.disconnect(on_unlinked)
+	print("links: seed %d, %d frames, %d bodies and %d links at the end; %d links made, %d released (%d by unlink(), %d by a body leaving: %d splits, %d merges, %d trims); %d frames with a linked body unsound; at worst %d beads of a linked body inside its partner; a pair stretched %.1f px past its rest length at most"
+		% [_birth_seed, LINK_FRAMES, _game.bodies().size(), _game.links().size(), made, counts["released"], counts["by_call"],
+			counts["released"] - counts["by_call"], _splits, _merges, _trims, unsound_frames, worst_inside, worst_stretch])
 
 # ---- scale ----
 

@@ -19,6 +19,7 @@ mod forces;
 mod geom;
 mod grid;
 mod kernel;
+mod links;
 mod pinch;
 mod skin;
 mod statics;
@@ -604,6 +605,126 @@ impl GooKernel {
     #[func]
     fn set_bead_pass_through(&mut self, key: i64, bead: i64, other: i64, on: bool) {
         self.k.set_bead_pass_through(key, bead.max(0) as usize, other, on);
+    }
+
+    // ---- Links (links.rs) ----
+
+    /// Adds (or replaces) the link `id` tying ring `key_a` to ring `key_b`: `pairs` holds
+    /// bead index pairs [bead of a, bead of b, ...]; `through_a` and `through_b` the beads
+    /// of each that do not collide with each other (the tied ones and their close
+    /// neighbours); `params` any of "gap" (px between the patches' bead centres at rest),
+    /// "stiffness", "damping" (the pairs', per reduced bead mass: 1/s², 1/s),
+    /// "bend_stiffness", "bend_damping" (the angular term's, per reduced moment of
+    /// inertia), "rest_angle" (radians), "ease_time" (s) and "min_rest" (px). The link
+    /// eases from where the rings are into its ideal pose. Removed with either ring.
+    /// False (nothing added) for a missing ring, one ring twice, no pairs or a bead out
+    /// of range.
+    #[func]
+    fn add_link(
+        &mut self,
+        id: i64,
+        key_a: i64,
+        key_b: i64,
+        pairs: PackedInt32Array,
+        through_a: PackedInt32Array,
+        through_b: PackedInt32Array,
+        params: VarDictionary,
+    ) -> bool {
+        let flat = pairs.as_slice();
+        if flat.len() < 2 || flat.len() % 2 != 0 || flat.iter().any(|&i| i < 0) {
+            godot_error!("GooKernel.add_link(): pairs must be [bead of a, bead of b, ...], got {} values", flat.len());
+            return false;
+        }
+        let p = links::LinkParams {
+            gap: num(&params, "gap") as f32,
+            stiffness: num(&params, "stiffness") as f32,
+            damping: num(&params, "damping") as f32,
+            bend_stiffness: num(&params, "bend_stiffness") as f32,
+            bend_damping: num(&params, "bend_damping") as f32,
+            rest_angle: num(&params, "rest_angle") as f32,
+            ease_time: num(&params, "ease_time") as f32,
+            min_rest: num(&params, "min_rest") as f32,
+        };
+        let beads = |a: &PackedInt32Array| a.as_slice().iter().filter(|&&i| i >= 0).map(|&i| i as usize).collect::<Vec<_>>();
+        self.k.add_link(
+            id,
+            key_a,
+            key_b,
+            flat.chunks_exact(2).map(|c| (c[0] as usize, c[1] as usize)).collect(),
+            beads(&through_a),
+            beads(&through_b),
+            p,
+        )
+    }
+
+    /// Sets one of link `id`'s knobs, by add_link()'s names (not "gap" or "ease_time":
+    /// fixed at add_link()). "rest_angle" moves its pose's targets at once; a link still
+    /// easing in eases toward the new ones.
+    #[func]
+    fn set_link_param(&mut self, id: i64, name: StringName, value: f64) {
+        let name = name.to_string();
+        let Some(l) = self.k.link_mut(id) else { return };
+        let v = value as f32;
+        match name.as_str() {
+            "stiffness" => l.p.stiffness = v,
+            "damping" => l.p.damping = v,
+            "bend_stiffness" => l.p.bend_stiffness = v,
+            "bend_damping" => l.p.bend_damping = v,
+            "rest_angle" | "min_rest" => {
+                if name == "rest_angle" {
+                    l.p.rest_angle = v;
+                } else {
+                    l.p.min_rest = v;
+                }
+                l.set_goal();
+                l.refresh();
+            }
+            other => godot_error!("GooKernel.set_link_param(): unknown parameter '{}'", other),
+        }
+    }
+
+    #[func]
+    fn remove_link(&mut self, id: i64) {
+        self.k.remove_link(id);
+    }
+
+    #[func]
+    fn has_link(&self, id: i64) -> bool {
+        self.k.link(id).is_some()
+    }
+
+    /// The links' ids, in the order they were added.
+    #[func]
+    fn link_ids(&self) -> PackedInt64Array {
+        PackedInt64Array::from(self.k.links.iter().map(|l| l.id).collect::<Vec<_>>().as_slice())
+    }
+
+    /// Link `id` as { "key_a", "key_b", "pairs" (flat, as add_link() takes them),
+    /// "through_a", "through_b", "rest_lengths" (what the solver holds now),
+    /// "goal_lengths" (at its rest angle, eased in), "rest_angle", "ease" (0..1),
+    /// "target_angle" (θ_b − θ_a the solver pulls toward), "angle" (θ_b − θ_a now),
+    /// "bend" (angle less the pose's: what rest_angle names, now) }; empty if none.
+    #[func]
+    fn link_info(&self, id: i64) -> VarDictionary {
+        let mut d = VarDictionary::new();
+        let Some(l) = self.k.link(id) else { return d };
+        put(&mut d, "key_a", l.ka);
+        put(&mut d, "key_b", l.kb);
+        let flat: Vec<i32> = l.pairs.iter().flat_map(|&(i, j)| [i as i32, j as i32]).collect();
+        put(&mut d, "pairs", PackedInt32Array::from(flat.as_slice()));
+        put(&mut d, "through_a", indices(&l.through_a));
+        put(&mut d, "through_b", indices(&l.through_b));
+        put(&mut d, "rest_lengths", PackedFloat32Array::from(l.rest.as_slice()));
+        put(&mut d, "goal_lengths", PackedFloat32Array::from(l.goal.as_slice()));
+        put(&mut d, "rest_angle", l.p.rest_angle as f64);
+        put(&mut d, "ease", l.ease as f64);
+        put(&mut d, "target_angle", l.target_angle as f64);
+        if let (Some(a), Some(b)) = (self.k.find(l.ka), self.k.find(l.kb)) {
+            let angle = self.k.relative_angle(a, b);
+            put(&mut d, "angle", angle as f64);
+            put(&mut d, "bend", links::wrap(angle - l.pose.psi) as f64);
+        }
+        d
     }
 
     // ---- Statics: the kernel's math on plain arrays, for the tests ----

@@ -35,6 +35,7 @@ use crate::consts::*;
 use crate::forces::*;
 use crate::geom::*;
 use crate::grid::Grid;
+use crate::links::{self, Link, LinkParams};
 use crate::pinch;
 use crate::skin;
 use crate::statics::StaticShape;
@@ -320,6 +321,8 @@ pub struct Kernel {
     untangling: Vec<(i64, i64)>,
     /// Ring pairs passing through each other on request (`set_pass_through`).
     passing: Vec<(i64, i64)>,
+    /// The links between rings (links.rs, `add_link`).
+    pub links: Vec<Link>,
     step_count: i64,
     /// Substeps of the last step (for the tests and the bench).
     pub last_substeps: usize,
@@ -355,6 +358,7 @@ impl Default for Kernel {
             through: Vec::new(),
             untangling: Vec::new(),
             passing: Vec::new(),
+            links: Vec::new(),
             step_count: 0,
             last_substeps: 0,
             last_capped: 0,
@@ -630,6 +634,7 @@ impl Kernel {
         self.through.retain(|t| t.ring != key && t.other != key);
         self.untangling.retain(|&(a, b)| a != key && b != key);
         self.passing.retain(|&(a, b)| a != key && b != key);
+        self.links.retain(|l| l.ka != key && l.kb != key);
         self.partners.remove(&key);
         self.reindex();
         self.refresh_exclusion_flags();
@@ -691,6 +696,7 @@ impl Kernel {
             .flat_map(|t| [t.ring, t.other])
             .chain(self.untangling.iter().flat_map(|&(a, b)| [a, b]))
             .chain(self.passing.iter().flat_map(|&(a, b)| [a, b]))
+            .chain(self.links.iter().flat_map(|l| [l.ka, l.kb]))
             .collect();
         for k in keys {
             if let Some(&i) = self.index.get(&k) {
@@ -704,6 +710,12 @@ impl Kernel {
         let (ka, kb) = (self.rings[ra].key, self.rings[rb].key);
         let pair = pair_key(ka, kb);
         if self.untangling.contains(&pair) || self.passing.contains(&pair) {
+            return true;
+        }
+        if self.links.iter().any(|l| {
+            (l.ka == ka && l.kb == kb && l.through_a.contains(&ia) && l.through_b.contains(&ib))
+                || (l.ka == kb && l.kb == ka && l.through_a.contains(&ib) && l.through_b.contains(&ia))
+        }) {
             return true;
         }
         self.through.iter().any(|t| {
@@ -755,6 +767,10 @@ impl Kernel {
     pub fn bead_passes_through(&self, ring: i64, bead: usize, other: i64) -> bool {
         self.through.iter().any(|t| t.ring == ring && t.other == other && t.beads.contains(&bead))
             || self.passing.contains(&pair_key(ring, other))
+            || self.links.iter().any(|l| {
+                (l.ka == ring && l.kb == other && l.through_a.contains(&bead))
+                    || (l.kb == ring && l.ka == other && l.through_b.contains(&bead))
+            })
     }
 
     // ---- Static shapes ----
@@ -897,6 +913,10 @@ impl Kernel {
         if self.pair_passes {
             self.separate_overlaps(delta);
         }
+        // Links: their ease, and a settled ring woken by a moving partner.
+        if !self.links.is_empty() {
+            self.step_links(delta);
+        }
         // 3. The solver.
         let stepped: Vec<bool> = self.rings.iter().map(|r| !r.settled).collect();
         self.integrate(delta as f32);
@@ -1015,6 +1035,21 @@ impl Kernel {
             }
             for other in &r.touching {
                 if let Some(&o) = self.index.get(other) {
+                    if !group.contains(&o) {
+                        group.push(o);
+                    }
+                }
+            }
+            // Linked rings settle together, like rings in contact.
+            for l in &self.links {
+                let other = if l.ka == r.key {
+                    l.kb
+                } else if l.kb == r.key {
+                    l.ka
+                } else {
+                    continue;
+                };
+                if let Some(&o) = self.index.get(&other) {
                     if !group.contains(&o) {
                         group.push(o);
                     }
@@ -1194,6 +1229,9 @@ impl Kernel {
             let r = &self.rings[idx];
             solve_ring(r, &mut self.ps.pos[r.start..r.start + r.n], &self.ps.prev[r.start..r.start + r.n], h);
         }
+        if !self.links.is_empty() {
+            self.solve_links(h);
+        }
         // Contacts.
         self.contacts.clear();
         self.touch_pairs.clear();
@@ -1356,6 +1394,12 @@ impl Kernel {
             if q <= fast_limit {
                 cell_reach = cell_reach.max(q);
             }
+        }
+        if cell_reach <= 0.0 {
+            // Every particle is fast (a whole linked chain whipped about): cells fit the
+            // shortest reach instead of collapsing to 1 px, which made each particle
+            // look up thousands of cells.
+            cell_reach = self.reach.iter().copied().fold(f32::INFINITY, f32::min);
         }
         let cell = (2.0 * cell_reach + slop).max(1.0);
         self.grid.build(&self.ps.pos, cell);
@@ -1548,6 +1592,184 @@ impl Kernel {
         }
     }
 
+    // ---- Links (links.rs) ----
+
+    /// Adds (or replaces) the link `id` between rings `ka` and `kb`: the bead pairs
+    /// `pairs` (bead of `ka`, bead of `kb`), the beads of each that pass through the
+    /// other's (`through_a`, `through_b`) and its knobs. The ideal pose comes from the two
+    /// rings' rest shapes; the link eases into it from where the rings are now. False
+    /// (and nothing added) for a ring that is missing, the same ring twice, no pairs or
+    /// a bead out of range.
+    pub fn add_link(
+        &mut self,
+        id: i64,
+        ka: i64,
+        kb: i64,
+        pairs: Vec<(usize, usize)>,
+        through_a: Vec<usize>,
+        through_b: Vec<usize>,
+        p: LinkParams,
+    ) -> bool {
+        let (Some(a), Some(b)) = (self.find(ka), self.find(kb)) else { return false };
+        if a == b || pairs.is_empty() {
+            return false;
+        }
+        let (na, nb) = (self.rings[a].n, self.rings[b].n);
+        if pairs.iter().any(|&(i, j)| i >= na || j >= nb) || self.rings[a].rest.len() != na || self.rings[b].rest.len() != nb {
+            return false;
+        }
+        self.remove_link(id);
+        let pose = links::ideal_pose(&self.rings[a].rest, &self.rings[b].rest, &pairs, p.gap);
+        let (ra, rb) = (&self.rings[a], &self.rings[b]);
+        let start: Vec<f32> = pairs.iter().map(|&(i, j)| dist(self.ps.pos[ra.start + i], self.ps.pos[rb.start + j])).collect();
+        let start_angle = self.relative_angle(a, b);
+        let mut link = Link {
+            id,
+            ka,
+            kb,
+            through_a: through_a.into_iter().filter(|&i| i < na).collect(),
+            through_b: through_b.into_iter().filter(|&j| j < nb).collect(),
+            pairs,
+            pose,
+            p,
+            goal: Vec::new(),
+            start,
+            start_angle,
+            ease: if p.ease_time > 0.0 { 0.0 } else { 1.0 },
+            rest: Vec::new(),
+            target_angle: 0.0,
+        };
+        link.set_goal();
+        link.refresh();
+        self.links.push(link);
+        // A pair being untangled when linked is let go: the link holds it now.
+        let pair = pair_key(ka, kb);
+        self.untangling.retain(|&q| q != pair);
+        self.refresh_exclusion_flags();
+        if self.rings[a].settled {
+            self.wake(a, true);
+        }
+        if self.rings[b].settled {
+            self.wake(b, true);
+        }
+        true
+    }
+
+    pub fn remove_link(&mut self, id: i64) {
+        let before = self.links.len();
+        self.links.retain(|l| l.id != id);
+        if self.links.len() != before {
+            self.refresh_exclusion_flags();
+        }
+    }
+
+    pub fn link(&self, id: i64) -> Option<&Link> {
+        self.links.iter().find(|l| l.id == id)
+    }
+
+    pub fn link_mut(&mut self, id: i64) -> Option<&mut Link> {
+        self.links.iter_mut().find(|l| l.id == id)
+    }
+
+    /// The index in `links` of a link between rings `ka` and `kb` (either way round).
+    fn link_between(&self, ka: i64, kb: i64) -> Option<usize> {
+        self.links.iter().position(|l| (l.ka == ka && l.kb == kb) || (l.ka == kb && l.kb == ka))
+    }
+
+    /// θ_b − θ_a of rings `a` and `b` (indices): their best-fit rotations' difference.
+    pub fn relative_angle(&self, a: usize, b: usize) -> f32 {
+        let (ra, rb) = (&self.rings[a], &self.rings[b]);
+        let (ta, _) = links::frame(&ra.rest, &self.ps.pos[ra.start..ra.start + ra.n]);
+        let (tb, _) = links::frame(&rb.rest, &self.ps.pos[rb.start..rb.start + rb.n]);
+        links::wrap(tb - ta)
+    }
+
+    /// Once per step: every link eases on, and a settled ring linked to an awake one
+    /// wakes (as a contact would wake it).
+    fn step_links(&mut self, delta: f64) {
+        let mut wake = Vec::new();
+        for l in self.links.iter_mut() {
+            if l.ease < 1.0 {
+                l.ease = if l.p.ease_time > 0.0 { (l.ease + delta as f32 / l.p.ease_time).min(1.0) } else { 1.0 };
+                l.refresh();
+            }
+            if let (Some(&a), Some(&b)) = (self.index.get(&l.ka), self.index.get(&l.kb)) {
+                let (sa, sb) = (self.rings[a].settled, self.rings[b].settled);
+                if sa != sb {
+                    wake.push(if sa { a } else { b });
+                }
+            }
+        }
+        for idx in wake {
+            if self.rings[idx].settled {
+                self.wake(idx, true);
+            }
+        }
+    }
+
+    /// One substep `h` of every link: each pair's distance toward its rest length, then
+    /// the relative angle toward its target (links.rs), XPBD with the link's stiffness
+    /// and damping per reduced mass. A settled ring does not move (inverse mass 0).
+    fn solve_links(&mut self, h: f32) {
+        let h2 = h * h;
+        for li in 0..self.links.len() {
+            let l = &self.links[li];
+            let (Some(&a), Some(&b)) = (self.index.get(&l.ka), self.index.get(&l.kb)) else { continue };
+            let (ra, rb) = (&self.rings[a], &self.rings[b]);
+            let wa = if ra.settled { 0.0 } else { ra.w };
+            let wb = if rb.settled { 0.0 } else { rb.w };
+            let wsum = wa + wb;
+            if wsum <= 0.0 {
+                continue;
+            }
+            let (sa, sb) = (ra.start, rb.start);
+            let pos = &mut self.ps.pos;
+            let prev = &self.ps.prev;
+            if l.p.stiffness > 0.0 {
+                let m = 1.0 / wsum;
+                let alpha = 1.0 / (l.p.stiffness * m);
+                let alpha_t = alpha / h2;
+                let gamma = alpha * l.p.damping * m / h;
+                let denom = (1.0 + gamma) * wsum + alpha_t;
+                for (k, &(i, j)) in l.pairs.iter().enumerate() {
+                    let (pi, pj) = (sa + i, sb + j);
+                    let d = pos[pj] - pos[pi];
+                    let length = len(d);
+                    if length < 1e-6 {
+                        continue;
+                    }
+                    let dir = d / length;
+                    let c = length - l.rest[k];
+                    let moving = dot(dir, (pos[pj] - prev[pj]) - (pos[pi] - prev[pi]));
+                    let dl = (-c - gamma * moving) / denom;
+                    pos[pi] -= dir * (wa * dl);
+                    pos[pj] += dir * (wb * dl);
+                }
+            }
+            if l.p.bend_stiffness > 0.0 {
+                let (na, nb) = (ra.n, rb.n);
+                let (ta, ca) = links::frame(&ra.rest, &pos[sa..sa + na]);
+                let (tb, cb) = links::frame(&rb.rest, &pos[sb..sb + nb]);
+                let (ta0, _) = links::frame(&ra.rest, &prev[sa..sa + na]);
+                let (tb0, _) = links::frame(&rb.rest, &prev[sb..sb + nb]);
+                let ia = if ra.settled { 0.0 } else { 1.0 / (ra.p.bead_mass as f32 * links::spread(&pos[sa..sa + na], ca)).max(1e-6) };
+                let ib = if rb.settled { 0.0 } else { 1.0 / (rb.p.bead_mass as f32 * links::spread(&pos[sb..sb + nb], cb)).max(1e-6) };
+                let isum = ia + ib;
+                if isum > 0.0 {
+                    let inertia = 1.0 / isum;
+                    let alpha = 1.0 / (l.p.bend_stiffness * inertia);
+                    let alpha_t = alpha / h2;
+                    let gamma = alpha * l.p.bend_damping * inertia / h;
+                    let c = links::wrap(tb - ta - l.target_angle);
+                    let moving = links::wrap(tb - tb0) - links::wrap(ta - ta0);
+                    let dl = (-c - gamma * moving) / ((1.0 + gamma) * isum + alpha_t);
+                    links::turn(&mut pos[sa..sa + na], ca, -ia * dl);
+                    links::turn(&mut pos[sb..sb + nb], cb, ib * dl);
+                }
+            }
+        }
+    }
+
     // ---- Pair passes (GooWorld2D._separate_overlaps) ----
 
     fn separate_overlaps(&mut self, delta: f64) {
@@ -1568,6 +1790,7 @@ impl Kernel {
                 if self.partners.get(&ka) == Some(&kb) {
                     continue;
                 }
+                let linked = if self.links.is_empty() { None } else { self.link_between(ka, kb) };
                 if self.rings[i].settled && self.rings[j].settled && !self.is_untangling(ka, kb) {
                     // Asleep together: only a bead inside the other's loop matters.
                     let (a, b) = (&self.rings[i], &self.rings[j]);
@@ -1608,7 +1831,7 @@ impl Kernel {
                         ((t.ring == ka && t.other == kb) || (t.ring == kb && t.other == ka))
                             && self.step_count - t.since >= STUCK_STEPS
                     });
-                if hit.deep() || untangling || stuck {
+                if linked.is_none() && (hit.deep() || untangling || stuck) {
                     if !untangling {
                         self.through.retain(|t| !((t.ring == ka && t.other == kb) || (t.ring == kb && t.other == ka)));
                         self.begin_untangle(i, j, delta);
@@ -1617,6 +1840,24 @@ impl Kernel {
                 }
                 self.let_through(i, j, &hit.beads_in_a, &hit.reach_a, &mut seen);
                 self.let_through(j, i, &hit.beads_in_b, &hit.reach_b, &mut seen);
+                let mut hit = hit;
+                if let Some(l) = linked {
+                    // A linked pair's own beads are not pushed apart (the link holds
+                    // them together), and the pair is never handed to the Untangler,
+                    // which would let every bead through and part them.
+                    let l = &self.links[l];
+                    let (own_i, own_j) = if l.ka == ka { (&l.through_a, &l.through_b) } else { (&l.through_b, &l.through_a) };
+                    for &b in own_i {
+                        if let Some(f) = hit.forces_a.get_mut(b) {
+                            *f = Vector2::ZERO;
+                        }
+                    }
+                    for &b in own_j {
+                        if let Some(f) = hit.forces_b.get_mut(b) {
+                            *f = Vector2::ZERO;
+                        }
+                    }
+                }
                 summed(&mut forces[i], &hit.forces_a);
                 summed(&mut forces[j], &hit.forces_b);
             }

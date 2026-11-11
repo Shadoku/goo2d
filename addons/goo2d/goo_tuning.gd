@@ -211,6 +211,48 @@ const GRAB_REACH: float = 0.8
 ## blobs, which hang 1.05-1.4 × as tall as they rest.
 const GRAB_CARRY: float = 0.3
 
+# ---- Links (GooWorld2D.link(), GooLink) ----
+# A link ties a patch of beads on one body to a patch on another, pair by pair,
+# with compliant distance constraints and an angular term (the kernel's
+# links.rs). Its stiffnesses are per reduced mass (1/s², like the grab's) and
+# its sizes are fractions of the bodies' radii or bead radii, so `unit` leaves
+# every one of them alone.
+
+## The pairs' stiffness, px/s² per px a pair is off its rest length, per
+## reduced bead mass (a frequency squared: 1/s²). XPBD, so any value is stable.
+const LINK_STIFFNESS: float = 20000.0
+## The pairs' damping, 1/s per reduced bead mass.
+const LINK_DAMPING: float = 80.0
+## The angular term's stiffness at strength 1, 1/s² per reduced moment of
+## inertia: how hard the bodies' relative rotation is pulled toward the link's
+## rest angle (scaled by the strength: a thread bends freely).
+const LINK_BEND_STIFFNESS: float = 600.0
+## The angular term's damping at strength 1, 1/s (× √strength).
+const LINK_BEND_DAMPING: float = 30.0
+## How wide the tied patch is at strength 1, as a fraction of the smaller
+## body's radius (strength scales it: at 0.1 one pair, a thread).
+const LINK_PATCH_RATIO: float = 1.0
+## The gap between the tied beads' centres at rest, in sums of their bead
+## radii: 1, the two collision outlines just touching at the neck (the bridge
+## skin fills the waist), so the beads beside the patch, which still collide,
+## do not push against the link at rest.
+const LINK_GAP: float = 1.0
+## The shortest a pair's rest length gets (a rest angle closing one side of
+## the neck), in sums of the two bead radii.
+const LINK_MIN_REST: float = 0.25
+## Beads beyond each end of a tied patch that pass through the other body's
+## patch too. 0: only the tied beads pass through each other (the neck does
+## not fight itself); every other bead collides, which keeps the bodies from
+## folding into each other (at 2, half of a strong link's ring passed through
+## and a pulled pair could settle overlapping, its patches crossed).
+const LINK_THROUGH_BEADS: int = 0
+## Seconds a new link takes at least to ease from where its bodies are into
+## its rest pose: bodies linked apart are drawn together, not snapped.
+const LINK_EASE_TIME: float = 0.3
+## The fastest, px/s at unit 1 (link_ease_speed() scales it), a new link draws
+## bodies linked apart together: its ease takes longer for a longer way.
+const LINK_EASE_SPEED: float = 300.0
+
 ## Seconds a merged blob takes to fade from its flash to its colour.
 const MERGE_FLASH: float = 0.2
 ## How far toward white a merged ring starts its MERGE_FLASH: its inflating is
@@ -271,6 +313,10 @@ static func solver_settings() -> Dictionary:
 		"untangle_strength": UNTANGLE_STRENGTH,
 		"untangle_separation_speed": UNTANGLE_SEPARATION_SPEED * unit,
 	}
+
+## LINK_EASE_SPEED at the length unit, px/s.
+static func link_ease_speed() -> float:
+	return LINK_EASE_SPEED * unit
 
 ## A new GooKernel with solver_settings().
 static func make_kernel() -> GooKernel:

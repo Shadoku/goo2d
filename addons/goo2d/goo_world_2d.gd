@@ -74,6 +74,13 @@ extends Node2D
 ## point, release_grab() lets go or throws. A held body never settles. A body
 ## that leaves the world (a split, a merge, a trim, despawn(), clear()) lets
 ## go of its grabs. body_at() finds the body under a point.
+##
+## Linking: link() joins two of its bodies so they hold together and bend at
+## the joint, drawn as one blob with a neck (GooLink: the kernel's link
+## constraints and the bridge skin); unlink() parts them. Linked bodies never
+## merge with each other (may_merge() is not asked for them). A body that
+## leaves the world (a split, a merge, a trim, despawn(), clear()) releases its
+## links (bodies_unlinked), as it lets go of its grabs.
 
 ## Emitted after two bodies merged into one of `radius` (px); `position` is the
 ## merged body's centre when it was made.
@@ -133,6 +140,13 @@ signal body_spawned(body: Goo2D)
 ## own grabs are re-attached at the point they held before it fires. Outside
 ## the physics flush.
 signal body_rebuilt(body: Goo2D)
+## Emitted when link() joined `a` and `b` under the link `handle`.
+signal bodies_linked(handle: int, a: Goo2D, b: Goo2D)
+## Emitted when the link `handle` between the bodies of ids `a_id` and `b_id`
+## (Goo2D.id) was released: by unlink(), or by either body leaving the world (a
+## split, a merge, a trim, despawn(), clear(); emitted as it goes, before the
+## signals announcing what became of it).
+signal bodies_unlinked(handle: int, a_id: int, b_id: int)
 
 ## Acceleration, in px/s² at GooTuning.unit 1, pulling a merging pair towards
 ## each other (merge_pull() scales it by the unit).
@@ -250,6 +264,11 @@ var _touching_before: Dictionary[Vector2i, int] = {}
 # The grabs held (grab()), by handle, and the next handle.
 var _grabs: Dictionary[int, Grab] = {}
 var _next_grab: int = 0
+# The links (link()), by handle, the next handle, and the internal node their
+# bridges are drawn in (made with the first link).
+var _links: Dictionary[int, GooLink] = {}
+var _next_link: int = 0
+var _bridges: Node2D = null
 
 # Registers the Goo2D children placed with the world (built in their own
 # _ready(), which runs before this one) and listens for bodies added later.
@@ -303,9 +322,13 @@ func _physics_process(delta: float) -> void:
 	_advance_transitions(delta)
 	_hold_grabs(delta)
 	_statics.sync()
+	if not _links.is_empty():
+		_attach_links()
 	goo.set_merge_partners(_partner_keys())
 	goo.step(delta)
 	Goo2D.dispatch_events(goo.take_events(), self)
+	if not _links.is_empty():
+		_draw_bridges(delta)
 
 ## Spawns a body of `radius` (px) centred on `global_pos`: round, or with a
 ## `shape` that body's outline at the equivalent radius `radius` (see
@@ -507,6 +530,8 @@ func judge_contact(other: Goo2D, body: Goo2D) -> void:
 		_touching = reused
 		_touching.clear()
 		_touch_frame = frame
+	if not _links.is_empty() and linked(body, other) >= 0:
+		return
 	var pair := MergeQueue.key(body.id, other.id)
 	if _touching.has(pair):
 		return
@@ -535,6 +560,8 @@ func _resolve_merges() -> void:
 		if not _is_live(a) or not _is_live(b) or not may_merge(a, b):
 			continue
 		if a.merging or b.merging:
+			continue
+		if not _links.is_empty() and linked(a, b) >= 0:
 			continue
 		_begin_merge(a)
 		_begin_merge(b)
@@ -966,10 +993,13 @@ func _is_live(body: Goo2D) -> bool:
 		and body.get_parent() == self
 
 # Takes the body out of the physics space now, so the body replacing it never
-# overlaps it, then frees it at the end of the frame, letting go of its grabs.
+# overlaps it, then frees it at the end of the frame, letting go of its grabs
+# and releasing its links (bodies_unlinked for each).
 # Emits nothing: the caller announces the new count once all its removals are
 # done (count_changed).
 func _remove(body: Goo2D) -> void:
+	if not _links.is_empty():
+		_release_links(body)
 	_by_id.erase(body.id)
 	if not _grabs.is_empty():
 		for handle: int in _grabs.keys():
@@ -1212,6 +1242,196 @@ class Grab extends RefCounted:
 		var relative := (velocity - goal_velocity - delta * stiffness * (position - goal)) \
 			/ (1.0 + delta * damping + delta * delta * stiffness)
 		return goal_velocity + relative
+
+# ---- Links ----
+#
+# A link ties a patch of beads on one body to a patch on another in the
+# kernel (GooLink, the kernel's links.rs): compliant distance constraints
+# pair by pair, and an angular term pulling the bodies' relative rotation
+# toward the link's rest angle (set_link_rest_angle(): a joint a game bends).
+# Its patches are named by anchors in each body's rest space; `strength`
+# sets how wide they are. A new link eases into its rest pose over
+# GooTuning.LINK_EASE_TIME, so bodies linked apart are drawn together. The
+# kernel drops a link whose ring leaves it; the world sends it again at the
+# next physics frame while both bodies are still its own (a ring rebuilt in
+# place: the patch is found again from the anchors), and releases it when
+# either leaves the world (_release_links(), from _remove()). Each link's
+# bridge skin is drawn after every step (GooLink.draw_bridge()).
+
+## Links `a` and `b`, two of this world's built bodies, and returns the link's
+## handle (for unlink(), set_link_strength(), set_link_rest_angle()...); -1,
+## with an error, for a body that is not this world's, the same body twice or
+## a pair already linked (linked() gives that link). `strength` (0..1) sets
+## how wide the neck is: from one pair of beads (a thread) to a patch about as
+## wide as the smaller body's radius at 1 (GooTuning.LINK_PATCH_RATIO), and how
+## stiffly the joint keeps its angle. `anchor_a` and `anchor_b` are the
+## patches' middles in each body's REST space (Goo2D.rest_shape's frame;
+## GooLink.rest_anchor() turns a global point into one); left at
+## Vector2.INF, the points of the two bodies nearest each other now
+## (GooLink.facing_anchors()). Bodies apart are drawn together over
+## GooTuning.LINK_EASE_TIME; their rest pose is the two patches facing each
+## other, the angle between the bodies' frames there being the link's rest
+## angle 0. Linked bodies never merge with each other; a merge transition
+## between them is cancelled. Emits bodies_linked.
+func link(a: Goo2D, b: Goo2D, strength: float = 1.0, anchor_a: Vector2 = Vector2.INF,
+		anchor_b: Vector2 = Vector2.INF) -> int:
+	if not _is_live(a) or not _is_live(b) or a.id < 0 or b.id < 0 \
+			or a.particle_count() == 0 or b.particle_count() == 0:
+		push_error("GooWorld2D.link(): %s and %s must both be this world's bodies" % [a, b])
+		return -1
+	if a == b:
+		push_error("GooWorld2D.link(): a body cannot be linked to itself")
+		return -1
+	if linked(a, b) >= 0:
+		push_error("GooWorld2D.link(): %s and %s are linked already (link %d)" % [a, b, linked(a, b)])
+		return -1
+	var facing := GooLink.facing_anchors(a, b)
+	var held := GooLink.new(_next_link, a, b, strength,
+		facing[0] if not anchor_a.is_finite() else anchor_a,
+		facing[1] if not anchor_b.is_finite() else anchor_b)
+	if not held.attach(kernel()):
+		push_error("GooWorld2D.link(): the kernel refused the link of %s and %s" % [a, b])
+		return -1
+	var handle := _next_link
+	_next_link += 1
+	_links[handle] = held
+	var running: Array[MergeTransition] = []
+	for transition: MergeTransition in _transitions:
+		var pair := MergeQueue.key(transition.id_a, transition.id_b)
+		if pair == MergeQueue.key(a.id, b.id):
+			_cancel(a)
+			_cancel(b)
+		else:
+			running.append(transition)
+	_transitions = running
+	a.wake()
+	b.wake()
+	bodies_linked.emit(handle, a, b)
+	return handle
+
+## Releases link `handle`: its bodies part (the kernel's constraints and their
+## bridge gone at once). Returns true if it was held, false for one released
+## already. Emits bodies_unlinked.
+func unlink(handle: int) -> bool:
+	var held: GooLink = _links.get(handle)
+	if held == null:
+		return false
+	_links.erase(handle)
+	kernel().remove_link(handle)
+	held.free_bridge()
+	if is_instance_valid(held.a):
+		held.a.wake()
+	if is_instance_valid(held.b):
+		held.b.wake()
+	bodies_unlinked.emit(handle, held.a.id if is_instance_valid(held.a) else -1,
+		held.b.id if is_instance_valid(held.b) else -1)
+	return true
+
+## Sets link `handle`'s strength (0..1, see link()): its patch is found again
+## at the new width and eased into from where the bodies are.
+func set_link_strength(handle: int, strength: float) -> void:
+	var held: GooLink = _links.get(handle)
+	if held == null:
+		return
+	held.strength = clampf(strength, 0.0, 1.0)
+	held.attach(kernel())
+
+## Link `handle`'s strength; -1 for a link released.
+func link_strength(handle: int) -> float:
+	var held: GooLink = _links.get(handle)
+	return held.strength if held != null else -1.0
+
+## Sets link `handle`'s rest angle, radians: the turn of its second body
+## relative to its first in the rest pose, about the neck (0: the patches
+## facing each other, as linked; positive turns the second body as
+## Node2D.rotation does, clockwise on screen). The kernel's targets move at
+## once and the bodies follow over a few frames; smooth when set every frame
+## (a joint swept by a game).
+func set_link_rest_angle(handle: int, radians: float) -> void:
+	var held: GooLink = _links.get(handle)
+	if held == null:
+		return
+	held.rest_angle = radians
+	kernel().set_link_param(handle, &"rest_angle", radians)
+
+## Link `handle`'s rest angle, radians; 0 for a link released.
+func link_rest_angle(handle: int) -> float:
+	var held: GooLink = _links.get(handle)
+	return held.rest_angle if held != null else 0.0
+
+## How far link `handle`'s joint is bent now, radians, in the terms of its
+## rest angle (the second body's turn relative to the first, less the rest
+## pose's); 0 for a link released.
+func link_bend(handle: int) -> float:
+	if not _links.has(handle):
+		return 0.0
+	return float(kernel().link_info(handle).get("bend", 0.0))
+
+## The handles of the links `body` is in, in the order they were made.
+func links_of(body: Goo2D) -> PackedInt32Array:
+	var handles := PackedInt32Array()
+	for handle: int in _links:
+		var held := _links[handle]
+		if held.a == body or held.b == body:
+			handles.append(handle)
+	return handles
+
+## The handle of the link between `a` and `b` (either way round); -1 if none.
+func linked(a: Goo2D, b: Goo2D) -> int:
+	for handle: int in _links:
+		var held := _links[handle]
+		if (held.a == a and held.b == b) or (held.a == b and held.b == a):
+			return handle
+	return -1
+
+## The two bodies of link `handle`, [a, b] as link() was given them; empty
+## for a link released.
+func link_bodies(handle: int) -> Array[Goo2D]:
+	var held: GooLink = _links.get(handle)
+	var result: Array[Goo2D] = []
+	if held != null:
+		result.append(held.a)
+		result.append(held.b)
+	return result
+
+## The handles of every link, in the order they were made.
+func links() -> PackedInt32Array:
+	return PackedInt32Array(_links.keys())
+
+## The GooLink of `handle` (its anchors, patch and bridge), null for a link
+## released: for reading; change it through the functions above.
+func link_info(handle: int) -> GooLink:
+	return _links.get(handle)
+
+# Releases every link of `body`, which is leaving the world (_remove()).
+func _release_links(body: Goo2D) -> void:
+	for handle: int in links_of(body):
+		unlink(handle)
+
+# Sends the kernel again any link it dropped (a ring rebuilt in place leaves
+# the kernel and comes back without its links), while both bodies are live.
+func _attach_links() -> void:
+	var goo := kernel()
+	for handle: int in _links.keys():
+		var held: GooLink = _links[handle]
+		if goo.has_link(handle):
+			continue
+		if not _is_live(held.a) or not _is_live(held.b):
+			unlink(handle)
+			continue
+		if held.a.particle_count() > 0 and held.b.particle_count() > 0:
+			held.attach(goo)
+
+# Draws every link's bridge skin (GooLink.draw_bridge()), in an internal node
+# in front of the world's children, so every body is drawn over it.
+func _draw_bridges(delta: float) -> void:
+	if _bridges == null:
+		_bridges = Node2D.new()
+		_bridges.name = "LinkBridges"
+		add_child(_bridges, false, Node.INTERNAL_MODE_FRONT)
+	var goo := kernel()
+	for held: GooLink in _links.values():
+		held.draw_bridge(_bridges, goo, delta)
 
 # ---- Merge rules ----
 #

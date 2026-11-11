@@ -4,7 +4,7 @@ Soft, wet, jiggly 2D goo bodies for Godot 4.7: round blobs and polygon shapes th
 bounce, settle, merge when they touch, split when they are pinched, crushed or cut, and are
 drawn as translucent goo with bubbles inside.
 
-The addon is seven scripts, one shader, the plugin's script and a native kernel (`GooKernel`, a
+The addon is nine scripts, one shader, the plugin's script and a native kernel (`GooKernel`, a
 Rust GDExtension in `native/` that owns the goo's beads and moves them with its own
 position-based solver). Each file is one system with its
 knobs at the top. Most numbers you might want to change sit in one of two places:
@@ -276,6 +276,56 @@ a squash does not turn. While a body's size eases, and whenever its deformation 
 does not split it by a pinch or a crush for `RESIZE_SPLIT_GUARD` (0.3 s): its beads lag a rest
 shape and target area that lead them, which the pinch and splat checks would read as a squeeze or
 an impact. Blades and tips still cut it. `examples/resize/` shows both.
+**Linking.** A world joins two of its bodies with a link, so they hold together, bend at the
+joint and are drawn as one blob with a neck (a creature built from several bodies):
+`link(a, b, strength, anchor_a, anchor_b)` returns a handle (-1, with an error, for a body not
+its own, the same body twice or a pair linked already), `unlink(handle)` parts them,
+`set_link_strength(handle, s)` and `set_link_rest_angle(handle, radians)` change it at any time
+(`link_strength()`, `link_rest_angle()`, `link_bend()` read it), and `links()`, `links_of(body)`,
+`linked(a, b)`, `link_bodies(handle)` and `link_info(handle)` (the `GooLink`: anchors, patch,
+bridge) say what is linked; `bodies_linked(handle, a, b)` and `bodies_unlinked(handle, a_id,
+b_id)` announce it. Round and polygon bodies link alike, in any combination.
+
+```gdscript
+var head := world.spawn(40.0, Vector2(400, 300))
+var body := world.spawn(36.0, Vector2(480, 300), GooShape.regular(4, 36.0))
+var neck := world.link(head, body, 0.7)        # 0: a thread … 1: a neck as wide as the smaller radius
+world.set_link_rest_angle(neck, 0.4 * sin(t))  # every frame: a joint a game bends (clockwise > 0)
+world.unlink(neck)
+```
+
+A link ties a patch of beads on one body to a patch on the other, pair by pair, in the kernel:
+each pair a compliant XPBD distance constraint (`GooTuning.LINK_STIFFNESS`, `LINK_DAMPING`, per
+reduced bead mass) solved every substep after the bodies' own constraints, and an angular term
+pulling the bodies' relative rotation (each ring's best-fit rotation, the one shape matching
+pulls toward) toward the link's rest angle (`LINK_BEND_STIFFNESS`, `LINK_BEND_DAMPING`, per
+reduced moment of inertia, × the strength: a thread bends freely). Both come from one rest
+pose: the two patches facing each other, `LINK_GAP` bead radii apart, the second body turned
+by the rest angle about the neck, so a turned rest angle also shortens the pairs on one side of
+the neck and lengthens the others, and a wide neck and a thread bend alike. The patches are
+named by anchors in each body's rest space (`Goo2D.rest_shape`'s frame), so they survive a ring
+rebuilt in place (the world sends the link again, its patch found from the anchors); left out,
+they are the points of the two bodies nearest each other (on a polygon a face or a corner,
+whichever faces the other body). `strength` sets the patch's width: `LINK_PATCH_RATIO` × the
+smaller radius at 1, one pair below about 0.15. The tied beads pass through each other (the
+neck does not fight itself; `LINK_THROUGH_BEADS` more beyond each end, 0 by default); every
+other bead collides, and the overlap push leaves only the tied beads alone (a linked pair is
+never handed to the Untangler). Linked bodies settle together and wake together. A new link
+eases from where its bodies are into its rest pose over `LINK_EASE_TIME`, longer for bodies far
+apart (`link_ease_speed()`), so they are drawn together rather than snapped. Linked bodies
+never merge with each other (`may_merge()` is not asked; a merge transition between them is
+cancelled). A split, a cut, a trim, a merge with a third body, `despawn()` or `clear()` releases
+the body's links (`bodies_unlinked`, as it goes), as it releases grabs; `may_split()` is the way
+to keep a linked body whole.
+
+The joined look is the bridge skin (`GooLink.bridge_polygon()`): a polygon from one body's
+outline to the other's, its two sides waist curves leaving each outline along its tangent,
+reaching back into both bodies, drawn under every body (an internal child of the world, in front
+of its other children, so each skin covers the part inside it) with a goo skin of its own in the
+larger body's tint, shader and look uniforms; the shader's rim runs along the neck's waist.
+`GooLink2D` places a link in the editor: a child of the world naming two `Goo2D` siblings, its
+`strength` and `rest_angle`, linked once both are registered; `examples/links/` shows links of
+every kind.
 
 A subclass that overrides `_physics_process()` calls `super(delta)` (after its own cuts, as the
 demo's `Game` does with `cut_at_tips()`).
@@ -339,13 +389,15 @@ A bare `Goo2D.new()` added from a script stays empty until a builder or `setup()
 | File | System | What it owns |
 |---|---|---|
 | `goo2d.gd` | **The body**: `Goo2D` (Node2D) | Its ring of beads in a `GooKernel` (its world's, or the one lone bodies share): the rest shape, rest edge lengths, corners and tuning it is built from, the kernel's events turned into signals and node state (`dispatch_events()`: `touched`, `pinched`, waking), queries on where the last step left the beads (`bead_points()`, `bead_position()`, `bead_velocity()`, `center()`, `area()`, `average_velocity()`, `bead_gripping()`, `ring_rotation()`...) and actions on them (`set_velocity()`, `apply_impulse()`, `apply_force()`, `set_bead_velocity()`, `set_bead_position()`, `set_frictionless()`, `set_pass_through()`, `wake()`) and whether a point lies inside its outline (`has_point()`); its beads' positions and velocities kept while it is out of the tree; the skin drawn from the kernel's outline, in the body's own `color` (`base_color()`; `COLOR_BY_SIZE` by default; split pieces inherit it, `inherit_look()`), or in two (`second_color` beyond a division fixed in its rest space, `division_axis`, `division_offset`; `set_two_tone()`, `clear_two_tone()`, `is_two_tone()`, `dominant_color()`, `color_set()`, the static `division_in_rest()`; split pieces get both, half and half), tinted for the moment by `set_tint(tint, second)` (`reset_tint()` back); the game's `tags` on the body (its kinds, in order; `tag()`, the first, is the one that counts), carried through splits, trims and merges, never read by the addon; the builders `make()`, `make_merged()`, `make_from_loop()` (each takes the body's tuning and tags, set before the ring is built); the GDScript reference versions of the kernel's math the tests compare it with (`find_pinch()`, `hull_depths()`, `skin_pieces()`...); the editor-facing exports and the editor preview of the rest outline (`preview_outline()`, a `@tool` script that builds nothing in the editor); resizing a live body (`resize()`, `eased_radius()`, `is_resizing()`, `resized`; the ease in `_physics_process()`, on only while it runs; the re-ring in place, `rebuilt`) and deforming its rest outline (`set_rest_deform()`, `clear_rest_deform()`, `rest_deform()`). Its only child is the `Skin`. |
-| `goo_world_2d.gd` | **The rules**: `GooWorld2D` (Node2D) | The world's `GooKernel` (`kernel()`) and its `GooStatics`, stepped in `_physics_process()`; bodies coming and going (`spawn()`, `despawn()`, `clear()`); which touching bodies merge and into what (`judge_contact()` for every contact the kernel reports asks `may_merge()`, the override point, by default the static `can_merge()`; `merged_color()`, the merged body's colour, or with `two_tone_merges` on `merged_colors()`, its one or two colours, the division between them from the parents' centres and areas; `merged_tags()`, its tags, by default the pair's deduped union), how its bodies are tuned (`tuning_for(shape, tags)`, the override point every body it builds is tuned by, with its tags, by default `GooTuning.tuning_for()`; `spawn()` takes the tags), the pull-together transition, the swap for one rebuilt ring; cutting a body along a chord (`cut()`) or a line (`cut_along()`, what a blade does; `cut_at_tips()`, what a set of blades does; `pierce()`, every body a static tip is inside), trimming a body off a tip when the cut would leave a crumb; which bodies became which (the signals `body_split`, `bodies_merged`, `body_trimmed`, by `Goo2D.id`, beside `split`, `merged`, `trimmed`) and every body it registers (`body_spawned`); which bodies the goo may cut (`may_split()`, the override point asked before every cut a pinch, a blade or a tip asks for, by default true; a direct `cut()` is not asked); the world's gravity (`gravity_scale`, sent to its kernel); grabs (`grab()`, `move_grab()`, `release_grab()`, `grabbed()`, `grab_body()`, `grab_point()`: a spring from a point to the beads nearest it, applied before the step; `body_at()`, the body under a point; their offsets scale with a resized body, and a body re-rung by a resize gets them back at the point they held, then `body_rebuilt`); the merge lock after a merge or split; the rules of the kernel's pair passes (pushing apart bodies that sank into each other, `intrusion()`; untangling rings threaded through each other, `Untangler`), kept here as the reference the kernel is tested against. Inner classes `MergeQueue`, `MergeTransition`, `Untangler`, `Grab`. |
+| `goo_world_2d.gd` | **The rules**: `GooWorld2D` (Node2D) | The world's `GooKernel` (`kernel()`) and its `GooStatics`, stepped in `_physics_process()`; bodies coming and going (`spawn()`, `despawn()`, `clear()`); which touching bodies merge and into what (`judge_contact()` for every contact the kernel reports asks `may_merge()`, the override point, by default the static `can_merge()`; `merged_color()`, the merged body's colour, or with `two_tone_merges` on `merged_colors()`, its one or two colours, the division between them from the parents' centres and areas; `merged_tags()`, its tags, by default the pair's deduped union), how its bodies are tuned (`tuning_for(shape, tags)`, the override point every body it builds is tuned by, with its tags, by default `GooTuning.tuning_for()`; `spawn()` takes the tags), the pull-together transition, the swap for one rebuilt ring; cutting a body along a chord (`cut()`) or a line (`cut_along()`, what a blade does; `cut_at_tips()`, what a set of blades does; `pierce()`, every body a static tip is inside), trimming a body off a tip when the cut would leave a crumb; which bodies became which (the signals `body_split`, `bodies_merged`, `body_trimmed`, by `Goo2D.id`, beside `split`, `merged`, `trimmed`) and every body it registers (`body_spawned`); which bodies the goo may cut (`may_split()`, the override point asked before every cut a pinch, a blade or a tip asks for, by default true; a direct `cut()` is not asked); the world's gravity (`gravity_scale`, sent to its kernel); grabs (`grab()`, `move_grab()`, `release_grab()`, `grabbed()`, `grab_body()`, `grab_point()`: a spring from a point to the beads nearest it, applied before the step; `body_at()`, the body under a point; their offsets scale with a resized body, and a body re-rung by a resize gets them back at the point they held, then `body_rebuilt`); links (`link()`, `unlink()`, `set_link_strength()`, `set_link_rest_angle()`, `links_of()`, `linked()`, `link_bodies()`, `link_info()`, `link_bend()`; `bodies_linked`, `bodies_unlinked`; released by `_remove()` with the body, sent to the kernel again when it dropped one, bridges drawn after every step); the merge lock after a merge or split; the rules of the kernel's pair passes (pushing apart bodies that sank into each other, `intrusion()`; untangling rings threaded through each other, `Untangler`), kept here as the reference the kernel is tested against. Inner classes `MergeQueue`, `MergeTransition`, `Untangler`, `Grab`. |
+| `goo_link.gd` | **A link**: `GooLink` (RefCounted) | What the world keeps about one link (its bodies, strength, rest angle, rest-space anchors, the patch sent to the kernel, `attach()`) and its bridge skin (`draw_bridge()`: a `Polygon2D` with a `GooSkin` of its own); the link's geometry as pure statics: the tied patch from anchors and strength (`patch()`), the facing anchors (`facing_anchors()`, `rest_anchor()`), the kernel's knobs (`kernel_params()`, `ease_time()`), the bridge polygon (`bridge_polygon()`: always simple and drawable, or empty). |
+| `goo_link_2d.gd` | **A link in the editor**: `GooLink2D` (Node2D, `@tool`) | A child of a `GooWorld2D` naming two `Goo2D` siblings (`body_a`, `body_b`), `strength`, `rest_angle`: linked once both are registered, unlinked when freed, its exports passed on while linked; draws the link and its neck's width in the editor. |
 | `goo_statics.gd` | **The scenery**: `GooStatics` (RefCounted) | Mirrors the scene's `StaticBody2D` nodes on `LAYER_WALLS` into a kernel as convex polygons (`shape_points()` of each collision shape), with their friction, bounce and grip, and every `TileMapLayer` with collision on that layer: its cells' polygons merged into few convex pieces (`bake_cells()`, `cell_polygons()`, `convex_pieces()`, `layer_pieces()`; the layer's material and clip in its metadata, `MATERIAL_META` and `CLIP_META`, `tile_material()`, `tile_clip()`); rebuilds the mirror when static bodies, collision nodes or tile layers enter or leave the tree or a layer's cells or `changed` say so, moves shapes whose nodes moved (`sync()`, every step), `refresh()` for changes it cannot see. |
 | `goo_tuning.gd` | **The numbers**: `GooTuning` (static) | The length unit `unit` (see "What `unit` scales"); sizes (`min_radius()` … `max_radius()`, `MIN_RADIUS` … `MAX_RADIUS` at unit 1), the log size scale `size_t()`, colour by size, the merge-by-size rule; every size-dependent physical quantity (bead count and radius, masses, spring frequency and damping, pressure, shape matching, internal damping, bounce, friction, wall grip, split thresholds); `tuning(radius)` and `tuning_for(shape)`, the dictionaries a body is built from; the solver's knobs (`SUBSTEPS`, `MAX_SUBSTEPS`, `TOUCH_SLOP`, `WAKE_DEPTH`, `WAKE_SPEED`, `MAX_BEAD_SPEED`, the Untangler's `UNTANGLE_STRENGTH` and `UNTANGLE_SEPARATION_SPEED`; `solver_settings()`, `make_kernel()`); the wall layer (`LAYER_WALLS`). |
 | `goo_shape.gd` | **Rest outlines**: `GooShape` (RefCounted value) | A body's shape at rest: round or any simple polygon; its equivalent radius, area, perimeter, corners; the bead loop a ring of it is built on; fusing two outlines into one (`fused()`); fitting an outline onto a deformed ring; cutting a polygon body in rest space along a chord (`cut()`, `cut_ring()`: the pieces decided by the beads they hold, the sliver guard) and trimming it (`trim_ring()`). |
 | `goo_loop.gd` | **Loop geometry**: `GooLoop` (static) | Math on closed point loops: signed area and orientation (CCW on screen is negative shoelace area), outward edge normals, Chaikin smoothing (with corners kept), resampling, beads spread over a polygon, centroid, best-fit rotation and goal positions for shape matching, self-intersection, where a loop first crosses itself and the loops it falls into cut there (`split_at_crossings()`), point-in-loop, union outlines; the chord a line through a tip cuts a loop on (`chord()`, `pierces()`). |
 | `goo_skin.gd` + `goo.gdshader` | **The look**: `GooSkin` | One `ShaderMaterial` per body and the uniforms it pushes each frame (outline, centre, radius, smoothed velocity, the ring's rotation, bubble field), and a two-tone body's second colour and division (`set_two_tone()`, `clear_two_tone()`, pushed at once), remembered so a shader swap (`shader`, `set_shader()`) re-pushes them at once; the bubble field a split piece or a merged ring inherits; `warm_up(parent, shader)`, which draws a shader once at boot so it compiles then; the default shader: pseudo-3D rim from the distance to the outline, refraction with a motion ripple, fresnel, specular, sheen, two layers of bubbles. Its head documents the uniform contract a replacement shader may use (see "Another skin shader" above). |
-| `native/` + `goo2d.gdextension` | **The native kernel**: `GooKernel` (RefCounted, Rust) | The beads and everything that runs every frame, for every ring of a world in one `step()`: the particles (position, previous position, velocity, inverse mass, radius) in flat arrays, a ring a contiguous range of them; the static shapes; the pair passes (the overlap push, as a force and as a displacement over the step, with per-bead pass-through; the Untangler); the solver's substeps (gravity, the step's forces, linear damping and the wall grip; skin and bending distances as XPBD constraints with compliance 1 / stiffness and the springs' damping, shape matching, the hard stretch limit; contacts with the static shapes, swept for fast particles, and between particles through candidate pairs found once a step on a hashed grid; restitution and friction; every velocity capped at `MAX_BEAD_SPEED`); the pressure and internal damping as forces over the step; calm detection and settling by contact groups, the rings touched (from the solver's own contacts), the pinch scan and splat check; the skin outline (a folded ring cut into loops at its crossings; per loop the kink-clamped offset, Chaikin, triangulation check and repair) and the shader's outline. A ring's rest shape and tuning change in place (`set_rest()`, `set_ring_params()`: a resize's ease and a rest deformation, every frame). It holds ids and numbers, never a Godot object; GDScript reads its events and each ring's results. Modules: `kernel.rs` (the rings, the particles, the solver and the step), `statics.rs` (the static shapes), `grid.rs` (the hashed grid), `forces.rs` (the pair passes' forces), `pinch.rs`, `skin.rs`, `geom.rs` (loop math in Godot's float semantics), `consts.rs` (the GDScript constants it mirrors; `constants()` hands them back), `lib.rs` (the class, and static versions of the math on plain arrays for the tests). The crate `goo2d_kernel` (godot-rust 0.5, `api-4-7`) is built into `bin/` by the host project's `tools/build_native.sh` (or downloaded by `tools/install_native.sh`, from what `kernel.yml` builds on every push: linux x86_64, windows x86_64, a macOS universal framework); the `.gdextension` loads it (web entries named for a build not made yet). |
+| `native/` + `goo2d.gdextension` | **The native kernel**: `GooKernel` (RefCounted, Rust) | The beads and everything that runs every frame, for every ring of a world in one `step()`: the particles (position, previous position, velocity, inverse mass, radius) in flat arrays, a ring a contiguous range of them; the static shapes; the pair passes (the overlap push, as a force and as a displacement over the step, with per-bead pass-through; the Untangler); the solver's substeps (gravity, the step's forces, linear damping and the wall grip; skin and bending distances as XPBD constraints with compliance 1 / stiffness and the springs' damping, shape matching, the hard stretch limit, the links between rings (bead pairs and an angular term, `add_link()`, `set_link_param()`, `remove_link()`, `link_info()`; a ring's links go with it); contacts with the static shapes, swept for fast particles, and between particles through candidate pairs found once a step on a hashed grid; restitution and friction; every velocity capped at `MAX_BEAD_SPEED`); the pressure and internal damping as forces over the step; calm detection and settling by contact groups, the rings touched (from the solver's own contacts), the pinch scan and splat check; the skin outline (a folded ring cut into loops at its crossings; per loop the kink-clamped offset, Chaikin, triangulation check and repair) and the shader's outline. A ring's rest shape and tuning change in place (`set_rest()`, `set_ring_params()`: a resize's ease and a rest deformation, every frame). It holds ids and numbers, never a Godot object; GDScript reads its events and each ring's results. Modules: `kernel.rs` (the rings, the particles, the solver and the step), `statics.rs` (the static shapes), `grid.rs` (the hashed grid), `forces.rs` (the pair passes' forces), `links.rs` (the links: their rest pose, rest lengths and angle as pure functions, with `cargo test` unit tests), `pinch.rs`, `skin.rs`, `geom.rs` (loop math in Godot's float semantics), `consts.rs` (the GDScript constants it mirrors; `constants()` hands them back), `lib.rs` (the class, and static versions of the math on plain arrays for the tests). The crate `goo2d_kernel` (godot-rust 0.5, `api-4-7`) is built into `bin/` by the host project's `tools/build_native.sh` (or downloaded by `tools/install_native.sh`, from what `kernel.yml` builds on every push: linux x86_64, windows x86_64, a macOS universal framework); the `.gdextension` loads it (web entries named for a build not made yet). |
 | `plugin.cfg`, `plugin.gd` | Plugin registration | Shows the addon under Project Settings > Plugins. |
 
 Dependencies run downward only: `GooWorld2D` → `Goo2D` → (`GooTuning`, `GooShape`, `GooSkin`,
@@ -385,6 +437,7 @@ what the measurement found. Start from the effect you want:
 | Change how the outline is smoothed | `SKIN_SMOOTHING` (Chaikin passes), `SKIN_KINK_TURN` / `SKIN_KINK_REACH` / `SKIN_KINK_CLEARANCE` (the offset's clamp at concave kinks), `SKIN_MAX_SPLITS` (how many times a folded ring's outline is cut at a crossing before what is left is drawn as it is), `CORNER_ANGLE` / `CORNER_TOLERANCE` (which beads of a rest shape are corners kept sharp), `GooSkin.MAX_POINTS`, `VELOCITY_SMOOTHING` | `goo2d.gd`; `goo_skin.gd` |
 | Change how a grab holds a body | `GRAB_STIFFNESS` (the spring, 1/s²: how fast the grab point closes on the point and how far a hanging body sags below it), `GRAB_DAMPING` (1/s; 2 × √stiffness is critical), `GRAB_REACH` (how much of the ring beyond the nearest bead is held, a fraction of the radius: less dangles more and tears more easily), `GRAB_CARRY` (how much of the hold the beads not held follow: less dangles more, tears more easily when dragged fast) | `goo_tuning.gd` |
 | Change how a live body resizes or deforms | `RESIZE_TIME` (0.5 s: `resize()`'s default ease), `RESIZE_MAX_LOG_RATE` (1.5 /s of log radius: the fastest growth or shrink; faster growth pushes harder on neighbours and walls), `RESIZE_COUNT_HYSTERESIS` (0.03 of `size_t()` past a bead count's boundary before the ring is rebuilt with the new count), `RESIZE_SETTLE_TIME` (0.5 s before a body held off its size's count re-rings to it), `RESIZE_SPLIT_GUARD` (0.3 s of split lock each frame a size eases or a deformation changes), `DEFORM_SQUASH_MIN` / `_MAX` (0.5 / 2), `DEFORM_AREA_MIN` / `_MAX` (0.6 / 1.6). Every one is a time, a ratio or a fraction of `size_t()`: `unit` leaves them alone | `goo_tuning.gd` |
+| Change how links hold and look | `LINK_STIFFNESS`, `LINK_DAMPING` (the pairs' XPBD constraints, per reduced bead mass, 1/s² and 1/s: how far a pulled link stretches), `LINK_BEND_STIFFNESS`, `LINK_BEND_DAMPING` (the angular term at strength 1: how hard a joint keeps its rest angle), `LINK_PATCH_RATIO` (the neck's width at strength 1, × the smaller radius), `LINK_GAP` (the tied beads' gap at rest, in bead radii), `LINK_MIN_REST`, `LINK_THROUGH_BEADS`, `LINK_EASE_TIME` and `LINK_EASE_SPEED` (how a new link draws its bodies together); none but `LINK_EASE_SPEED` is scaled by `unit` (they are frequencies and fractions); the bridge's waist: `GooLink.BRIDGE_WAIST_MIN` / `_MAX`, `BRIDGE_SAMPLES` | `goo_tuning.gd`; `goo_link.gd` |
 | Use another layer for the goo's walls | `LAYER_WALLS` (the layer `GooStatics` mirrors) | `goo_tuning.gd` |
 
 ### What `unit` scales
@@ -469,8 +522,10 @@ from its target, and damping of each bead's motion relative to the ring's mean. 
 motion (gravity, those forces, linear damping), keeps each bead its rest distance from its two
 neighbours (the skin) and from the bead after next (bending), as compliant constraints of the
 springs' stiffness and damping, pulls the ring toward its rest outline moved rigidly onto it
-(shape matching, best-fit rotation), never lets a skin edge stretch past `Goo2D.MAX_STRETCH`, and
-resolves the contacts: with the static shapes (`GooStatics`; a bead fast enough to cross a thin
+(shape matching, best-fit rotation), never lets a skin edge stretch past `Goo2D.MAX_STRETCH`,
+holds every link (its bead pairs toward their rest lengths, then the two rings' relative
+rotation toward the link's, each ring turned rigidly about its centroid by its share; see
+"Linking" above, and `native/src/links.rs`), and resolves the contacts: with the static shapes (`GooStatics`; a bead fast enough to cross a thin
 wall in one substep is checked along its way) and with every other bead closer than their two
 radii (beads 1 or 2 apart along one ring excepted), with the walls' and the goo's friction and
 bounce, and caps every bead's speed at `GooTuning.MAX_BEAD_SPEED`. Last, per ring: the rings it touched (`touched`), calm detection and settling, the pinch
@@ -578,6 +633,11 @@ across a piece cut thin (a round ring's cap) are first spread a bead diameter ap
   Whatever holds the body by bead index or by its kernel ring re-attaches here, by a point or by a
   rest-space anchor (`Goo2D.rest_shape`, turned by `ring_rotation()` about `center()`, maps one
   onto the beads). Outside the physics flush.
+- `GooWorld2D.bodies_linked(handle: int, a: Goo2D, b: Goo2D)`: `link()` joined `a` and `b`.
+  `bodies_unlinked(handle: int, a_id: int, b_id: int)`: the link was released, by `unlink()` or
+  by either body leaving the world (a split, a cut, a trim, a merge, `despawn()`, `clear()`;
+  emitted as the body goes, before the signals saying what became of it), with the bodies'
+  `Goo2D.id`s.
 
 ## Limits
 
@@ -615,6 +675,13 @@ across a piece cut thin (a round ring's cap) are first spread a bead diameter ap
   vanishes and the rest inflates back to the whole area over `inflate_time`. Only a tip inside a
   body trims it; a pinch, a crush or a direct `cut()` that would leave a crumb is refused (the
   ring asks again later), as is a cut of a loop that crosses itself or of a merging body.
+- Links: a link is released, never carried over, when either body splits, is cut, trimmed or
+  merged (a game that wants a creature to keep its parts keeps them whole with `may_split()`
+  and links the new bodies itself on `body_split`). The bridge skin is a polygon of its own
+  drawn under the two skins, with a goo skin whose outline is the bridge: each body's rim still
+  shows where it meets the neck, so a pair reads as two drops joined by a neck, not one
+  metaball. A link's rest pose has the patches facing; anchors far round a body (or a strength
+  near 1 on very unequal bodies) make a joint that starts under strain and eases into it.
 - The world knows only the tips it is told about: a blade-like `StaticBody2D` must be fed to
   `cut_at_tips()`, `cut_along()` or `pierce()` every frame (the demo's `Game` does it for its
   blades and wedge).
@@ -633,11 +700,22 @@ The addon's tests live in the host project's `tests/` (they need its headless ru
   `test_goo_kernel.gd` (the native `GooKernel`: its static math against the GDScript reference
   functions on random loops, the constants it mirrors, a ring joining and leaving its kernel,
   and its solver on rings added straight to a kernel: gravity, a static floor and the grip, the
-  stretch limit, swept contacts, the speed cap, pass-through, sleeping, static shapes).
+  stretch limit, swept contacts, the speed cap, pass-through, sleeping, static shapes; links:
+  their pairs held at their rest lengths, removed with a ring, their tied beads passing through,
+  a rest angle turning the second ring its way), `test_goo_link.gd` (`GooLink`'s patch by
+  strength and the bridge polygon: always drawable, touching both outlines, a waist, wider for a
+  stronger link). The kernel's `links.rs` has Rust unit tests too (`cargo test --lib` in
+  `native/`; `check.py` does not run them).
+- `tests/integration/test_goo_links.gd`: links on real bodies (a pair pulled apart comes back, a
+  chain of ten whipped about for ten seconds at unit 1 and 0.5, every round and polygon pairing,
+  a weak link stretching more, bodies linked apart drawn together, a swept rest angle, never
+  merging, released by a despawn, a cut, a merge and `clear()`, a chain hung from a grab, the
+  `GooLink2D` fixture `goo_editor_links.tscn`, the bridge).
 - The host project's `tools/stability.gd` plays the known failure cases headless and counts
-  them (pass-through, bodies spawned inside each other, skins, impalement, and `births`: a
+  them (pass-through, bodies spawned inside each other, skins, impalement, `births`: a
   seeded random game watched after every step for explosions, tangled rings and bodies born
-  wrong by a split or a merge).
+  wrong by a split or a merge, and `links`: a seeded random game of linking, unlinking and
+  throwing).
 - `tests/integration/test_goo2d.gd`: one body at a time (building, resting and sleeping,
   wobble, squeezing through gaps, self-collision, rebuilding, the 40-drop benchmark);
   `test_goo_editor_nodes.gd`: `Goo2D` nodes placed under a `GooWorld2D` in a `.tscn`

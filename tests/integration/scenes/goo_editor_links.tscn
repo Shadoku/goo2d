@@ -1,0 +1,39 @@
+[gd_scene format=3]
+
+[ext_resource type="Script" path="res://addons/goo2d/goo2d.gd" id="1_goo2d"]
+[ext_resource type="Script" path="res://addons/goo2d/goo_world_2d.gd" id="2_world"]
+[ext_resource type="Script" path="res://addons/goo2d/goo_link_2d.gd" id="3_link"]
+
+[node name="GooEditorLinks" type="Node2D"]
+
+[node name="World" type="Node2D" parent="."]
+script = ExtResource("2_world")
+gravity_scale = 0.0
+
+[node name="Round" type="Node2D" parent="World"]
+position = Vector2(400, 300)
+script = ExtResource("1_goo2d")
+radius = 40.0
+
+[node name="Square" type="Node2D" parent="World"]
+position = Vector2(482, 300)
+script = ExtResource("1_goo2d")
+radius = 40.0
+sides = 4
+
+[node name="Small" type="Node2D" parent="World"]
+position = Vector2(330, 300)
+script = ExtResource("1_goo2d")
+radius = 28.0
+
+[node name="Neck" type="Node2D" parent="World"]
+script = ExtResource("3_link")
+body_a = NodePath("../Round")
+body_b = NodePath("../Square")
+rest_angle = 0.3
+
+[node name="Thread" type="Node2D" parent="World"]
+script = ExtResource("3_link")
+body_a = NodePath("../Round")
+body_b = NodePath("../Small")
+strength = 0.1
