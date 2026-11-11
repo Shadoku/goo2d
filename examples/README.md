@@ -16,6 +16,7 @@ the rest of the project; their tests live in `tests/integration/examples/`.
 | [`color_merge/`](color_merge/README.md) | Blobs in four colours that merge only with their own colour, whatever their sizes | `Goo2D.color`, `GooWorld2D.may_merge()`, `GooWorld2D.merged_color()` |
 | [`tower/`](tower/README.md) | A tower-building minigame: stiff square blobs dropped onto a narrow platform, won when the stack stands above the goal line | `GooWorld2D.tuning_for()` (stiffer bodies in one world), `may_merge()` (off, so the blocks stay separate), editor-placed platform and goal line |
 | [`two_tone/`](two_tone/README.md) | Blobs that merge whatever their colours, a merged body drawn in both its parents' colours with a soft division that turns with it as it rolls | `GooWorld2D.two_tone_merges`, `GooWorld2D.merged_colors()` (its default), `Goo2D.set_two_tone()`, `Goo2D.second_color` |
+| [`links/`](links/README.md) | Bodies joined by links in a top-down tank: a chain, a round body linked to a square and a triangle, links of three strengths, a joint swung back and forth; each pair drawn as one blob with a neck | `GooWorld2D.link()`, `set_link_rest_angle()`, `link_bend()`, `grab()`, `gravity_scale` 0, `may_merge()` (off) |
 | [`shaders/`](shaders/README.md) | The same goo drawn by three skins: the addon's wet goo, a cel-shaded solid, a faceted gem | `GooWorld2D.skin_shader`, `Goo2D.skin_shader`, the uniform contract in `goo.gdshader` |
 
 The gaps these examples exposed in the addon (the merge rule as an override, a body's own
