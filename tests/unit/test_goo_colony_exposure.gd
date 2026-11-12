@@ -181,6 +181,26 @@ func test_a_pocket_inside_a_ring_of_cells_is_found_and_a_bay_open_to_the_outside
 			assert_eq(_count(kinds, GooColony.LOOP_POCKET), 0, "an open bay is the outside")
 			assert_eq(facing_in_open, facing_in, "beads facing the bay are exposed")
 
+func test_the_exposed_beads_of_a_loose_mixed_cluster_lie_on_its_outside_loop() -> void:
+	# A loose mixed-size cluster with deep bays, its enclosed cells cores: the outline must
+	# close. A run that finds no loop (a tiny gap between three cells, one a core, can send
+	# its run onto the outline) leaves its beads exposed: a few at most.
+	for seed_value: int in [5, 7, 11]:
+		var sim := _sim(GooColonySim.EXPOSURE_OPTIONS)
+		var k := sim.add_creature(_pack(40, seed_value, true))
+		_steps(sim, 60)
+		var s := sim.colony.stats()
+		var kinds := sim.colony.creature_loop_kinds(k)
+		var on_loops := 0
+		for li: int in kinds.size():
+			if kinds[li] == GooColony.LOOP_OUTSIDE:
+				on_loops += sim.colony.creature_loop(k, li).size()
+		print("    mixed cluster of 40 (seed %d): %d rings, %d cores, loops %s, %d points on outside loops, %d beads exposed, %d of them on no loop" % [
+			seed_value, s["rings"], s["cores"], kinds, on_loops, s["exposed"], s["broken_runs"]])
+		assert_true(s["broken_runs"] <= 0.03 * s["exposed"], "every exposed bead but a few is on a loop")
+		assert_eq(_count(kinds, GooColony.LOOP_OUTSIDE), 1, "one outside")
+		assert_gt(on_loops, 0)
+
 # ---- Switching ----
 
 ## The adhesion tests' packing: `count` touching cells, mixed sizes when `mixed`.

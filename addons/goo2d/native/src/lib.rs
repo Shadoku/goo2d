@@ -1191,6 +1191,7 @@ impl GooColony {
         put(&mut d, "exposed", s.exposed as i64);
         put(&mut d, "enclosed", s.enclosed as i64);
         put(&mut d, "pockets", s.pockets as i64);
+        put(&mut d, "broken_runs", s.broken_runs as i64);
         put(&mut d, "to_core", s.to_core as i64);
         put(&mut d, "to_ring", s.to_ring as i64);
         put(&mut d, "cross_skipped", s.cross_skipped as i64);

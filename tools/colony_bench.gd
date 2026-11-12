@@ -903,6 +903,7 @@ func _on_physics(first: bool, delta: float) -> void:
 			_sample("skipped", s["cross_skipped"], false)
 			_sample("enclosed", s["enclosed"], false)
 			_sample("pockets", s["pockets"], false)
+			_sample("lost_runs", s["broken_runs"], false)
 			_switches += s["to_core"] + s["to_ring"]
 			_switch_frames[0] += s["to_core"]
 			_switch_frames[1] += s["to_ring"]
@@ -976,7 +977,7 @@ func _sample(key: String, value: float, usec: bool = true) -> void:
 
 func _report() -> void:
 	print("colony_bench: %d frames after %d warm-up (ms: min / median / p95)" % [_frames, _warmup])
-	var order := ["physics", "kernel", "holds", "capture", "settle", "exposure", "exp_runs", "drag_cpu", "skipped", "enclosed", "pockets",
+	var order := ["physics", "kernel", "holds", "capture", "settle", "exposure", "exp_runs", "drag_cpu", "skipped", "enclosed", "pockets", "lost_runs",
 		"sticks", "broken", "script", "push", "draw", "draw_rust", "rs_setup", "rs_render",
 		"forces", "pairs", "solve", "rings_cpu", "intra_cpu", "cross", "vel", "cross_hits", "intra_pairs", "cross_pairs",
 		"k_pairpass", "k_links", "k_solver", "k_rings", "k_skins"]

@@ -477,6 +477,8 @@ pub struct Creature {
     /// A pair parted (or a cell switched) since the last pass: run it for Exposure::hot
     /// frames.
     exp_hot: bool,
+    /// Beads left exposed by the last pass for want of a loop (broken runs).
+    pub exp_broken: usize,
     xs: exposure::Scratch,
     /// Per cell: the frame since which it has been a candidate to switch (0: none), and
     /// the frame before which it may not switch again.
@@ -575,6 +577,8 @@ pub struct Stats {
     pub exposed: usize,
     pub enclosed: usize,
     pub pockets: usize,
+    /// Beads exposed only because their run found no loop (should stay near 0).
+    pub broken_runs: usize,
     pub to_core: usize,
     pub to_ring: usize,
     pub cross_skipped: usize,
@@ -2841,6 +2845,7 @@ impl Colony {
                 stats.exposed += open;
                 stats.enclosed += c.exposed.len() - open;
                 stats.pockets += c.loops.iter().filter(|l| l.kind == LoopKind::Pocket).count();
+                stats.broken_runs += c.exp_broken;
             }
         }
         stats.cross_skipped = self.cross_skipped;

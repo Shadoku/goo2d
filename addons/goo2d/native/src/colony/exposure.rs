@@ -370,10 +370,12 @@ impl Creature {
             }
             s.cell_chains[cell] = (first, s.chains.len() as u32 - first);
         }
-        // Each run's successor along the outline: the run that starts where it ends, on the
-        // cell it meets there. Tried in order: a run of that cell coming out of a contact
-        // with this cell; one of any cell nearby coming out of this cell; any run of that
-        // cell nearby; any run nearby. None: the run is left broken (exposed).
+        // Each run's successor along the outline: the run that starts where it ends. Tried
+        // in order: (0) a run of the cell it meets there (X) coming out of a contact with
+        // this cell (A); (1) a run of any cell nearby coming out of a contact with X (X has
+        // no run there: the outline passes along it, wholly enclosed by contact); (2) one
+        // coming out of A; (3) any run of X; (4) any run nearby but its own. None: the run
+        // is left broken (exposed).
         let rcell = self.cells.iter().map(|c| c.t.radius).fold(0.0f32, f32::max);
         let reach = 3.0 * rcell + cs;
         let span = (reach / cs).ceil() as i32;
@@ -388,7 +390,7 @@ impl Creature {
             // (tier, distance², chain)
             let mut best: (u8, f32, u32) = (u8::MAX, f32::INFINITY, NONE);
             let offer = |tier: u8, d: f32, c: u32, best: &mut (u8, f32, u32)| {
-                if d <= reach * reach && (tier < best.0 || (tier == best.0 && d < best.1)) {
+                if c as usize != ch && d <= reach * reach && (tier < best.0 || (tier == best.0 && d < best.1)) {
                     *best = (tier, d, c);
                 }
             };
@@ -400,7 +402,7 @@ impl Creature {
                         continue;
                     }
                     let from_a = s.against[s.prev(c.start) as usize] == a_cell;
-                    offer(if from_a { 0 } else { 2 }, dist_sq(pe, s.pos[c.start as usize]), c2, &mut best);
+                    offer(if from_a { 0 } else { 3 }, dist_sq(pe, s.pos[c.start as usize]), c2, &mut best);
                 }
             }
             if best.0 > 0 {
@@ -418,8 +420,15 @@ impl Creature {
                             if c2 == NONE || s.chains[c2 as usize].start != q || s.chains[c2 as usize].closed {
                                 continue;
                             }
-                            let from_a = s.against[s.prev(q) as usize] == a_cell;
-                            offer(if from_a { 1 } else { 3 }, dist_sq(pe, s.pos[q as usize]), c2, &mut best);
+                            let from = s.against[s.prev(q) as usize];
+                            let tier = if x_cell != NONE && from == x_cell && s.cell[q as usize] != x_cell {
+                                1
+                            } else if from == a_cell {
+                                2
+                            } else {
+                                4
+                            };
+                            offer(tier, dist_sq(pe, s.pos[q as usize]), c2, &mut best);
                         }
                     }
                 }
@@ -496,8 +505,13 @@ impl Creature {
             self.loops.push(OutlineLoop { kind, area: *area as f32, pts: lp });
         }
         // The result: exposed = not enclosed by contact and not on a pocket.
+        self.exp_broken = 0;
         for i in 0..nb {
             self.exposed[i] = (s.contact[i] == 1 && s.mark[i] != 2) as u8;
+            // Exposed for want of a loop (a broken run): counted, as a health figure.
+            if s.contact[i] == 1 && s.mark[i] == 0 {
+                self.exp_broken += 1;
+            }
         }
         for ring in self.rings.iter_mut() {
             ring.open = self.exposed[ring.start..ring.start + ring.n].iter().map(|&e| e as u32).sum();
