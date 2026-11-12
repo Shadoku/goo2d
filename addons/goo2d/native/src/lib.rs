@@ -14,6 +14,7 @@
 //! `tests/unit/test_goo_kernel.gd` to check against the GDScript reference
 //! implementations on random loops.
 
+mod cells;
 mod colony;
 mod consts;
 mod forces;
@@ -1910,5 +1911,449 @@ impl GooColony {
     #[func]
     fn creature_tension_points(&self, c: i64) -> PackedVector2Array {
         self.c.creatures.get(c as usize).map(|cr| pv2(&cr.tension_x)).unwrap_or_default()
+    }
+}
+
+/// Exploration prototype (src/cells.rs, docs/explore-cells.md): creatures whose every cell
+/// is one oriented disc particle held by links. Used by tools/cells_*.gd,
+/// addons/goo2d/goo_cells_sim.gd and tests/unit/test_goo_cells.gd only.
+#[derive(GodotClass)]
+#[class(base = RefCounted, init)]
+pub struct GooCells {
+    c: cells::Cells,
+    base: Base<RefCounted>,
+}
+
+fn cells_num(value: &Variant) -> f64 {
+    value.try_to::<f64>().or_else(|_| value.try_to::<i64>().map(|i| i as f64)).or_else(|_| value.try_to::<bool>().map(|b| if b { 1.0 } else { 0.0 })).unwrap_or(0.0)
+}
+
+#[godot_api]
+impl GooCells {
+    #[constant]
+    const BEND_NONE: i64 = cells::BEND_NONE as i64;
+    #[constant]
+    const BEND_LINK: i64 = cells::BEND_LINK as i64;
+    #[constant]
+    const BEND_SHAPE: i64 = cells::BEND_SHAPE as i64;
+    #[constant]
+    const SELF_NONE: i64 = cells::SELF_NONE as i64;
+    #[constant]
+    const SELF_UNLINKED: i64 = cells::SELF_UNLINKED as i64;
+    #[constant]
+    const SELF_TYPES: i64 = cells::SELF_TYPES as i64;
+    #[constant]
+    const SELF_FAR: i64 = cells::SELF_FAR as i64;
+    #[constant]
+    const WAVE_OFF: i64 = cells::WAVE_OFF as i64;
+    #[constant]
+    const WAVE_RADIUS: i64 = cells::WAVE_RADIUS as i64;
+    #[constant]
+    const WAVE_POSE: i64 = cells::WAVE_POSE as i64;
+    #[constant]
+    const WAVE_SQUEEZE: i64 = cells::WAVE_SQUEEZE as i64;
+    #[constant]
+    const EVENT_PARTED: i64 = cells::EVENT_PARTED as i64;
+    #[constant]
+    const EVENT_JOINED: i64 = cells::EVENT_JOINED as i64;
+    #[constant]
+    const EVENT_SPLIT: i64 = cells::EVENT_SPLIT as i64;
+
+    /// threads, substeps, stretch_hz, bend_hz, bend_mode, shape_k, link_damp, bend_damp,
+    /// collide_all, capsules, contact_hz, contact_pad, self_mode, margin, drag (bool),
+    /// drag_normal, drag_tangent, drag_linear_normal, drag_linear_tangent, drag_density,
+    /// drag_facing, drag_substep, current (Vector2), tension, gravity (Vector2),
+    /// plastic_yield, plastic_rate, plastic_recover, break_force, break_torque, break_smooth,
+    /// link_tol, max_speed, density, ease_time, ease_from.
+    #[func]
+    fn set_options(&mut self, options: VarDictionary) {
+        let mut colliders = false;
+        for (key, value) in options.iter_shared() {
+            let name = key.to_string();
+            let x = cells_num(&value);
+            let o = &mut self.c.opt;
+            match name.as_str() {
+                "threads" => self.c.set_threads(x as usize),
+                "substeps" => o.substeps = (x as usize).max(1),
+                "stretch_hz" => o.stretch_hz = x as f32,
+                "bend_hz" => o.bend_hz = x as f32,
+                "bend_mode" => o.bend_mode = x as u8,
+                "shape_k" => o.shape_k = x as f32,
+                "link_damp" => o.link_damp = x as f32,
+                "bend_damp" => o.bend_damp = x as f32,
+                "collide_all" => {
+                    o.collide_all = x != 0.0;
+                    colliders = true;
+                }
+                "capsules" => o.capsules = x != 0.0,
+                "contact_hz" => o.contact_hz = x as f32,
+                "contact_pad" => {
+                    o.contact_pad = x as f32;
+                    colliders = true;
+                }
+                "self_mode" => o.self_mode = x as u8,
+                "contact_iters" => o.contact_iters = (x as u32).max(1),
+                "self_every" => o.self_every = (x as u32).max(1),
+                "margin" => o.margin = x as f32,
+                "drag" => o.drag.enabled = x != 0.0,
+                "drag_normal" => o.drag.normal = x as f32,
+                "drag_tangent" => o.drag.tangent = x as f32,
+                "drag_linear_normal" => o.drag.linear_normal = x as f32,
+                "drag_linear_tangent" => o.drag.linear_tangent = x as f32,
+                "drag_density" => o.drag.density = x as f32,
+                "drag_facing" => o.drag.facing_only = x != 0.0,
+                "drag_substep" => o.drag_substep = x != 0.0,
+                "drag_max_step" => o.drag.max_step = x as f32,
+                "current" => o.current = value.try_to::<Vector2>().unwrap_or(Vector2::ZERO),
+                "tension" => o.tension = x as f32,
+                "gravity" => o.gravity = value.try_to::<Vector2>().unwrap_or(Vector2::ZERO),
+                "plastic_yield" => o.plastic_yield = x as f32,
+                "plastic_rate" => o.plastic_rate = x as f32,
+                "plastic_recover" => o.plastic_recover = x as f32,
+                "break_force" => o.break_force = x as f32,
+                "break_torque" => o.break_torque = x as f32,
+                "break_smooth" => o.break_smooth = x as f32,
+                "link_tol" => o.link_tol = x as f32,
+                "max_speed" => o.max_speed = x as f32,
+                "density" => o.density = x as f32,
+                "ease_time" => o.ease_time = x as f32,
+                "ease_from" => o.ease_from = x as f32,
+                _ => godot_error!("GooCells: unknown option {}", name),
+            }
+        }
+        if colliders {
+            self.c.refresh_colliders();
+        }
+    }
+
+    /// A type's factors: stretch, bend, break (× the options), self_collide (bool),
+    /// join_mask (bits of the types it may join), pad (px added to its contact radius).
+    #[func]
+    fn set_type(&mut self, t: i64, params: VarDictionary) {
+        let tp = &mut self.c.opt.types[(t as usize).min(cells::TYPES - 1)];
+        for (key, value) in params.iter_shared() {
+            let x = cells_num(&value);
+            match key.to_string().as_str() {
+                "stretch" => tp.stretch = x as f32,
+                "bend" => tp.bend = x as f32,
+                "break" => tp.brk = x as f32,
+                "self_collide" => tp.self_collide = x != 0.0,
+                "join_mask" => tp.join_mask = x as u16,
+                "pad" => tp.pad = x as f32,
+                other => godot_error!("GooCells: unknown type parameter {}", other),
+            }
+        }
+    }
+
+    #[func]
+    fn add_creature(&mut self, centers: PackedVector2Array, radii: PackedFloat32Array, types: PackedInt32Array) -> i64 {
+        let t: Vec<u8> = types.as_slice().iter().map(|&x| x as u8).collect();
+        self.c.add_creature(centers.as_slice(), radii.as_slice(), &t) as i64
+    }
+
+    #[func]
+    fn add_wall(&mut self, points: PackedVector2Array) {
+        self.c.add_wall(points.as_slice());
+    }
+
+    #[func]
+    fn step(&mut self, delta: f64) {
+        self.c.step(delta as f32);
+    }
+
+    /// Creature slots (a merged creature's slot stays, dead).
+    #[func]
+    fn creature_count(&self) -> i64 {
+        self.c.bodies.len() as i64
+    }
+
+    #[func]
+    fn alive(&self, c: i64) -> bool {
+        self.c.bodies.get(c as usize).map(|b| b.alive).unwrap_or(false)
+    }
+
+    #[func]
+    fn cell_count(&self, c: i64) -> i64 {
+        self.c.bodies[c as usize].n as i64
+    }
+
+    #[func]
+    fn push_creature(&mut self, c: i64, acceleration: Vector2) {
+        self.c.bodies[c as usize].push = acceleration;
+    }
+
+    /// An angular acceleration (rad/s², clockwise on screen positive) about its centre of
+    /// mass: forces of a rigid turn, no net force.
+    #[func]
+    fn twist(&mut self, c: i64, alpha: f64) {
+        self.c.bodies[c as usize].twist = alpha as f32;
+    }
+
+    /// Forces per cell, kept until set again (empty: none).
+    #[func]
+    fn set_cell_forces(&mut self, c: i64, forces: PackedVector2Array) {
+        let b = &mut self.c.bodies[c as usize];
+        for i in 0..b.n {
+            b.user_force[i] = forces.as_slice().get(i).copied().unwrap_or(Vector2::ZERO);
+        }
+    }
+
+    /// Thrust per cell (force) along its heading turned by `angles` (rad, in its frame).
+    #[func]
+    fn set_cell_thrust(&mut self, c: i64, thrust: PackedFloat32Array, angles: PackedFloat32Array) {
+        let b = &mut self.c.bodies[c as usize];
+        for i in 0..b.n {
+            b.thrust[i] = thrust.as_slice().get(i).copied().unwrap_or(0.0);
+            b.thrust_angle[i] = angles.as_slice().get(i).copied().unwrap_or(0.0);
+        }
+    }
+
+    #[func]
+    fn set_velocity(&mut self, c: i64, v: Vector2) {
+        let b = &mut self.c.bodies[c as usize];
+        for i in 0..b.n {
+            b.vel[i] = v;
+            b.om[i] = 0.0;
+        }
+    }
+
+    #[func]
+    fn translate(&mut self, c: i64, by: Vector2) {
+        let b = &mut self.c.bodies[c as usize];
+        for i in 0..b.n {
+            b.pos[i] += by;
+            b.prev[i] += by;
+        }
+    }
+
+    #[func]
+    fn creature_center(&self, c: i64) -> Vector2 {
+        self.c.bodies[c as usize].center()
+    }
+
+    #[func]
+    fn creature_velocity(&self, c: i64) -> Vector2 {
+        self.c.bodies[c as usize].velocity()
+    }
+
+    /// The best-fit turn against its design (rad).
+    #[func]
+    fn creature_turn(&self, c: i64) -> f64 {
+        self.c.bodies[c as usize].turn_against_rest() as f64
+    }
+
+    #[func]
+    fn creature_spin(&self, c: i64) -> f64 {
+        self.c.bodies[c as usize].spin() as f64
+    }
+
+    #[func]
+    fn shape_error(&self, c: i64) -> f64 {
+        self.c.bodies[c as usize].shape_error() as f64
+    }
+
+    /// mode (WAVE_*), amplitude (WAVE_RADIUS/SQUEEZE: of the radius; WAVE_POSE: the slope
+    /// k·A), wavelength (px), frequency (Hz), axis (design frame; WAVE_POSE swims toward
+    /// +axis), half_width (px, WAVE_RADIUS), bias (1/px, WAVE_POSE), envelope (0..1).
+    #[func]
+    fn set_wave(&mut self, c: i64, mode: i64, amplitude: f64, wavelength: f64, frequency: f64, axis: Vector2, half_width: f64, bias: f64, envelope: f64) {
+        let b = &mut self.c.bodies[c as usize];
+        let phase = b.wave.phase;
+        b.wave = cells::Wave {
+            mode: mode as u8,
+            amp: amplitude as f32,
+            k: std::f32::consts::TAU / (wavelength as f32).max(1e-3),
+            omega: std::f32::consts::TAU * frequency as f32,
+            axis: axis.normalized(),
+            half_width: half_width as f32,
+            bias: bias as f32,
+            envelope: envelope as f32,
+            phase,
+            age: if b.wave.mode == mode as u8 { b.wave.age } else { 0.0 },
+        };
+        if mode as u8 == cells::WAVE_OFF {
+            for i in 0..b.n {
+                b.muscle[i] = 1.0;
+            }
+            for l in b.links.iter_mut() {
+                l.d_design = l.d_base;
+                l.ai_design = l.ai_base;
+                l.aj_design = l.aj_base;
+            }
+        }
+    }
+
+    /// Radius muscles per cell (1 at rest), kept until set again.
+    #[func]
+    fn set_cell_scales(&mut self, c: i64, scales: PackedFloat32Array) {
+        let b = &mut self.c.bodies[c as usize];
+        for (i, &s) in scales.as_slice().iter().enumerate().take(b.n) {
+            b.muscle[i] = s;
+        }
+    }
+
+    #[func]
+    fn centers(&self, c: i64) -> PackedVector2Array {
+        PackedVector2Array::from(self.c.bodies[c as usize].pos.as_slice())
+    }
+
+    #[func]
+    fn velocities(&self, c: i64) -> PackedVector2Array {
+        PackedVector2Array::from(self.c.bodies[c as usize].vel.as_slice())
+    }
+
+    #[func]
+    fn radii(&self, c: i64) -> PackedFloat32Array {
+        PackedFloat32Array::from(self.c.bodies[c as usize].r.as_slice())
+    }
+
+    #[func]
+    fn angles(&self, c: i64) -> PackedFloat32Array {
+        PackedFloat32Array::from(self.c.bodies[c as usize].th.as_slice())
+    }
+
+    #[func]
+    fn rest_local(&self, c: i64) -> PackedVector2Array {
+        PackedVector2Array::from(self.c.bodies[c as usize].rest_local.as_slice())
+    }
+
+    #[func]
+    fn types(&self, c: i64) -> PackedInt32Array {
+        PackedInt32Array::from_iter(self.c.bodies[c as usize].typ.iter().map(|&t| t as i32))
+    }
+
+    #[func]
+    fn uids(&self, c: i64) -> PackedInt32Array {
+        PackedInt32Array::from_iter(self.c.bodies[c as usize].uid.iter().map(|&t| t as i32))
+    }
+
+    #[func]
+    fn boundary(&self, c: i64) -> PackedInt32Array {
+        PackedInt32Array::from_iter(self.c.bodies[c as usize].boundary.iter().map(|&t| t as i32))
+    }
+
+    #[func]
+    fn outline(&self, c: i64) -> PackedInt32Array {
+        PackedInt32Array::from_iter(self.c.bodies[c as usize].outline.iter().map(|&t| t as i32))
+    }
+
+    #[func]
+    fn outline_surface(&self, c: i64) -> PackedVector2Array {
+        let mut s = Vec::new();
+        self.c.bodies[c as usize].outline_surface(&mut s);
+        PackedVector2Array::from(s.as_slice())
+    }
+
+    #[func]
+    fn skin(&self, c: i64, iterations: i64) -> PackedVector2Array {
+        PackedVector2Array::from(self.c.skin(c as usize, iterations.max(0) as usize).as_slice())
+    }
+
+    /// Every creature's skin: [points, counts (one per slot), build µs].
+    #[func]
+    fn skins_all(&self, iterations: i64) -> VarArray {
+        let t = std::time::Instant::now();
+        let (p, counts) = self.c.skins_all(iterations.max(0) as usize);
+        let us = t.elapsed().as_micros() as i64;
+        let mut a = VarArray::new();
+        a.push(&PackedVector2Array::from(p.as_slice()).to_variant());
+        a.push(&PackedInt32Array::from(counts.as_slice()).to_variant());
+        a.push(&us.to_variant());
+        a
+    }
+
+    /// Links as pairs of cell indices.
+    #[func]
+    fn links(&self, c: i64) -> PackedInt32Array {
+        let b = &self.c.bodies[c as usize];
+        let mut out = Vec::with_capacity(b.links.len() * 2);
+        for l in &b.links {
+            out.push(l.i as i32);
+            out.push(l.j as i32);
+        }
+        PackedInt32Array::from(out.as_slice())
+    }
+
+    /// Each link's smoothed load (the break test's number).
+    #[func]
+    fn link_loads(&self, c: i64) -> PackedFloat32Array {
+        PackedFloat32Array::from_iter(self.c.bodies[c as usize].links.iter().map(|l| l.load))
+    }
+
+    /// Each link's strain now (length over rest − 1).
+    #[func]
+    fn link_strains(&self, c: i64) -> PackedFloat32Array {
+        let b = &self.c.bodies[c as usize];
+        PackedFloat32Array::from_iter(b.links.iter().map(|l| (b.pos[l.j as usize] - b.pos[l.i as usize]).length() / l.rest.max(1e-3) - 1.0))
+    }
+
+    /// Candidates to join: (creature a, cell, creature b, cell) × N.
+    #[func]
+    fn find_captures(&self, capture: f64, same: bool) -> PackedInt32Array {
+        let v = self.c.find_captures(capture as f32, same);
+        PackedInt32Array::from_iter(v.iter().flat_map(|p| p.iter().map(|&x| x as i32)))
+    }
+
+    /// Joins pairs as find_captures() gives them (four ints each); returns links made.
+    #[func]
+    fn join(&mut self, pairs: PackedInt32Array) -> i64 {
+        let s = pairs.as_slice();
+        let v: Vec<[u32; 4]> = s.chunks_exact(4).map(|q| [q[0] as u32, q[1] as u32, q[2] as u32, q[3] as u32]).collect();
+        self.c.join(&v) as i64
+    }
+
+    #[func]
+    fn add_cell(&mut self, c: i64, at: Vector2, radius: f64, typ: i64) -> i64 {
+        self.c.add_cell(c as usize, at, radius as f32, typ as u8) as i64
+    }
+
+    #[func]
+    fn remove_cell(&mut self, c: i64, i: i64) {
+        self.c.remove_cell(c as usize, i as usize);
+    }
+
+    /// Events since the last call: (kind, creature, a, b) × N (uids; EVENT_SPLIT: parent,
+    /// new creature, its cell count).
+    #[func]
+    fn take_events(&mut self) -> PackedInt32Array {
+        let e = std::mem::take(&mut self.c.events);
+        PackedInt32Array::from_iter(e.iter().flat_map(|x| x.iter().copied()))
+    }
+
+    /// [px, py, angular momentum about the origin]
+    #[func]
+    fn momentum(&self) -> PackedFloat64Array {
+        PackedFloat64Array::from(self.c.momentum().as_slice())
+    }
+
+    #[func]
+    fn state_hash(&self) -> i64 {
+        self.c.state_hash()
+    }
+
+    /// [cross_overlap_max, cells_inside_other, self_overlap_max, strain_max, shape_err_max,
+    /// shape_err_mean, wall_overlap_max, not_finite]
+    #[func]
+    fn health(&self) -> PackedFloat32Array {
+        PackedFloat32Array::from(self.c.health().as_slice())
+    }
+
+    #[func]
+    fn stats(&self) -> VarDictionary {
+        let s = &self.c.stats;
+        let mut d = VarDictionary::new();
+        d.set("total_us", s.total_us as i64);
+        d.set("prep_us", s.prep_us as i64);
+        d.set("broad_us", s.broad_us as i64);
+        d.set("solve_us", s.solve_us as i64);
+        d.set("serial_us", s.serial_us as i64);
+        d.set("vel_us", s.vel_us as i64);
+        d.set("topo_us", s.topo_us as i64);
+        d.set("cross_pairs", s.cross_pairs as i64);
+        d.set("wall_pairs", s.wall_pairs as i64);
+        d.set("self_pairs", s.self_pairs as i64);
+        d.set("links", s.links as i64);
+        d.set("build_us", s.build_us as i64);
+        d
     }
 }
