@@ -78,6 +78,8 @@ const RETOPO_EVERY: int = 30
 const FROZEN_SKIN: float = 16.0
 ## The most cells one retopology switches between ring and core.
 const RETOPO_SWITCHES: int = 8
+## The bead count of the smallest cell with the frozen preset (cell_floats()'s `beads`).
+const FROZEN_BEADS: int = 12
 
 ## everything_options() with the frozen topology: what the fluid game's creatures use.
 ## The spinning step (`spin`) wants a pool of at most the machine's cores; joins and
@@ -86,10 +88,15 @@ static func frozen_options(strength: float = TENSION) -> Dictionary:
 	var options := everything_options(strength)
 	options.merge({ "frozen": true, "frozen_self": 4, "pair_skin": FROZEN_SKIN * GooTuning.unit,
 		"retopo_every": RETOPO_EVERY, "frozen_breaks": true, "retopo_switches": RETOPO_SWITCHES,
-		"fast_search": true, "spin": true, "fast_rings": true }, true)
+		"fast_search": true, "spin": true, "fast_rings": true, "cell_beads": FROZEN_BEADS }, true)
 	return options
 
 var colony: GooColony
+
+## The bead count of the smallest cell for add_creature() and add_cell() (cell_floats()'s
+## `beads`): GooTuning's 12, or the option "cell_beads" given to new() (frozen_options()
+## gives FROZEN_BEADS).
+var cell_beads: int = GooTuning.MIN_BEADS
 
 ## Ask may_adhere() once about each pair of cells that touch for the first time (until
 ## they part and come apart): the colony holds such a pair back until it is answered,
@@ -110,7 +117,11 @@ func _init(options: Dictionary = {}) -> void:
 	colony.set_options({ "adhesion": true, "capture": CAPTURE * unit, "join_reach": JOIN_REACH * unit,
 		"break_force": BREAK_FORCE * unit, "max_speed": GooTuning.MAX_BEAD_SPEED * unit, "skip_speed": SKIP_SPEED * unit })
 	if not options.is_empty():
-		colony.set_options(options)
+		var rest := options.duplicate()
+		if rest.has("cell_beads"):
+			cell_beads = int(rest["cell_beads"])
+			rest.erase("cell_beads")
+		colony.set_options(rest)
 
 ## May cells `a` and `b` of creature `creature` stick (asked once per first touch while
 ## `asks_script` is on, never from a worker thread). Override, or set `adhere_filter`.
@@ -151,12 +162,36 @@ func part_cells(creature: int, a: int, b: int) -> int:
 	flush_events()
 	return removed
 
+## Frozen topology: creature `creature` retopologises in its next step (captures, so its
+## touching cells join; its exposure, outline and cores updated; joins reported then).
+func request_retopology(creature: int) -> void:
+	colony.request_retopology(creature)
+
+## Adds a cell, a Dictionary as add_creature() takes them, to creature `creature`; its
+## index (the creature's last). Frozen topology: it asks for the creature's retopology,
+## where the new cell sticks to its neighbours.
+func add_cell(creature: int, cell: Dictionary) -> int:
+	var k := colony.add_cell(creature, cell_floats(cell["position"], cell["radius"], cell.get("core", false), cell.get("color", Color.WHITE), -1.0, cell_beads))
+	var type_id: int = cell.get("type", 0)
+	if k >= 0 and type_id != 0:
+		colony.set_cell_type(creature, k, type_id)
+	return k
+
+## Removes cell `cell` of creature `creature`; the later cells are renumbered down by one.
+## Each pair it was joined in is reported parted at once (cells_parted, in the numbering
+## before the removal). Asks for a retopology. False for a cell that is not there or a
+## creature's last.
+func remove_cell(creature: int, cell: int) -> bool:
+	var removed := colony.remove_cell(creature, cell)
+	flush_events()
+	return removed
+
 ## Adds a creature of `cells`, each a Dictionary {position: Vector2, radius: float,
 ## type: int (0), core: bool (false), color: Color}; its index.
 func add_creature(cells: Array) -> int:
 	var floats := PackedFloat32Array()
 	for cell: Dictionary in cells:
-		floats.append_array(cell_floats(cell["position"], cell["radius"], cell.get("core", false), cell.get("color", Color.WHITE)))
+		floats.append_array(cell_floats(cell["position"], cell["radius"], cell.get("core", false), cell.get("color", Color.WHITE), -1.0, cell_beads))
 	var k := colony.add_creature(floats)
 	for i: int in cells.size():
 		var type_id: int = cells[i].get("type", 0)
@@ -165,11 +200,32 @@ func add_creature(cells: Array) -> int:
 	return k
 
 ## The GooColony.CELL_STRIDE floats of a cell of `radius` at `at`: GooTuning.tuning()
-## for its size at the current unit (`linear_damp` < 0: the tuning's).
+## for its size at the current unit (`linear_damp` < 0: the tuning's). `beads` is the bead
+## count of the smallest cell (GooTuning's 12); a larger cell keeps its own count minus
+## the same difference (GooTuning.bead_count(): 12 for the smallest, up to 22), at least
+## 6, with its masses, bead radius, ring radius and springs recomputed for that count as
+## tuning() would (docs/colony-frozen.md, "Beads per cell").
 static func cell_floats(at: Vector2, radius: float, core: bool = false, color: Color = Color.WHITE,
-		linear_damp: float = -1.0) -> PackedFloat32Array:
+		linear_damp: float = -1.0, beads: int = GooTuning.MIN_BEADS) -> PackedFloat32Array:
 	var t := GooTuning.tuning(radius)
-	return PackedFloat32Array([at.x, at.y, radius, 1.0 if core else 0.0, t["bead_count"], t["ring_radius"],
-		t["bead_radius"], t["bead_mass"], t["pressure_k"], t["shape_match_k"], t["skin_stiffness"],
-		t["skin_damping"], t["bending_stiffness"], t["bending_damping"], t["internal_damp"],
-		t["linear_damp"] if linear_damp < 0.0 else linear_damp, t["target_area"], color.r, color.g, color.b])
+	var damp: float = t["linear_damp"] if linear_damp < 0.0 else linear_damp
+	if beads == GooTuning.MIN_BEADS:
+		return PackedFloat32Array([at.x, at.y, radius, 1.0 if core else 0.0, t["bead_count"], t["ring_radius"],
+			t["bead_radius"], t["bead_mass"], t["pressure_k"], t["shape_match_k"], t["skin_stiffness"],
+			t["skin_damping"], t["bending_stiffness"], t["bending_damping"], t["internal_damp"],
+			damp, t["target_area"], color.r, color.g, color.b])
+	var n: int = maxi(int(t["bead_count"]) + beads - GooTuning.MIN_BEADS, 6)
+	var bead_mass := GooTuning.blob_mass(radius) / n
+	var bead_r := GooTuning.BEAD_RADIUS_RATIO * TAU * radius / n
+	var area: float = t["target_area"]
+	var qa := 0.5 * n * sin(TAU / n)
+	var qb := 2.0 * n * sin(PI / n) * bead_r
+	var qc := PI * bead_r * bead_r - area
+	var ring_r := (-qb + sqrt(qb * qb - 4.0 * qa * qc)) / (2.0 * qa)
+	var omega := GooTuning._skin_frequency(radius)
+	var zeta := GooTuning.joint_damping_ratio(radius)
+	var skin_k := bead_mass * omega * omega
+	var skin_d := 2.0 * zeta * bead_mass * omega
+	return PackedFloat32Array([at.x, at.y, radius, 1.0 if core else 0.0, n, ring_r, bead_r, bead_mass,
+		t["pressure_k"], t["shape_match_k"], skin_k, skin_d, GooTuning.BENDING_RATIO * skin_k,
+		GooTuning.BENDING_RATIO * skin_d, t["internal_damp"], damp, area, color.r, color.g, color.b])

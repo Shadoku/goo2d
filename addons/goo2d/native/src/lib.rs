@@ -1280,6 +1280,30 @@ impl GooColony {
         }
     }
 
+    /// Adds a cell (CELL_STRIDE floats, as add_creature() takes them) to creature `c`;
+    /// its index (the creature's last), or -1. Frozen topology: it asks for a retopology,
+    /// where it sticks to its neighbours.
+    #[func]
+    fn add_cell(&mut self, c: i64, cell: PackedFloat32Array) -> i64 {
+        let f = cell.as_slice();
+        if f.len() < colony::CELL_STRIDE {
+            godot_error!("GooColony.add_cell(): {} floats, a cell takes {}", f.len(), colony::CELL_STRIDE);
+            return -1;
+        }
+        self.c.creatures.get_mut(c as usize).map(|cr| cr.add_cell(&f[..colony::CELL_STRIDE]) as i64).unwrap_or(-1)
+    }
+
+    /// Removes cell `cell` of creature `c` (the later cells renumbered down by one; each
+    /// pair it was joined in reported parted, in the old numbering). Asks for a
+    /// retopology. False for a cell that is not there or a creature's last.
+    #[func]
+    fn remove_cell(&mut self, c: i64, cell: i64) -> bool {
+        if cell < 0 {
+            return false;
+        }
+        self.c.creatures.get_mut(c as usize).map(|cr| cr.remove_cell(cell as usize)).unwrap_or(false)
+    }
+
     #[func]
     fn creature_center(&self, c: i64) -> Vector2 {
         self.c.creatures.get(c as usize).map(|cr| cr.center()).unwrap_or(Vector2::ZERO)
@@ -1530,6 +1554,16 @@ impl GooColony {
     #[func]
     fn cell_muscle(&self, c: i64, cell: i64) -> f64 {
         self.c.creatures.get(c as usize).and_then(|cr| cr.cells.get(cell as usize)).map(|x| x.muscle as f64).unwrap_or(0.0)
+    }
+
+    /// A ring cell's bead radius (px; a core's: 0).
+    #[func]
+    fn cell_bead_radius(&self, c: i64, cell: i64) -> f64 {
+        let Some(cr) = self.c.creatures.get(c as usize) else { return 0.0 };
+        match cr.cells.get(cell as usize).map(|x| x.kind) {
+            Some(colony::Kind::Ring(r)) => cr.r[cr.rings[r].start] as f64,
+            _ => 0.0,
+        }
     }
 
     #[func]

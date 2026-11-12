@@ -74,28 +74,8 @@ func _throw(options: Dictionary, speed: float) -> Dictionary:
 func _add(sim: GooColonySim, cells: Array) -> int:
 	var floats := PackedFloat32Array()
 	for c: Dictionary in cells:
-		floats.append_array(cell_floats_beads(c["position"], c["radius"], false, _beads, GooTuning.tuning(c["radius"])["linear_damp"]))
+		floats.append_array(GooColonySim.cell_floats(c["position"], c["radius"], false, Color.WHITE, -1.0, _beads))
 	return sim.colony.add_creature(floats)
-
-## The bench's _cell_floats(): GooTuning.tuning(r) with the bead count changed by `beads`
-## - 12 (masses, bead radius, ring radius and springs recomputed), linear damping `damp`.
-static func cell_floats_beads(at: Vector2, r: float, core: bool, beads: int, damp: float) -> PackedFloat32Array:
-	var t := GooTuning.tuning(r)
-	var n: int = maxi(int(t["bead_count"]) + beads - 12, 6)
-	var blob := GooTuning.blob_mass(r)
-	var bead_mass := blob / n
-	var bead_r := GooTuning.BEAD_RADIUS_RATIO * TAU * r / n
-	var qa := 0.5 * n * sin(TAU / n)
-	var qb := 2.0 * n * sin(PI / n) * bead_r
-	var qc := PI * bead_r * bead_r - PI * r * r
-	var ring_r := (-qb + sqrt(qb * qb - 4.0 * qa * qc)) / (2.0 * qa)
-	var omega := GooTuning._skin_frequency(r)
-	var zeta := GooTuning.joint_damping_ratio(r)
-	var skin_k := bead_mass * omega * omega
-	var skin_d := 2.0 * zeta * bead_mass * omega
-	return PackedFloat32Array([at.x, at.y, r, 1.0 if core else 0.0, n, ring_r, bead_r, bead_mass,
-		t["pressure_k"], t["shape_match_k"], skin_k, skin_d, GooTuning.BENDING_RATIO * skin_k,
-		GooTuning.BENDING_RATIO * skin_d, t["internal_damp"], damp, PI * r * r, 1.0, 1.0, 1.0])
 
 static func _hex(rings: int, at: Vector2 = Vector2.ZERO) -> Array:
 	var r := GooTuning.min_radius()

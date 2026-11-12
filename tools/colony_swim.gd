@@ -41,7 +41,7 @@ var _seconds: float = 10.0
 var _threads: int = 4
 var _crowd: int = 1
 var _cores: bool = true
-var _beads: int = 12
+var _beads: int = -1
 var _tension: float = GooColonySim.TENSION
 var _extra := {}
 var _trace: bool = false
@@ -92,6 +92,9 @@ func _initialize() -> void:
 	opts["threads"] = _threads
 	opts["cpu_timers"] = true
 	opts.merge(_extra, true)
+	if _beads < 0:
+		_beads = int(opts.get("cell_beads", GooTuning.MIN_BEADS))
+	opts.erase("cell_beads")
 	_sim = GooColonySim.new(opts)
 	_colony = _sim.colony
 	var columns := ceili(sqrt(float(_crowd)))
@@ -125,7 +128,9 @@ func _add_creature(origin: Vector2) -> void:
 	_length = hi.x - lo.x + 2.0 * r
 	var half := maxf((hi.y - lo.y) * 0.5, 1.0)
 	for s: Vector3 in spots:
-		floats.append_array(cell_floats_beads(origin + Vector2(s.x, s.y), r, s.z > 0.5, _beads))
+		var f := GooColonySim.cell_floats(origin + Vector2(s.x, s.y), r, s.z > 0.5, Color.WHITE, 0.0, _beads)
+		f[14] *= 0.25  # a quarter of the internal damping (the fluid game's RING_INTERNAL_DAMP_SCALE)
+		floats.append_array(f)
 		# u: 0 at the tail (-x) to 1 at the head (+x); v: -1..1 across.
 		list.append(Vector3((s.x - lo.x) / maxf(hi.x - lo.x, 1.0), (s.y - (lo.y + hi.y) * 0.5) / half, 0.0))
 	_colony.add_creature(floats)
@@ -209,25 +214,3 @@ func _report() -> void:
 	print("SWIM model=%s shape=%s gait=%s beads=%d crowd=%d speed=%.2f bl_per_cycle=%.3f step_ms=%.2f/%.2f own_inside=%d cross_inside=%d inverted=%d area_min=%.2f" % [
 		_model, _shape, _gait, _beads, _crowd, mean, mean / _freq / _length, tt[n / 2], tt[int(n * 0.95)], int(_worst["own_inside"]),
 		int(_worst["cross_inside"]), int(_worst["inverted"]), _worst["area_min"]])
-
-## The CELL_STRIDE floats of a cell of radius `r` with `beads` beads for the smallest cell
-## (GooTuning.tuning() otherwise: masses, bead radius, ring radius and springs recomputed
-## for the count, as tools/colony_bench.gd's), no linear damping (the water drags it) and
-## a quarter of the internal damping (the fluid game's RING_INTERNAL_DAMP_SCALE).
-static func cell_floats_beads(at: Vector2, r: float, core: bool, beads: int) -> PackedFloat32Array:
-	var t := GooTuning.tuning(r)
-	var n: int = maxi(int(t["bead_count"]) + beads - 12, 6)
-	var blob := GooTuning.blob_mass(r)
-	var bead_mass := blob / n
-	var bead_r := GooTuning.BEAD_RADIUS_RATIO * TAU * r / n
-	var qa := 0.5 * n * sin(TAU / n)
-	var qb := 2.0 * n * sin(PI / n) * bead_r
-	var qc := PI * bead_r * bead_r - PI * r * r
-	var ring_r := (-qb + sqrt(qb * qb - 4.0 * qa * qc)) / (2.0 * qa)
-	var omega := GooTuning._skin_frequency(r)
-	var zeta := GooTuning.joint_damping_ratio(r)
-	var skin_k := bead_mass * omega * omega
-	var skin_d := 2.0 * zeta * bead_mass * omega
-	return PackedFloat32Array([at.x, at.y, r, 1.0 if core else 0.0, n, ring_r, bead_r, bead_mass,
-		t["pressure_k"], t["shape_match_k"], skin_k, skin_d, GooTuning.BENDING_RATIO * skin_k,
-		GooTuning.BENDING_RATIO * skin_d, t["internal_damp"] * 0.25, 0.0, PI * r * r, 1.0, 1.0, 1.0])

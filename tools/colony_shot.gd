@@ -21,8 +21,12 @@ extends SceneTree
 ## cells (top) and a cell beside one 1.6 times its size (bottom) after 3 s, without tension
 ## (left) and with it (right). worm: a single file of 12 cells (top) and a worm three cells
 ## wide (bottom) after 5 s, without tension (left) and with it (right).
-## GooTuning.unit 0.5, drawn 4 screen px per px (exposure and crash: 3; ragged, worm: 2;
-## wall: 5).
+## swim: a worm of 24 × 5 cells (its inside cores) after 4 s of tools/colony_swim.gd's bend
+## gait (amp 0.3, 1.5 waves, 0.5 Hz) with GooColonySim.frozen_options() (docs/colony-frozen.md).
+## --frozen: every scene with frozen_options() (drag and tension on); --beads=K: K beads for
+## the smallest cell (GooColonySim.cell_floats()'s `beads`).
+## GooTuning.unit 0.5, drawn 4 screen px per px (exposure and crash: 3; ragged, worm, swim:
+## 2; wall: 5).
 
 const UNIT: float = 0.5
 const ZOOM: float = 4.0
@@ -37,6 +41,9 @@ var _frames: int = 0
 var _pull: float = 0.0
 var _cells: Array[Vector3] = []
 var _tension: float = -1.0
+var _beads: int = -1
+var _frozen: bool = false
+var _swim: Array = []
 
 class View extends Node2D:
 	var sim: GooColonySim
@@ -56,7 +63,7 @@ class View extends Node2D:
 				for p: Vector2 in points:
 					centre += p
 				centre /= points.size()
-				var bead_r: float = GooTuning.tuning(colony.cell_radius(c, cell))["bead_radius"]
+				var bead_r: float = colony.cell_bead_radius(c, cell)
 				var outline := PackedVector2Array()
 				var n := points.size()
 				for i: int in n:
@@ -114,13 +121,17 @@ func _initialize() -> void:
 			which = arg.get_slice("=", 1)
 		elif arg.begins_with("--tension="):
 			_tension = arg.get_slice("=", 1).to_float()
+		elif arg.begins_with("--beads="):
+			_beads = arg.get_slice("=", 1).to_int()
+		elif arg == "--frozen":
+			_frozen = true
 		elif not arg.begins_with("--"):
 			_out = arg
 	if _out.is_empty():
 		push_error("colony_shot: give an output directory")
 		quit(1)
 		return
-	_scenes = PackedStringArray(["rest", "pull", "collide", "exposure", "crash", "ragged", "wall", "worm"]) if which == "all" else PackedStringArray([which])
+	_scenes = PackedStringArray(["rest", "pull", "collide", "exposure", "crash", "ragged", "wall", "worm", "swim"]) if which == "all" else PackedStringArray([which])
 	GooTuning.unit = UNIT
 	RenderingServer.set_default_clear_color(Color(0.08, 0.09, 0.12))
 	_next_scene()
@@ -135,14 +146,18 @@ func _next_scene() -> void:
 	var options := GooColonySim.EXPOSURE_OPTIONS.duplicate()
 	if _scenes[_scene] in ["ragged", "wall", "worm"]:
 		options.merge(GooColonySim.tension_options() if _tension < 0.0 else GooColonySim.tension_options(_tension), true)
+	if _frozen or _scenes[_scene] == "swim":
+		options = GooColonySim.frozen_options() if _tension < 0.0 else GooColonySim.frozen_options(_tension)
 	_sim = GooColonySim.new(options)
+	if _beads > 0:
+		_sim.cell_beads = _beads
 	_view = View.new()
 	_view.sim = _sim
 	var zoom := ZOOM
 	match _scenes[_scene]:
 		"crash", "exposure":
 			zoom = 3.0
-		"ragged", "worm":
+		"ragged", "worm", "swim":
 			zoom = 2.0
 		"wall":
 			zoom = 5.0
@@ -210,6 +225,19 @@ func _next_scene() -> void:
 					if i == 0:
 						_sim.colony.set_creature_tension(k, 0.0)
 			_frames = 300
+		"swim":
+			# A worm of 24 × 5 cells, its inside cores, swimming 4 s by tools/colony_swim.gd's
+			# bend gait with the frozen preset (drag and tension on).
+			var r := GooTuning.min_radius()
+			var list: Array = []
+			_swim.clear()
+			for c: int in 24:
+				for j: int in 5:
+					list.append({ "position": Vector2(c * 2.0 * r + (j % 2) * r, j * sqrt(3.0) * r), "radius": r,
+						"core": j > 0 and j < 4 and c > 0 and c < 23 })
+					_swim.append(Vector2(c / 23.0, (j - 2) / 2.0))
+			_sim.add_creature(list)
+			_frames = 240
 	_view.queue_redraw()
 
 static func _offset(cells: Array, by: Vector2) -> Array:
@@ -271,6 +299,13 @@ func _physics_process(delta: float) -> bool:
 	if _view == null or _scene >= _scenes.size():
 		return false
 	var name := _scenes[_scene]
+	if name == "swim":
+		# tools/colony_swim.gd's bend gait: a wave of muscles running tail-ward.
+		var ramp := clampf((_frame - 20) / 40.0, 0.0, 1.0)
+		var scales := PackedFloat32Array()
+		for uv: Vector2 in _swim:
+			scales.append(1.0 + 0.3 * ramp * sin(TAU * (1.5 * uv.x + 0.5 * _frame * delta)) * uv.y)
+		_sim.colony.set_cell_muscles(0, scales)
 	if name == "pull" and _frame == 120:
 		for i: int in _cells.size():
 			var side := signf(_cells[i].x) if absf(_cells[i].x) > 15.0 else 0.0

@@ -3039,6 +3039,89 @@ impl Creature {
         }
     }
 
+    /// Adds a cell (CELL_STRIDE floats, as add_creature() takes them) to the creature; its
+    /// index (the last). It sticks to its neighbours at the next retopology, which it asks
+    /// for (frozen topology), or the next capture.
+    pub fn add_cell(&mut self, f: &[f32]) -> usize {
+        let cell = self.cells.len();
+        self.cells.push(Cell::new(CellTuning::from_floats(f)));
+        let at = Vector2::new(f[0], f[1]);
+        let vel = self.velocity();
+        if f[3] > 0.5 {
+            self.push_core(cell, at, vel);
+        } else {
+            let t = self.cells[cell].t;
+            let pts = circle(at, t.ring_radius, t.beads);
+            self.push_ring(cell, &pts, vel);
+        }
+        self.cand_since.push(0);
+        self.switch_until.push(0);
+        if !self.cell_water.is_empty() {
+            self.cell_water.push(self.water);
+        }
+        if !self.bonds.is_empty() {
+            self.recount_bonded();
+        }
+        self.topology += 1;
+        self.exp_dirty = true;
+        self.retopo_req = true;
+        cell
+    }
+
+    /// Removes cell `cell` from the creature: its particles and every stick on them; the
+    /// later cells are renumbered down by one. Each pair it was joined in is reported
+    /// parted first (in the numbering before the removal). Asks for a retopology. False for
+    /// a cell that is not there or the creature's last.
+    pub fn remove_cell(&mut self, cell: usize) -> bool {
+        if cell >= self.cells.len() || self.cells.len() < 2 {
+            return false;
+        }
+        let c32 = cell as u32;
+        let gone: Vec<(u32, u32)> = self.pairs.iter().filter(|(k, p)| (k.0 == c32 || k.1 == c32) && p.joined).map(|(k, _)| *k).collect();
+        for key in gone {
+            self.events.push((EVENT_PARTED, key.0, key.1));
+        }
+        match self.cells[cell].kind {
+            Kind::Ring(r) => self.remove_ring(r),
+            Kind::Core(k) => self.remove_core(k),
+        }
+        self.cells.remove(cell);
+        let down = |x: u32| if x > c32 { x - 1 } else { x };
+        for ring in self.rings.iter_mut() {
+            if ring.cell > cell {
+                ring.cell -= 1;
+            }
+        }
+        for owner in self.ccell.iter_mut() {
+            *owner = down(*owner);
+        }
+        for st in self.sticks.iter_mut() {
+            st.cell_a = down(st.cell_a);
+            st.cell_b = down(st.cell_b);
+        }
+        let pairs = std::mem::take(&mut self.pairs);
+        self.pairs = pairs.into_iter().filter(|(k, _)| k.0 != c32 && k.1 != c32).map(|(k, p)| ((down(k.0), down(k.1)), p)).collect();
+        self.asks.retain(|&(a, b)| a != c32 && b != c32);
+        for ask in self.asks.iter_mut() {
+            *ask = (down(ask.0), down(ask.1));
+        }
+        self.cand_since.remove(cell);
+        self.switch_until.remove(cell);
+        if cell < self.cell_water.len() {
+            self.cell_water.remove(cell);
+        }
+        if !self.bonds.is_empty() {
+            self.bonds.clear();
+            self.recount_bonded();
+        }
+        self.recount_bonded();
+        self.topology += 1;
+        self.exp_valid = false;
+        self.exp_dirty = true;
+        self.retopo_req = true;
+        true
+    }
+
     /// Core cell `cell` becomes a ring: its beads on the circle it rests on, each pulled
     /// in along its ray until it clears every neighbouring bead and core, moving with the
     /// core. Returns the deepest overlap left with a neighbour (0: none), or -1 when the

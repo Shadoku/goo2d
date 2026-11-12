@@ -571,22 +571,7 @@ func _print_ratios() -> void:
 ## the bead count changed by --beads (its masses, spacing, bead radius, ring radius and
 ## springs recomputed as tuning() would for that count), the drag's damping.
 func _cell_floats(at: Vector2, r: float, core: bool, color: Color) -> PackedFloat32Array:
-	var t := GooTuning.tuning(r)
-	var n: int = maxi(int(t["bead_count"]) + _beads - 12, 6)
-	var blob := GooTuning.blob_mass(r)
-	var bead_mass := blob / n
-	var bead_r := GooTuning.BEAD_RADIUS_RATIO * TAU * r / n
-	var qa := 0.5 * n * sin(TAU / n)
-	var qb := 2.0 * n * sin(PI / n) * bead_r
-	var qc := PI * bead_r * bead_r - PI * r * r
-	var ring_r := (-qb + sqrt(qb * qb - 4.0 * qa * qc)) / (2.0 * qa)
-	var omega := GooTuning._skin_frequency(r)
-	var zeta := GooTuning.joint_damping_ratio(r)
-	var skin_k := bead_mass * omega * omega
-	var skin_d := 2.0 * zeta * bead_mass * omega
-	return PackedFloat32Array([at.x, at.y, r, 1.0 if core else 0.0, n, ring_r, bead_r, bead_mass,
-		t["pressure_k"], t["shape_match_k"], skin_k, skin_d, GooTuning.BENDING_RATIO * skin_k,
-		GooTuning.BENDING_RATIO * skin_d, t["internal_damp"], _drag, PI * r * r, color.r, color.g, color.b])
+	return GooColonySim.cell_floats(at, r, core, color, _drag, _beads)
 
 # ---- Building ----
 
@@ -623,6 +608,7 @@ func _build_colony(design: Array[Vector3], kinds: PackedByteArray, starts: Array
 		GooTuning.unit = unit
 		var keep := {}
 		for key: String in ["frozen", "frozen_self", "pair_skin", "retopo_every", "frozen_breaks", "retopo_switches", "fast_search", "spin", "fast_rings"]:
+			# (Its cell_beads is --beads here.)
 			keep[key] = fo[key]
 		for key: String in _preset_overrides:
 			keep[key] = _preset_overrides[key]
