@@ -19,7 +19,19 @@ extends RefCounted
 ## in front of its other children, so the bodies' skins cover the parts inside
 ## them) with a goo skin of its own (a GooSkin whose outline is the bridge, so
 ## the shader's rim runs along the neck's waist), in the larger body's tint,
-## shader and look uniforms. The pair reads as one blob with a waist.
+## shader and look uniforms (followed whenever they change, follow_look()).
+## The pair reads as one blob with a waist. Its bubble field rides the neck's
+## material: the neck's beads (both patches with the beads beyond their ends
+## that pass through, through_a and through_b) are its material points; the
+## field's origin is their mean (GooSkin.field_center, where the polygon's
+## centroid would slide as its outline changes) and its map the affine one that
+## best carries their places in the field to where they are now (least squares,
+## GooSkin.set_field_matrix(), the bridge's `rotation` left at 0: the turn is
+## in the map), so the neck's bubbles turn as the pair turns, stretch as it is
+## pulled, shear as a joint bends and grow as a body does. Their places are
+## read off the field when the bridge is first drawn and again whenever the
+## patch is tied anew or a body re-rung (the link sent again), the origin kept
+## where it was, so nothing jumps.
 
 ## Points along each of the bridge's two waist curves.
 const BRIDGE_SAMPLES: int = 8
@@ -55,6 +67,20 @@ var skin: GooSkin = null
 
 var _drawn_versions: Vector2i = Vector2i(-2, -2)
 var _look_shader: Shader = null
+# The look uniforms follow_look() copies (those the larger body's shader
+# declares that are not GooSkin.UNIFORMS), read once per shader.
+var _look_names: Array[StringName] = []
+# The neck's beads the bridge's field follows (through_a, then through_b, as
+# they were when their places were read) and their places in the field, about
+# their mean.
+var _neck_beads: PackedInt32Array = PackedInt32Array()
+var _neck_places: PackedVector2Array = PackedVector2Array()
+# Their mean when last drawn: the field's origin is kept where it was when the
+# beads change (GooSkin.bubble_offset takes up the move).
+var _neck_mean: Vector2 = Vector2.INF
+# The bodies' bead counts when the places were read: a re-rung body's beads
+# are other beads under the same indices until the link is tied again.
+var _neck_counts: Vector2i = Vector2i(-1, -1)
 
 func _init(link_handle: int, body_a: Goo2D, body_b: Goo2D, link_strength: float,
 		rest_anchor_a: Vector2, rest_anchor_b: Vector2) -> void:
@@ -349,6 +375,8 @@ func draw_bridge(holder: Node2D, kernel: GooKernel, delta: float) -> void:
 	if skin.shader != big.skin_shader or _look_shader == null:
 		skin.set_shader(big.skin_shader)
 		_copy_look(big)
+	else:
+		follow_look()
 	bridge.color = big.get_tint()
 	if versions == _drawn_versions and a.settled and b.settled:
 		return
@@ -365,24 +393,66 @@ func draw_bridge(holder: Node2D, kernel: GooKernel, delta: float) -> void:
 	var centre := GooLoop.centroid(polygon)
 	var to_local := holder.get_global_transform().affine_inverse()
 	bridge.polygon = to_local * polygon if to_local != Transform2D.IDENTITY else polygon
+	_follow_neck()
 	skin.update(polygon, centre, minf(a.radius, b.radius), (a.average_velocity() + b.average_velocity()) * 0.5,
 		delta)
 
+# The bridge's field follows the neck's beads (see the head): the origin on
+# their mean, the map fitted to their places (read again when the patch
+# changed).
+func _follow_neck() -> void:
+	var points_a := a.bead_points()
+	var points_b := b.bead_points()
+	var beads := through_a + through_b
+	var points := PackedVector2Array()
+	for k: int in beads.size():
+		var on_a := k < through_a.size()
+		var loop := points_a if on_a else points_b
+		if loop.is_empty():
+			return
+		points.append(loop[posmod(beads[k], loop.size())])
+	var count := points.size()
+	if count < 2:
+		return
+	var mean := Vector2.ZERO
+	for point: Vector2 in points:
+		mean += point
+	mean /= count
+	var places := PackedVector2Array()
+	places.resize(count)
+	for i: int in count:
+		places[i] = points[i] - mean
+	var counts := Vector2i(points_a.size(), points_b.size())
+	if beads != _neck_beads or counts != _neck_counts or _neck_places.size() != count:
+		# Their places in the field as it is now; the field's origin kept where
+		# it was (a new set of beads has another mean).
+		var back := skin.field_matrix().affine_inverse()
+		for i: int in count:
+			places[i] = back.basis_xform(places[i])
+		if _neck_mean.is_finite():
+			skin.bubble_offset += back.basis_xform(_neck_mean - mean)
+		_neck_beads = beads
+		_neck_counts = counts
+		_neck_places = places
+	else:
+		skin.set_field_matrix(GooLoop.affine_fit(_neck_places, places))
+	skin.field_center = mean
+	_neck_mean = mean
+
 # Copies the larger body's look uniforms (those not in GooSkin.UNIFORMS, which
 # the bridge's skin pushes itself: rim width, refraction...) onto the bridge's
-# material, and its bubble seed.
+# material, and its bubble seed; remembers their names for follow_look().
 func _copy_look(big: Goo2D) -> void:
 	_look_shader = skin.material.shader
-	var from := big.get_node_or_null(^"Skin") as Polygon2D
-	if from == null or not from.material is ShaderMaterial:
-		return
-	var source := from.material as ShaderMaterial
-	if source.shader == null:
+	_look_names.clear()
+	var source := _look_source(big)
+	if source == null or source.shader == null:
 		return
 	for uniform: Dictionary in source.shader.get_shader_uniform_list():
-		var uniform_name: String = uniform["name"]
+		var uniform_name := StringName(uniform["name"])
 		if GooSkin.UNIFORMS.has(uniform_name):
 			continue
+		_look_names.append(uniform_name)
 		var value: Variant = source.get_shader_parameter(uniform_name)
 		if value != null:
 			skin.material.set_shader_parameter(uniform_name, value)
@@ -390,6 +460,27 @@ func _copy_look(big: Goo2D) -> void:
 	if seed_value != null:
 		skin.noise_seed = seed_value
 		skin.material.set_shader_parameter(&"seed", seed_value)
+
+## Copies onto the bridge each look uniform of its larger body's skin that
+## differs from the bridge's (a look changed on the body after the bridge was
+## first drawn: a game's rim width, bubble_lag, bubble_wobble...). draw_bridge()
+## calls it every frame: one read and compare per look uniform, a write only
+## for one that changed.
+func follow_look() -> void:
+	if skin == null or not is_instance_valid(a) or not is_instance_valid(b):
+		return
+	var source := _look_source(a if a.radius >= b.radius else b)
+	if source == null:
+		return
+	for uniform_name: StringName in _look_names:
+		var value: Variant = source.get_shader_parameter(uniform_name)
+		if value != null and value != skin.material.get_shader_parameter(uniform_name):
+			skin.material.set_shader_parameter(uniform_name, value)
+
+# The larger body's skin material, or null.
+static func _look_source(big: Goo2D) -> ShaderMaterial:
+	var from := big.get_node_or_null(^"Skin") as Polygon2D
+	return from.material as ShaderMaterial if from != null else null
 
 ## Frees the bridge (the link is gone).
 func free_bridge() -> void:
