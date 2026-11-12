@@ -329,6 +329,11 @@ pub struct Kernel {
     /// Particle velocities the last step clamped to `solver.max_bead_speed`, summed over
     /// its substeps (for tools/stability.gd's `births`).
     pub last_capped: usize,
+    /// Wall-clock microseconds of the last step and of its phases: [pair passes,
+    /// links, solver, per-ring logic, skins] (for tools/colony_bench.gd; nothing reads
+    /// them back into the simulation).
+    pub last_step_usec: u64,
+    pub last_phase_usec: [u64; 5],
 
     grid: Grid,
     /// This step's candidate pairs of particles (build_pairs()) and each particle's reach.
@@ -362,6 +367,8 @@ impl Default for Kernel {
             step_count: 0,
             last_substeps: 0,
             last_capped: 0,
+            last_step_usec: 0,
+            last_phase_usec: [0; 5],
             grid: Grid::default(),
             pairs: Vec::new(),
             reach: Vec::new(),
@@ -898,6 +905,14 @@ impl Kernel {
 
     /// One physics frame for every ring (see the module docs).
     pub fn step(&mut self, delta: f64) {
+        let clock = std::time::Instant::now();
+        let mut lap = clock;
+        let mut phase = [0u64; 5];
+        let mut mark = |k: usize, lap: &mut std::time::Instant| {
+            let now = std::time::Instant::now();
+            phase[k] += (now - *lap).as_micros() as u64;
+            *lap = now;
+        };
         self.step_count += 1;
         for r in self.rings.iter_mut() {
             r.split_lock = (r.split_lock - delta).max(0.0);
@@ -913,13 +928,16 @@ impl Kernel {
         if self.pair_passes {
             self.separate_overlaps(delta);
         }
+        mark(0, &mut lap);
         // Links: their ease, and a settled ring woken by a moving partner.
         if !self.links.is_empty() {
             self.step_links(delta);
         }
+        mark(1, &mut lap);
         // 3. The solver.
         let stepped: Vec<bool> = self.rings.iter().map(|r| !r.settled).collect();
         self.integrate(delta as f32);
+        mark(2, &mut lap);
         // 4. Rings: views and touching first (the calm groups read every ring's), then
         // the per-ring logic.
         for idx in 0..self.rings.len() {
@@ -955,12 +973,16 @@ impl Kernel {
         }
         self.ps.force.iter_mut().for_each(|f| *f = Vector2::ZERO);
         self.ps.shift.iter_mut().for_each(|f| *f = Vector2::ZERO);
+        mark(3, &mut lap);
         let mut geometry = Geometry2D::singleton();
         for idx in 0..self.rings.len() {
             if self.rings[idx].skin_dirty {
                 self.rebuild_skin(idx, &mut geometry);
             }
         }
+        mark(4, &mut lap);
+        self.last_phase_usec = phase;
+        self.last_step_usec = clock.elapsed().as_micros() as u64;
     }
 
     fn ring_step(&mut self, idx: usize, delta: f64) {
@@ -2023,7 +2045,7 @@ fn solve_ring(r: &Ring, pos: &mut [Vector2], prev: &[Vector2], h: f32) {
 /// `rest[i]`, a spring of `stiffness` (compliance 1 / stiffness) and `damping` (force per
 /// px/s), particles of inverse mass `w`, one substep `h`.
 #[allow(clippy::too_many_arguments)]
-fn distances(pos: &mut [Vector2], prev: &[Vector2], rest: &[f32], hop: usize, stiffness: f32, damping: f32, w: f32, h: f32) {
+pub(crate) fn distances(pos: &mut [Vector2], prev: &[Vector2], rest: &[f32], hop: usize, stiffness: f32, damping: f32, w: f32, h: f32) {
     let n = pos.len();
     if stiffness <= 0.0 || rest.len() != n {
         return;
