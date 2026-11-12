@@ -173,6 +173,9 @@ pub struct Stick {
     /// made again after its cell switched between ring and core holds the gap it found,
     /// so the switch moves nothing at once. 0 for every stick capture makes.
     pub gap0: f32,
+    /// An anchored stick on a core's rim: its anchor's direction in the core's frame
+    /// (cos, sin of `anchor`), so the solve turns it without trigonometry.
+    pub adir: Vector2,
     /// A sticky stick's end a slides too: the place along its own ring (bead a's, local)
     /// that faces the contact, `a` kept the bead nearest it. An anchored one's is bead a.
     pub sa: f32,
@@ -460,6 +463,10 @@ pub struct Creature {
     /// Per core: the compliance of its contacts with its own creature's beads and cores
     /// (Cores::contact; 0: rigid).
     cka: Vec<f32>,
+    /// Per core: (cos, sin) of its turn, refreshed each substep while it has anchored
+    /// sticks on its rim (`anchored_on_cores`, counted once a frame).
+    crot_cs: Vec<Vector2>,
+    anchored_on_cores: bool,
     /// The outline as loops (the outside, pockets), from the last exposure pass.
     pub loops: Vec<OutlineLoop>,
     /// Whether `exposed` / `cexposed` / `loops` hold a computed state.
@@ -557,7 +564,8 @@ pub struct Stats {
     pub sticks: usize,
     pub made: usize,
     pub broken: usize,
-    /// Milestone 2: the drag (CPU, summed), the exposure pass with its switches (wall),
+    /// Milestone 2: the drag and the exposure pass with its switches (CPU, summed over
+    /// creatures; the exposure pass runs inside the settle pass's wall time),
     /// exposure passes run, beads exposed and enclosed, pockets, rings that became cores
     /// and cores that became rings this step, cross-creature candidates skipped because
     /// enclosed.
@@ -876,6 +884,7 @@ impl Creature {
     fn frame_forces(&mut self, opt: &Options) {
         let gravity = opt.gravity;
         self.core_frame(&opt.cores);
+        self.anchored_on_cores = self.sticks.iter().any(|st| st.b_core && !st.a_core && st.mode == JOIN_ANCHORED);
         if opt.drag.enabled {
             let t = Instant::now();
             self.apply_drag(&opt.drag, opt.ex.enabled);
@@ -1342,7 +1351,8 @@ impl Creature {
         // A bead anchored on a core's rim: its anchor is its own angle in the core's frame
         // (zero tension when it sticks).
         let anchor = if b_core && !a_core { self.core_angle(self.pos[a as usize], b as usize) } else { s };
-        self.sticks.push(Stick { a, b, a_core, b_core, s, anchor, offset, gap0: 0.0, sa, cell_a, cell_b, mode, alpha_n, alpha_t, load: 0.0, pull: 0.0 });
+        let adir = Vector2::new(anchor.cos(), anchor.sin());
+        self.sticks.push(Stick { a, b, a_core, b_core, s, anchor, adir, offset, gap0: 0.0, sa, cell_a, cell_b, mode, alpha_n, alpha_t, load: 0.0, pull: 0.0 });
         if !a_core {
             self.stuck[a as usize] = if b_core { STUCK_CORE } else { b + 1 };
         }
@@ -1523,6 +1533,11 @@ impl Creature {
     /// place follows the bead (hopping to the next edge past an end).
     fn solve_sticks(&mut self) {
         let inv_h2 = 1.0 / (self.h * self.h);
+        // Each core's turn as (cos, sin), once a substep (anchored sticks on its rim).
+        if self.anchored_on_cores {
+            self.crot_cs.clear();
+            self.crot_cs.extend(self.crot.iter().map(|&r| Vector2::new(r.cos(), r.sin())));
+        }
         for k in 0..self.sticks.len() {
             let mut st = self.sticks[k];
             let a = st.a as usize;
@@ -1555,8 +1570,12 @@ impl Creature {
                     // the turning rim, C = (bead - centre) · t - offset, t the rim's
                     // tangent at the anchor's angle. Its gradient turns the core
                     // (dC/dθ = -(bead - centre) · u), so it conserves angular momentum.
-                    let ang = self.crot[b] + st.anchor;
-                    let u = Vector2::new(ang.cos(), ang.sin());
+                    let cs = match self.crot_cs.get(b) {
+                        Some(&cs) if self.anchored_on_cores => cs,
+                        _ => Vector2::new(self.crot[b].cos(), self.crot[b].sin()),
+                    };
+                    let d = st.adir;
+                    let u = Vector2::new(d.x * cs.x - d.y * cs.y, d.x * cs.y + d.y * cs.x);
                     let tan = Vector2::new(-u.y, u.x);
                     let rel = self.pos[a] - self.cpos[b];
                     let ct = dot(rel, tan) - st.offset;
@@ -1770,6 +1789,7 @@ impl Creature {
                 let here = self.core_angle(p, kb);
                 let off = self.core_tangent_offset(p, kb, here) - tension * keep;
                 self.sticks[k].anchor = here;
+                self.sticks[k].adir = Vector2::new(here.cos(), here.sin());
                 self.sticks[k].offset = off;
                 continue;
             }
@@ -2783,6 +2803,7 @@ impl Colony {
             vel += ns(t);
         }
         let t = Instant::now();
+        let ex_on = opt.ex.enabled;
         self.for_each(|c| {
             let events = c.events.len();
             c.broken = c.after_step(&ad, n_sub, frame);
@@ -2793,13 +2814,12 @@ impl Colony {
                 c.exp_dirty = true;
                 c.exp_hot = true;
             }
+            // The exposure pass in the same parallel region (one fork less, better balance).
+            if ex_on {
+                c.post_step(&opt, frame);
+            }
         });
         stats.settle_us = t.elapsed().as_micros() as u64;
-        if opt.ex.enabled {
-            let t = Instant::now();
-            self.for_each(|c| c.post_step(&opt, frame));
-            stats.exposure_us = t.elapsed().as_micros() as u64;
-        }
         for c in self.creatures.iter_mut() {
             stats.sticks_cpu_us += c.ns_sticks / 1000;
             stats.sticks += c.sticks.len();
@@ -2813,6 +2833,7 @@ impl Colony {
             stats.intra_pairs += c.bb.len() + c.bc.len() + c.cc.len();
             stats.drag_cpu_us += c.ns_drag / 1000;
             stats.exposure_runs += c.exp_runs;
+            stats.exposure_us += c.ns_exposure / 1000;
             stats.to_core += c.to_core;
             stats.to_ring += c.to_ring;
             if c.exp_valid {
