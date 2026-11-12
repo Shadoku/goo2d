@@ -42,6 +42,12 @@ extends SceneTree
 ##   --reuse=on|off --skin=PX     keep each creature's own contact candidates across frames,
 ##                                built with PX of margin (3) and filtered every frame
 ##   --m2                         all of milestone 2 at once: GooColonySim.EXPOSURE_OPTIONS
+##   --tension=T                  milestone 3 (docs/colony-tension.md): the surface tension
+##                                at strength T at unit 1 (GooColonySim.tension_options(T);
+##                                runs the exposure pass whatever --exposure says)
+##   --everything                 what the game uses: GooColonySim.everything_options()
+##                                (--m2, --water-drag=on, --tension at its default, --reuse=on
+##                                with its skin); options after it override it
 ##   --water-drag=on|off          the game's water drag on exposed edges, in the kernel
 ##                                (GooColonySim.DRAG_OPTIONS); the linear damping --drag
 ##                                stays unless --drag=0
@@ -106,6 +112,7 @@ var _water: String = "uniform"
 var _exp_every_hot := Vector2i(30, 6)
 var _reuse: bool = false
 var _skin: float = 3.0
+var _tension: float = 0.0
 var _sleep: float = 0.0
 var _coarse: float = 0.0
 var _frames: int = 300
@@ -188,6 +195,18 @@ func _initialize() -> void:
 			_auto_cores = true
 			_core_contact = GooColonySim.EXPOSURE_OPTIONS["core_contact"]
 			_core_anchors = true
+		elif arg.begins_with("--tension="): _tension = float(value)
+		elif arg == "--everything":
+			var every := GooColonySim.everything_options()
+			_exposure = true
+			_auto_cores = true
+			_core_contact = every["core_contact"]
+			_core_anchors = true
+			_water_drag = true
+			_tension = GooColonySim.TENSION
+			_reuse = every["reuse_pairs"]
+			_skin = every["pair_skin"] / GooTuning.unit * UNIT
+			_exp_every_hot.y = every["exposure_hot"]
 		elif arg.begins_with("--water-drag="): _water_drag = value == "on"
 		elif arg.begins_with("--water="): _water = value
 		elif arg.begins_with("--exposure-every="): _exp_every_hot.x = int(value)
@@ -556,6 +575,11 @@ func _build_colony(design: Array[Vector3], kinds: PackedByteArray, starts: Array
 			"exposure_every": _exp_every_hot.x, "exposure_hot": _exp_every_hot.y })
 	if _water_drag:
 		_colony.set_options(GooColonySim.DRAG_OPTIONS)
+	if _tension > 0.0:
+		var unit := GooTuning.unit
+		GooTuning.unit = UNIT
+		_colony.set_options(GooColonySim.tension_options(_tension))
+		GooTuning.unit = unit
 	for ci: int in _creatures:
 		var hue := fmod(0.13 + ci * 0.618, 1.0)
 		var floats := PackedFloat32Array()
@@ -907,6 +931,8 @@ func _on_physics(first: bool, delta: float) -> void:
 			_sample("exposure", s["exposure_us"])
 			_sample("exp_runs", s["exposure_runs"], false)
 			_sample("drag_cpu", s["drag_cpu_us"])
+			_sample("tension_cpu", s["tension_cpu_us"])
+			_sample("patched", s["patched_runs"], false)
 			_sample("skipped", s["cross_skipped"], false)
 			_sample("enclosed", s["enclosed"], false)
 			_sample("pockets", s["pockets"], false)
@@ -985,7 +1011,7 @@ func _sample(key: String, value: float, usec: bool = true) -> void:
 
 func _report() -> void:
 	print("colony_bench: %d frames after %d warm-up (ms: min / median / p95)" % [_frames, _warmup])
-	var order := ["physics", "kernel", "holds", "capture", "settle", "exposure", "exp_runs", "drag_cpu", "skipped", "enclosed", "pockets", "lost_runs", "pair_builds",
+	var order := ["physics", "kernel", "holds", "capture", "settle", "exposure", "exp_runs", "drag_cpu", "tension_cpu", "skipped", "enclosed", "pockets", "lost_runs", "patched", "pair_builds",
 		"sticks", "broken", "script", "push", "draw", "draw_rust", "rs_setup", "rs_render",
 		"forces", "pairs", "own_pairs", "solve", "rings_cpu", "intra_cpu", "cross", "vel", "cross_hits", "intra_pairs", "cross_pairs",
 		"k_pairpass", "k_links", "k_solver", "k_rings", "k_skins"]
@@ -1000,7 +1026,7 @@ func _report() -> void:
 		print("  health (worst over the measured frames, every 10th): fastest %.0f px/s, ring area %.2f..%.2f of target, %d inside out, bond stretch %.2f, overlap %.2f px, sticks stretched %.2f / squeezed %.2f px, load %.0f, %d not finite" % [
 			_health["fastest"], _health["area_min"], _health["area_max"], int(_health["inverted"]), _health["stretch"], _health["overlap"],
 			_health["stick_stretch"], _health["stick_squeeze"], _health["stick_load"], int(_health["not_finite"])])
-	if _mode == "colony" and _exposure:
+	if _mode == "colony" and (_exposure or _tension > 0.0):
 		var st := _colony.stats()
 		print("  milestone 2: %d rings and %d cores at the end; over every frame, warm-up included, %d rings became cores and %d cores rings" % [
 			st["rings"], st["cores"], _switch_frames[0], _switch_frames[1]])
@@ -1018,9 +1044,9 @@ func _report() -> void:
 	var line := "RESULT mode=%s n=%d m=%d shape=%s mix=%s beads=%d cores=%s intra=%s threads=%d substeps=%d draw=%s hold=%s" % [
 		_mode, _creatures, _cells, _shape, _mix, _beads, _cores and _mode == "colony", "cores" if _core_contacts else ("on" if _intra else "off"), _threads, _substeps, _draw,
 		_hold + ("/sticky" if _sticky else "")]
-	line += " exposure=%s auto=%s skip=%d contact=%.2f anchors=%s water_drag=%s water=%s reuse=%s" % [_exposure, _auto_cores, _skip, _core_contact, _core_anchors, _water_drag, _water,
-		("%.1f" % _skin) if _reuse else "off"]
-	for key: String in ["physics", "kernel", "holds", "exposure", "drag_cpu", "pairs", "cross", "script", "draw", "rs_setup"]:
+	line += " exposure=%s auto=%s skip=%d contact=%.2f anchors=%s water_drag=%s water=%s reuse=%s tension=%.0f every_hot=%d/%d" % [_exposure, _auto_cores, _skip, _core_contact, _core_anchors, _water_drag, _water,
+		("%.1f" % _skin) if _reuse else "off", _tension, _exp_every_hot.x, _exp_every_hot.y]
+	for key: String in ["physics", "kernel", "holds", "exposure", "drag_cpu", "tension_cpu", "pairs", "own_pairs", "solve", "cross", "script", "draw", "rs_setup"]:
 		if _samples.has(key):
 			var list: PackedFloat64Array = _samples[key]
 			line += " %s=%.2f/%.2f" % [key + "_ms", list[list.size() / 2], list[mini(int(list.size() * 0.95), list.size() - 1)]]

@@ -56,13 +56,16 @@ static func tension_options(strength: float = TENSION) -> Dictionary:
 
 ## Everything the fluid game's creatures use (docs/colony-tension.md): adhesion (always on
 ## in GooColonySim), EXPOSURE_OPTIONS, DRAG_OPTIONS, the surface tension at `strength` (at
-## unit 1) and the creature's own contact candidates kept across frames (reuse_pairs,
-## pair_skin 4 px at unit 1).
+## unit 1) and the creature's own contact candidates kept across frames (reuse_pairs, with
+## pair_skin 8 px at unit 1: 4 px at the fluid game's 0.5, as docs/colony-exposure.md measured),
+## and the exposure pass only on its regular frames and after a switch or a parting, not on
+## the 6 frames after (exposure_hot 0: half the passes, the settle pass 0.2 ms less at 30 × 150;
+## a core whose neighbour drifts off slowly comes back as a ring up to 0.5 s later).
 static func everything_options(strength: float = TENSION) -> Dictionary:
 	var options := EXPOSURE_OPTIONS.duplicate()
 	options.merge(DRAG_OPTIONS)
 	options.merge(tension_options(strength))
-	options.merge({ "reuse_pairs": true, "pair_skin": 4.0 * GooTuning.unit })
+	options.merge({ "reuse_pairs": true, "pair_skin": 8.0 * GooTuning.unit, "exposure_hot": 0 })
 	return options
 
 var colony: GooColony

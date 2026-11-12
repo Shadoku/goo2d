@@ -425,8 +425,8 @@ blades, dropper or input.
 ## The colony (experimental)
 
 A second solver beside `GooKernel`, for creatures made of many cells (the colony plan;
-`docs/colony-spike.md`, `docs/colony-adhesion.md`, `docs/colony-exposure.md` in the addon's
-repository). It shares only
+`docs/colony-spike.md`, `docs/colony-adhesion.md`, `docs/colony-exposure.md`,
+`docs/colony-tension.md` in the addon's repository). It shares only
 the ring math with the kernel and does not collide with `GooWorld2D` bodies. Its cells are
 not nodes: a `GooColony` (RefCounted, Rust, `native/src/colony.rs`) holds creatures, each a
 set of ring cells and core cells with its own storage, stepped on several threads with the
@@ -440,11 +440,17 @@ Optionally (milestone 2, `docs/colony-exposure.md`): each bead is exposed or enc
 loops), rings wholly enclosed become cores and exposed cores rings again with no jump, cores
 turn (walls onto them anchored) and give (compliant contacts), and the fluid game's water
 drag acts on exposed edges inside the step, with the water given per creature or per cell.
+Optionally (milestone 3, `docs/colony-tension.md`): surface tension pulls along every skin
+edge facing the water and across the outline's short hops between cells, as equal and
+opposite pairs (no net force or torque), so a creature rounds off and its walls zip wider;
+its strength is per colony (`tension`, a force), per creature (`set_creature_tension()`) and
+per cell type (`set_type_tension()`).
 `goo_colony_sim.gd` (`GooColonySim`, RefCounted) is the thin GDScript layer: it sets the
 colony up at `GooTuning.unit`, asks `may_adhere(creature, a, b)` about each first touch on
 the main thread, emits `cells_joined` / `cells_parted`, and has the presets
-`EXPOSURE_OPTIONS` and `DRAG_OPTIONS`. Surface tension, walls, links, grabs and a look are
-later milestones; until then it is for tools and tests.
+`EXPOSURE_OPTIONS`, `DRAG_OPTIONS`, `tension_options()` and `everything_options()` (all of
+it, what the fluid game uses). Walls, links, grabs and a look are later milestones; until
+then it is for tools and tests.
 
 ## Tuning knobs, by what you want to change
 
