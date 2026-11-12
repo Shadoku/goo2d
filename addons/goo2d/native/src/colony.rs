@@ -48,6 +48,20 @@
 //! that turn (beads anchored on their rims) and give (compliant contacts, or a soft
 //! radius), the fluid game's water drag on exposed edges, and a creature's own contact
 //! candidates kept across frames.
+//!
+//! Milestone 3 (docs/colony-tension.md; colony/tension.rs): surface tension along the
+//! exposed surface.
+//!
+//! The frozen topology (docs/colony-frozen.md; `Options::frozen`, off by default): a
+//! creature's topology (capture, the full break/settle pass with its events, the exposure
+//! pass and the switches between ring and core) changes only on its retopology frames: on
+//! request (`retopo_req`, add_cell(), remove_cell()), every `retopo_every` frames staggered
+//! by creature, or (`urgent_retopo`) after a stick passed the break force. Between them a
+//! stick past the break force still breaks at once (`frozen_breaks`), the tension and the
+//! drag act along the last outline, and the creature's own contacts come from lists kept
+//! per pair of cells (`FROZEN_SELF_CELLS`, colony/cellpairs.rs). Muscles
+//! (set_cell_muscle()) change a cell's size every frame without touching the topology.
+//! The spinning step (`spin`) runs a frame's phases on the pool's threads at once.
 
 use crate::consts::{MAX_PRESSURE_RATIO, MAX_STRETCH, MIN_AREA_RATIO};
 use crate::geom::*;
@@ -606,9 +620,13 @@ pub struct Options {
     pub frozen: bool,
     /// 0: only when requested.
     pub retopo_every: u32,
-    /// Between retopologies, a creature's own contacts: FROZEN_SELF_NONE (sticks alone),
-    /// FROZEN_SELF_KEPT (the list found at the last retopology, `pair_skin` px of margin,
-    /// filtered each frame), FROZEN_SELF_FULL (searched every frame as before).
+    /// Between retopologies, a creature's own contacts: FROZEN_SELF_NONE (sticks alone:
+    /// unsound), FROZEN_SELF_KEPT (the list found at the last retopology, `pair_skin` px of
+    /// margin, filtered each frame), FROZEN_SELF_FULL (searched every frame as before),
+    /// FROZEN_SELF_VERLET (one list for the whole creature, built again when any particle
+    /// may have moved `pair_skin` against its rigid motion: every frame for a swimming
+    /// creature), FROZEN_SELF_CELLS (lists per pair of cells, colony/cellpairs.rs: the
+    /// preset's).
     pub frozen_self: u8,
     /// Frozen topology: a stick loaded past the break force between retopologies breaks
     /// at once, with the full model's break pass (the pair rests, a parted event); else
@@ -3116,6 +3134,10 @@ impl Creature {
         }
         self.recount_bonded();
         self.topology += 1;
+        // The outline's loops and the tension's edges name particles that moved or went.
+        self.loops.clear();
+        self.surface.clear();
+        self.tension_edges.clear();
         self.exp_valid = false;
         self.exp_dirty = true;
         self.retopo_req = true;

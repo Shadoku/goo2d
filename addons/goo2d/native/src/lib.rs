@@ -1048,7 +1048,14 @@ impl GooColony {
     /// "drag_linear_normal", "drag_linear_tangent", "drag_max_step"; milestone 3's
     /// (docs/colony-tension.md): "tension" (the force each outline edge pulls with; 0
     /// off), "tension_pockets" (× it on skin facing a pocket), "tension_min_edge" (px),
-    /// "tension_hop", "tension_hop_max" (× a hop's two bead radii: full, none).
+    /// "tension_hop", "tension_hop_max" (× a hop's two bead radii: full, none); the frozen
+    /// topology's (docs/colony-frozen.md): "frozen" (bool), "retopo_every" (frames; 0: only
+    /// on request), "frozen_self" (0 none, 1 kept, 2 searched every frame, 3 Verlet, 4 cell
+    /// pairs), "pair_skin" (px), "frozen_breaks" (bool: a stick past the break force breaks
+    /// between retopologies), "frozen_creep" (bool), "urgent_retopo" (bool), "retopo_switches"
+    /// (the most switches per retopology; 0 no limit), "fast_search", "spin", "fast_rings"
+    /// (bools: the step's), "cpu_timers" (bool, process-wide: the per-part CPU timers in
+    /// stats()).
     #[func]
     fn set_options(&mut self, options: VarDictionary) {
         for (key, value) in options.iter_shared() {

@@ -426,7 +426,7 @@ blades, dropper or input.
 
 A second solver beside `GooKernel`, for creatures made of many cells (the colony plan;
 `docs/colony-spike.md`, `docs/colony-adhesion.md`, `docs/colony-exposure.md`,
-`docs/colony-tension.md` in the addon's repository). It shares only
+`docs/colony-tension.md`, `docs/colony-frozen.md` in the addon's repository). It shares only
 the ring math with the kernel and does not collide with `GooWorld2D` bodies. Its cells are
 not nodes: a `GooColony` (RefCounted, Rust, `native/src/colony.rs`) holds creatures, each a
 set of ring cells and core cells with its own storage, stepped on several threads with the
@@ -445,11 +445,21 @@ edge facing the water and across the outline's short hops between cells, as equa
 opposite pairs (no net force or torque), so a creature rounds off and its walls zip wider;
 its strength is per colony (`tension`, a force), per creature (`set_creature_tension()`) and
 per cell type (`set_type_tension()`).
+Optionally (the frozen topology, `docs/colony-frozen.md`): a creature's topology (capture,
+joins, the exposure pass, its cores) changes only at its retopologies, on request
+(`request_retopology()`, `add_cell()`, `remove_cell()`) or every `retopo_every` frames
+staggered by creature; between them it is a fixed structure of rings, cores and sticks
+(a wall past the break force still breaks at once), its own contacts kept per pair of cells,
+its cells driven by muscles (`set_cell_muscles()`: a size scale per cell, every frame, no
+exposure pass), the step's phases on spinning threads. About half the full model's time for
+crowds that collide or swim.
 `goo_colony_sim.gd` (`GooColonySim`, RefCounted) is the thin GDScript layer: it sets the
 colony up at `GooTuning.unit`, asks `may_adhere(creature, a, b)` about each first touch on
 the main thread, emits `cells_joined` / `cells_parted`, and has the presets
-`EXPOSURE_OPTIONS`, `DRAG_OPTIONS`, `tension_options()` and `everything_options()` (all of
-it, what the fluid game uses). Walls, links, grabs and a look are later milestones; until
+`EXPOSURE_OPTIONS`, `DRAG_OPTIONS`, `tension_options()`, `everything_options()` (all of
+it, every frame) and `frozen_options()` (all of it with the frozen topology: what the fluid
+game uses), and `request_retopology()`, `add_cell()`, `remove_cell()`, `cell_beads` (the
+smallest cell's bead count). Walls, links, grabs and a look are later milestones; until
 then it is for tools and tests.
 
 ## Tuning knobs, by what you want to change

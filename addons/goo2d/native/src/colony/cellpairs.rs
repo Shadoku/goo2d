@@ -385,7 +385,14 @@ impl Creature {
                 }
                 let b = e.b as usize;
                 let m = motion(&cp, a, b);
+                let cores = matches!((self.cells[a].kind, self.cells[b].kind), (Kind::Core(_), Kind::Core(_)));
                 let mut ok = e.valid && e.epoch_a == cp.epoch[a] && e.epoch_b == cp.epoch[b];
+                if ok && cores {
+                    // Two cores: the list is their one pair, whatever they did.
+                    cp.lists += 1;
+                    self.filter_cell_pair(e, a, m + contact_slop);
+                    continue;
+                }
                 if ok {
                     // Any common turn w gives a bound; the two cells' turns since t summed (as
                     // complex numbers, both near unit length) is their mean, near enough.

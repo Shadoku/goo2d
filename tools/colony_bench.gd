@@ -67,6 +67,15 @@ extends SceneTree
 ##   --seed=S
 ##   --seal=PX                    the gap between two cells _classify() counts as sealed
 ##                                (CAPTURE, 1.5 px)
+## The frozen topology (docs/colony-frozen.md; adhesion only):
+##   --frozen-preset              GooColonySim.frozen_options()'s frozen part over the rest
+##                                (with --everything: the preset); its bead count is --beads
+##   --frozen                     the frozen topology alone, with the knobs below
+##   --frozen-self=none|kept|full|verlet|cells   a creature's own contacts between
+##                                retopologies (the preset: cells)
+##   --retopo-every=N --switches=N --urgent=on|off --frozen-breaks=on|off --frozen-creep=on|off
+##   --spin=on|off --fast-search=on|off --fast-rings=on|off   the step's knobs
+##   (options given after --frozen-preset override it: --skin, --retopo-every, --spin...)
 ## Special runs (they print and quit):
 ##   --ratios                     ring/core counts of packed designs per shape, mix, size
 ##   --promote-test               promotion and demotion: cost and how far neighbours jump

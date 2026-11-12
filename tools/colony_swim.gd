@@ -18,6 +18,7 @@ extends SceneTree
 ##   --crowd=N                N creatures swimming at once, side by side, all timed (1)
 ##   --seconds=S              measured seconds after 1 s to settle (10)
 ##   --threads=T --beads=K --retopo-every=N --skin=PX (at unit 0.5) --frozen-self=none|kept|full|verlet|cells
+##   --spin=on|off --fast-search=on|off --substeps=S   options over the model's
 ##   --tension=T              the surface tension at unit 1 (GooColonySim.TENSION; 0 off)
 ##   --cores=on|off           a worm's interior cells as cores from the start (on)
 ##   --trace                  one line per measured frame
@@ -83,6 +84,7 @@ func _initialize() -> void:
 		elif arg.begins_with("--frozen-self="): _extra["frozen_self"] = ["none", "kept", "full", "verlet", "cells"].find(value)
 		elif arg.begins_with("--substeps="): _extra["substeps"] = int(value)
 		elif arg.begins_with("--spin="): _extra["spin"] = value == "on"
+		elif arg.begins_with("--fast-search="): _extra["fast_search"] = value == "on"
 		elif arg == "--trace": _trace = true
 		else: push_error("colony_swim: unknown option %s" % arg)
 	GooTuning.unit = UNIT
