@@ -8,7 +8,8 @@
 // the backdrop; and a facet whose reflection lines up with the light sparkles,
 // which happens as the body moves: its `velocity` nudges every tilt.
 //
-// Uses the skin's uniforms point_count, points, center, radius, velocity, rotation and
+// Uses the skin's uniforms point_count, points, center, radius, velocity, rotation,
+// bubble_basis (the cut squashes with the body; it grows with `radius`) and
 // seed, and a two-tone body's second_color, division_axis and division_offset,
 // mixed as goo.gdshader mixes them (see the contract at the top of
 // addons/goo2d/goo.gdshader); its
@@ -28,6 +29,9 @@ uniform vec2 velocity = vec2(0.0);
 // the facets are laid out in the rest pose and turned by this, so they ride
 // with a rolling or tipping body instead of staying fixed around its centre.
 uniform float rotation = 0.0;
+// The body's rest deformation (GooSkin's bubble_basis, determinant 1): the cut
+// is made in the undeformed rest space, so its facets squash with the body.
+uniform mat2 bubble_basis = mat2(1.0);
 uniform float seed = 0.0;
 // A two-tone body's second colour (transparent black: none) and its division,
 // fixed in the body's rest space (GooSkin.set_two_tone()).
@@ -192,7 +196,7 @@ void fragment() {
 	float rc = cos(rotation);
 	float rs = sin(rotation);
 	vec2 d = p - center;
-	vec2 rel = vec2(rc * d.x + rs * d.y, rc * d.y - rs * d.x);
+	vec2 rel = inverse(bubble_basis) * vec2(rc * d.x + rs * d.y, rc * d.y - rs * d.x);
 	float rho = length(rel) / r;
 	float theta = atan(rel.y, rel.x);
 	float oct_theta = floor(theta / 0.7854 + 0.5) * 0.7854;

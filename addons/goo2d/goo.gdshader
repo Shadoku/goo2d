@@ -3,9 +3,10 @@
 // The polygon is the blob's smoothed outline; GooSkin also pushes the raw
 // collision outline (`points`, global space), the centre, radius, a smoothed
 // velocity and the bubble field (`seed`, `bubble_origin`, `bubble_cell`,
-// `bubble_turn`): state the blob carries and hands on to the pieces of a split,
-// so the bubbles live in a field that moves and turns with the blob (fixed in
-// its rest pose) but is not tied to its current centre or size. Per fragment: signed distance to that outline -> a pseudo-3D normal
+// `bubble_turn`, `bubble_basis`): state the blob carries and hands on to the
+// pieces of a split, so the bubbles live in a field that moves, turns, grows and
+// deforms with the blob's material (fixed in the rest space it was made in) but
+// is not tied to its current centre or size. Per fragment: signed distance to that outline -> a pseudo-3D normal
 // that is flat in the middle and rolls off over `rim_width` like a drop's edge
 // -> refraction of the screen behind (lens at the rim plus a travelling ripple
 // while moving), fresnel rim, specular hotspot, soft sheen and two layers of
@@ -33,10 +34,26 @@
 //   uniform float seed;          // per-body random value (1..98), kept by its pieces
 //   uniform vec2 bubble_origin;  // a point that moves and turns with the body
 //                                // about its centre, global space
-//   uniform float bubble_cell;   // a length in px, fixed at the body's birth
+//   uniform float bubble_cell;   // px: the cell the field was made with, times
+//                                // the body's growth since (1 for a body never
+//                                // resized or deformed)
 //   uniform float bubble_turn;   // radians: the bubble field is fixed in the rest
 //                                // pose, turned by rotation + bubble_turn (the
 //                                // turn it was inherited with)
+//   uniform mat2 bubble_basis;   // the body's rest deformation since the field
+//                                // was made (a squash, an area pulse), in its
+//                                // REST space, determinant 1 (the scale is in
+//                                // bubble_cell); mat2(1.0) for a body never
+//                                // deformed. The field's map, a point p to its
+//                                // place in the field in cells (GooSkin.
+//                                // field_point() is it in GDScript; keep them in
+//                                // sync):
+//                                //   rest = rot(-rotation) * (p - bubble_origin)
+//                                //   lp = rot(-bubble_turn) * inverse(bubble_basis) * rest
+//                                //   cell coordinates = lp / bubble_cell
+//                                // A shader's other patterns fixed in the rest
+//                                // pose may undo the deformation the same way
+//                                // (assets/goo/gem.gdshader's facets).
 //   uniform vec4 second_color;   // a two-tone body's second colour (source_color);
 //                                // transparent black (alpha 0) for a body of one
 //                                // colour: read it as "the same as COLOR", so a
@@ -46,7 +63,10 @@
 //                                // pointing toward second_color's side
 //   uniform float division_offset; // px along division_axis from the rest
 //                                // centroid to where the division crosses it
-//                                // (0: half and half; > 0: COLOR owns more)
+//                                // (0: half and half; > 0: COLOR owns more).
+//                                // Both are pushed as the division lies on the
+//                                // body's material now: GooSkin carries it as
+//                                // the body grows and deforms.
 // COLOR is the body's tint (the Skin Polygon2D's colour, Goo2D.set_tint(): the
 // body's colour, flashed and blended during merges; a two-tone body's primary
 // colour, second_color on the far side of its division, two_tone() below shows
@@ -78,6 +98,10 @@ uniform float bubble_cell = 16.0;
 // The turn the bubble field was inherited with (radians): the field is fixed
 // in the body's rest pose, turned by rotation + bubble_turn.
 uniform float bubble_turn = 0.0;
+// The body's rest deformation since the field was made, in its rest space,
+// determinant 1 (GooSkin's field matrix without its scale, which is in
+// bubble_cell): the bubbles squash with the body.
+uniform mat2 bubble_basis = mat2(1.0);
 // Seconds of the body's velocity the bubble field trails behind by (0: the
 // bubbles stay put in the body as it moves).
 uniform float bubble_lag : hint_range(0.0, 0.5) = 0.05;
@@ -94,6 +118,9 @@ uniform float motion_distortion_px : hint_range(0.0, 32.0) = 10.0;
 uniform float goo_opacity : hint_range(0.0, 1.0) = 0.3;
 uniform float bubble_density : hint_range(0.0, 1.0) = 0.55;
 uniform float bubble_speed : hint_range(0.0, 200.0) = 16.0;
+// How much each bubble wobbles on its own (a sideways sway and a pulse of its
+// radius over TIME): 1 as drawn, 0 still.
+uniform float bubble_wobble : hint_range(0.0, 2.0) = 1.0;
 uniform vec3 light_dir = vec3(-0.55, -0.7, 0.75);
 
 varying vec2 world_pos;
@@ -116,7 +143,7 @@ vec2 hash22(vec2 p) {
 }
 
 // One layer of bubbles: one per cell of `cell` px (where the cell's hash says
-// so), drifting up with a sideways wobble. x = ring, y = interior, z = glint,
+// so), drifting up with a sideways wobble (bubble_wobble). x = ring, y = interior, z = glint,
 // w = bubble radius in px (0 where there is none).
 vec4 bubble_layer(vec2 p, float cell, float layer_seed, float density, float sd, vec2 glint_dir) {
 	vec2 uv = p / cell + vec2(seed * 3.731 + layer_seed * 17.0, seed * 1.913 + layer_seed * 5.0);
@@ -125,11 +152,11 @@ vec4 bubble_layer(vec2 p, float cell, float layer_seed, float density, float sd,
 	float present = step(hash12(id + seed + layer_seed), density);
 	vec2 rnd = hash22(id * 1.37 + seed);
 	float phase = hash12(id + 91.7) * 6.2831;
-	float br = mix(0.07, 0.2, rnd.x) * (1.0 + 0.08 * sin(TIME * 3.0 + phase));
+	float br = mix(0.07, 0.2, rnd.x) * (1.0 + 0.08 * bubble_wobble * sin(TIME * 3.0 + phase));
 	// Keep the bubble (and its wobble) inside its own cell: no neighbour search.
 	float room = 0.5 - br - 0.08;
 	vec2 pos = vec2(0.5) + (rnd - 0.5) * 2.0 * room;
-	pos.x += sin(TIME * 1.7 + phase) * 0.07;
+	pos.x += sin(TIME * 1.7 + phase) * 0.07 * bubble_wobble;
 	vec2 dp = (f - pos) * cell;
 	float rpx = br * cell;
 	float dist = length(dp);
@@ -225,13 +252,21 @@ void fragment() {
 	vec3 bg = textureLod(screen_tex, SCREEN_UV + offset * SCREEN_PIXEL_SIZE, 0.35).rgb;
 
 	// Bubbles, in the blob's bubble field lagging behind the motion. The field
-	// is fixed in the body's rest pose (turned by rotation + bubble_turn about
-	// bubble_origin), so the bubbles ride its turn; the rise is world-up, added
-	// before the turn; the glint keeps facing the light.
+	// is fixed in the rest space it was made in: turned back by rotation about
+	// bubble_origin into the body's rest space, its deformation undone
+	// (bubble_basis), then turned by bubble_turn into the field's frame, so the
+	// bubbles ride the body's turn, growth and squash; the rise is world-up,
+	// added before the turn; the glint keeps facing the light. GooSkin.
+	// field_point() is this map in GDScript: keep the two in sync.
 	float bc = cos(rotation + bubble_turn);
 	float bs = sin(rotation + bubble_turn);
 	vec2 bd = p - bubble_origin + vec2(0.0, TIME * bubble_speed) - velocity * bubble_lag;
-	vec2 lp = vec2(bc * bd.x + bs * bd.y, bc * bd.y - bs * bd.x);
+	float rc0 = cos(rotation);
+	float rs0 = sin(rotation);
+	vec2 rest_d = inverse(bubble_basis) * vec2(rc0 * bd.x + rs0 * bd.y, rc0 * bd.y - rs0 * bd.x);
+	float tc = cos(bubble_turn);
+	float ts = sin(bubble_turn);
+	vec2 lp = vec2(tc * rest_d.x + ts * rest_d.y, tc * rest_d.y - ts * rest_d.x);
 	vec2 glint_dir = vec2(bc * 0.38 + bs * 0.42, bc * 0.42 - bs * 0.38);
 	float cell = bubble_cell;
 	vec4 b1 = bubble_layer(lp, cell, 0.0, bubble_density, sd, glint_dir);
