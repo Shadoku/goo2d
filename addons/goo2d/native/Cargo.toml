@@ -13,8 +13,11 @@ crate-type = ["cdylib"]
 godot = { version = "0.5", features = ["api-4-7"] }
 # GooColony's threaded step (src/colony.rs, the colony spike): pure Rust, no C toolchain.
 rayon = "1"
-libc = "0.2"
 
 [profile.release]
 opt-level = 3
 lto = "thin"
+
+# The colony's CPU timers (colony.rs, CpuClock): the thread CPU clock.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

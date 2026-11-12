@@ -764,6 +764,13 @@ impl Creature {
         if to_core.is_empty() && to_ring.is_empty() {
             return;
         }
+        if opt.retopo_switches > 0 {
+            // At most retopo_switches at once, exposed cores first (the others wait, still
+            // candidates, for the next pass).
+            let cap = opt.retopo_switches as usize;
+            to_ring.truncate(cap);
+            to_core.truncate(cap - to_ring.len());
+        }
         let rest = (ex.switch_rest / dt).ceil() as u64;
         self.exp_hot_until = frame + ex.hot as u64;
         for &cell in &to_core {

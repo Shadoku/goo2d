@@ -1071,7 +1071,9 @@ impl GooColony {
                 "frozen_self" => o.frozen_self = number as u8,
                 "frozen_breaks" => o.frozen_breaks = value.try_to::<bool>().unwrap_or(number != 0.0),
                 "frozen_creep" => o.frozen_creep = value.try_to::<bool>().unwrap_or(number != 0.0),
-                "stick_every" => o.stick_every = (number as u32).max(1),
+                "urgent_retopo" => o.urgent_retopo = value.try_to::<bool>().unwrap_or(number != 0.0),
+                "retopo_switches" => o.retopo_switches = number.max(0.0) as u32,
+                "cpu_timers" => colony::CPU_TIMERS.store(value.try_to::<bool>().unwrap_or(number != 0.0), std::sync::atomic::Ordering::Relaxed),
                 "fast_search" => o.fast_search = value.try_to::<bool>().unwrap_or(number != 0.0),
                 "spin" => o.spin = value.try_to::<bool>().unwrap_or(number != 0.0),
                 "fast_rings" => o.fast_rings = value.try_to::<bool>().unwrap_or(number != 0.0),
@@ -1223,6 +1225,10 @@ impl GooColony {
         put(&mut d, "retopos", s.retopos as i64);
         put(&mut d, "own_cpu_us", s.own_cpu_us as i64);
         put(&mut d, "retopo_cpu_us", s.retopo_cpu_us as i64);
+        put(&mut d, "cp_rebuilt", s.cp_rebuilt as i64);
+        put(&mut d, "cp_snaps", s.cp_snaps as i64);
+        put(&mut d, "cp_lists", s.cp_lists as i64);
+        put(&mut d, "urgent", s.urgent as i64);
         let (mut beads, mut cores, mut rings, mut bonds) = (0usize, 0usize, 0usize, 0usize);
         for c in &self.c.creatures {
             beads += c.bead_count();
@@ -1499,6 +1505,30 @@ impl GooColony {
     #[func]
     fn resize_cell(&mut self, c: i64, cell: i64, radius: f64) -> bool {
         self.c.creatures.get_mut(c as usize).map(|cr| cr.resize_cell(cell as usize, radius as f32)).unwrap_or(false)
+    }
+
+    /// A muscle: cell `cell` at `scale` × its size (colony.rs's set_cell_muscle()): no
+    /// exposure pass, no retopology. False for a cell that is not there or a scale not
+    /// above 0.
+    #[func]
+    fn set_cell_muscle(&mut self, c: i64, cell: i64, scale: f64) -> bool {
+        self.c.creatures.get_mut(c as usize).map(|cr| cr.set_cell_muscle(cell as usize, scale as f32)).unwrap_or(false)
+    }
+
+    /// Every muscle of creature `c` at once, one scale per cell in cell order (fewer: the
+    /// rest left as they are); the cheap path for a gait driven every frame.
+    #[func]
+    fn set_cell_muscles(&mut self, c: i64, scales: PackedFloat32Array) {
+        if let Some(cr) = self.c.creatures.get_mut(c as usize) {
+            for (i, &s) in scales.as_slice().iter().enumerate().take(cr.cells.len()) {
+                cr.set_cell_muscle(i, s);
+            }
+        }
+    }
+
+    #[func]
+    fn cell_muscle(&self, c: i64, cell: i64) -> f64 {
+        self.c.creatures.get(c as usize).and_then(|cr| cr.cells.get(cell as usize)).map(|x| x.muscle as f64).unwrap_or(0.0)
     }
 
     #[func]

@@ -68,6 +68,27 @@ static func everything_options(strength: float = TENSION) -> Dictionary:
 	options.merge({ "reuse_pairs": true, "pair_skin": 8.0 * GooTuning.unit, "exposure_hot": 0 })
 	return options
 
+## The frozen topology (docs/colony-frozen.md): a creature's topology (which cells stick,
+## which are cores, its outline) changes only at its retopologies, every RETOPO_EVERY
+## frames (staggered by creature), when request_retopology() asks, or at once after a stick
+## was loaded past the break force (urgent_retopo). Between them its own contacts come
+## from lists kept per pair of cells (frozen_self 4) built with FROZEN_SKIN px of margin
+## at unit 1.
+const RETOPO_EVERY: int = 30
+const FROZEN_SKIN: float = 16.0
+## The most cells one retopology switches between ring and core.
+const RETOPO_SWITCHES: int = 8
+
+## everything_options() with the frozen topology: what the fluid game's creatures use.
+## The spinning step (`spin`) wants a pool of at most the machine's cores; joins and
+## parts are reported only at retopologies.
+static func frozen_options(strength: float = TENSION) -> Dictionary:
+	var options := everything_options(strength)
+	options.merge({ "frozen": true, "frozen_self": 4, "pair_skin": FROZEN_SKIN * GooTuning.unit,
+		"retopo_every": RETOPO_EVERY, "frozen_breaks": true, "retopo_switches": RETOPO_SWITCHES,
+		"fast_search": true, "spin": true, "fast_rings": true }, true)
+	return options
+
 var colony: GooColony
 
 ## Ask may_adhere() once about each pair of cells that touch for the first time (until

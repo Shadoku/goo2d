@@ -58,6 +58,7 @@ use rayon::prelude::*;
 use std::collections::BTreeMap;
 use std::time::Instant;
 
+mod cellpairs;
 mod drag;
 mod exposure;
 mod tension;
@@ -248,7 +249,16 @@ pub const FROZEN_SELF_FULL: u8 = 2;
 /// The kept list, searched again when a particle's motion could exceed its skin (a
 /// Verlet list, contacts only between retopologies).
 pub const FROZEN_SELF_VERLET: u8 = 3;
+/// Kept per pair of cells, judged per pair (colony/cellpairs.rs).
+pub const FROZEN_SELF_CELLS: u8 = 4;
 const PAIR_PAD: f32 = 1.0;
+/// The spinning step's barrier spins this many times before it yields its core: with every
+/// core in the pool, a thread waiting long in a spin keeps a preempted one off its core
+/// (measured: 20 000 spins made the 95th percentile of a swimming crowd 11-14 ms against
+/// a median of 5; 200-2000 kept it at 6-6.5).
+const SPIN_LIMIT: u32 = 1000;
+/// Frozen topology: frames before an urgent retopology may be asked again (1/6 s at 60 Hz).
+const URGENT_REST: u64 = 10;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CellTuning {
@@ -315,6 +325,9 @@ pub struct Cell {
     /// The mean direction of its exposed beads from its centre (thrusters, spikes; zero
     /// when none).
     pub outward: Vector2,
+    /// Its size without the muscle (resize_cell(), or its creation) and the muscle's scale.
+    pub base_radius: f32,
+    pub muscle: f32,
     // Room for later milestones (data only: nothing reads or writes it yet).
     #[allow(dead_code)]
     /// Contacts with other creatures or walls in the last step (contact reports).
@@ -323,7 +336,7 @@ pub struct Cell {
 
 impl Cell {
     fn new(t: CellTuning) -> Cell {
-        Cell { kind: Kind::Core(0), t, ctype: 0, push: Vector2::ZERO, exposure: 1.0, outward: Vector2::ZERO, contacts: 0 }
+        Cell { kind: Kind::Core(0), base_radius: t.radius, muscle: 1.0, t, ctype: 0, push: Vector2::ZERO, exposure: 1.0, outward: Vector2::ZERO, contacts: 0 }
     }
 }
 
@@ -530,11 +543,15 @@ pub struct Creature {
     /// the after-step pass, retopologies this step, the substep index.
     pub retopo_req: bool,
     retopo_now: bool,
+    /// Frozen topology: whether it has had its first retopology; before when an urgent
+    /// retopology may be asked again (frame), and how many were asked this step.
+    retopo_done: bool,
+    urgent_until: u64,
+    urgent: usize,
     ns_after: u64,
     retopos: usize,
     substep: u32,
     ns_own: u64,
-    stick_every: u32,
     fast_rings: bool,
     exp_runs: usize,
     to_core: usize,
@@ -557,6 +574,10 @@ pub struct Creature {
     tension_built: u64,
     tension_edges: Vec<tension::TEdge>,
     ns_tension: u64,
+    /// Frozen topology's own contacts kept per cell pair (FROZEN_SELF_CELLS).
+    cp: cellpairs::CellPairs,
+    /// The colony's frame number in this step.
+    frame_now: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -588,12 +609,19 @@ pub struct Options {
     /// FROZEN_SELF_KEPT (the list found at the last retopology, `pair_skin` px of margin,
     /// filtered each frame), FROZEN_SELF_FULL (searched every frame as before).
     pub frozen_self: u8,
-    /// Sticks may break between retopologies (else only at one).
+    /// Frozen topology: a stick loaded past the break force between retopologies breaks
+    /// at once, with the full model's break pass (the pair rests, a parted event); else
+    /// it holds until the next retopology.
     pub frozen_breaks: bool,
     /// Anchors creep between retopologies.
     pub frozen_creep: bool,
-    /// Sticks solved every this many substeps (1: every one).
-    pub stick_every: u32,
+    /// Frozen topology: a stick loaded past the break force between retopologies (with
+    /// frozen_breaks off) asks for its creature's retopology in the next frame (at most
+    /// once in URGENT_REST).
+    pub urgent_retopo: bool,
+    /// The most cells one retopology switches between ring and core (0: no limit); the
+    /// others stay candidates for the next.
+    pub retopo_switches: u32,
     /// The own-candidate search with grid cells of the usual reach (explore-frozen).
     pub fast_search: bool,
     /// The step's phases on a spinning team (step_spin()) instead of a fork per phase.
@@ -624,9 +652,10 @@ impl Default for Options {
             frozen: false,
             retopo_every: 0,
             frozen_self: FROZEN_SELF_KEPT,
-            frozen_breaks: false,
+            frozen_breaks: true,
             frozen_creep: true,
-            stick_every: 1,
+            urgent_retopo: false,
+            retopo_switches: 0,
             fast_search: false,
             spin: false,
             fast_rings: false,
@@ -697,6 +726,12 @@ pub struct Stats {
     /// The CPU time of this step's retopologies (their creatures' own search, capture,
     /// after-step and exposure passes).
     pub retopo_cpu_us: u64,
+    /// FROZEN_SELF_CELLS: cell-pair lists built, cells snapshot, lists in use this step.
+    pub cp_rebuilt: usize,
+    pub cp_snaps: usize,
+    pub cp_lists: usize,
+    /// Urgent retopologies asked this step (a stick past the break force).
+    pub urgent: usize,
 }
 
 pub struct Colony {
@@ -775,20 +810,41 @@ fn circle(center: Vector2, radius: f32, n: usize) -> Vec<Vector2> {
         .collect()
 }
 
+/// Whether the step's per-part timers run (Options::cpu_timers, process-wide): each
+/// reading of a thread's CPU clock is a system call (about 0.23 µs here), some 2000 a frame
+/// at 30 creatures, so a game leaves them off and the bench turns them on.
+pub static CPU_TIMERS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// This thread's CPU time (robust to the machine being shared: a preempted thread does
-/// not count the time it waited).
+/// not count the time it waited), when CPU_TIMERS is on (else 0, for nothing). Outside
+/// unix, the wall clock.
 #[derive(Clone, Copy)]
 pub struct CpuClock(u64);
 impl CpuClock {
     #[inline]
     pub fn now() -> CpuClock {
+        if !CPU_TIMERS.load(std::sync::atomic::Ordering::Relaxed) {
+            return CpuClock(0);
+        }
+        CpuClock(Self::read())
+    }
+
+    #[cfg(unix)]
+    fn read() -> u64 {
         let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
         unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
-        CpuClock(ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64)
+        ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+    }
+
+    #[cfg(not(unix))]
+    fn read() -> u64 {
+        use std::sync::OnceLock;
+        static START: OnceLock<Instant> = OnceLock::new();
+        START.get_or_init(Instant::now).elapsed().as_nanos() as u64
     }
 }
 
-fn ns(since: CpuClock) -> u64 {
+pub(crate) fn ns(since: CpuClock) -> u64 {
     CpuClock::now().0.saturating_sub(since.0)
 }
 
@@ -1327,7 +1383,7 @@ impl Creature {
         }
     }
 
-    fn substep_own(&mut self, opt: &Options, stick_every: u32) {
+    fn substep_own(&mut self, opt: &Options) {
         if !self.active {
             return;
         }
@@ -1343,7 +1399,7 @@ impl Creature {
         let t = CpuClock::now();
         self.solve_bonds();
         self.ns_bonds += ns(t);
-        if !self.sticks.is_empty() && self.substep % stick_every == stick_every - 1 {
+        if !self.sticks.is_empty() {
             let t = CpuClock::now();
             self.solve_sticks();
             self.ns_sticks += ns(t);
@@ -1714,9 +1770,7 @@ impl Creature {
     /// stick's bead also held at its place along the edge, more softly; a sticky one's
     /// place follows the bead (hopping to the next edge past an end).
     fn solve_sticks(&mut self) {
-        // Solved every stick_every substeps: the compliance over that span.
-        let he = self.h * self.stick_every.max(1) as f32;
-        let inv_h2 = 1.0 / (he * he);
+        let inv_h2 = 1.0 / (self.h * self.h);
         // Each core's turn as (cos, sin), once a substep (anchored sticks on its rim).
         if self.anchored_on_cores {
             self.crot_cs.clear();
@@ -1931,7 +1985,7 @@ impl Creature {
         let inv = 1.0 / substeps.max(1) as f32;
         let smooth = if ad.load_time > 0.0 { (self.dt / ad.load_time).min(1.0) } else { 1.0 };
         for st in self.sticks.iter_mut() {
-            st.load += (st.pull * inv * self.stick_every.max(1) as f32 - st.load) * smooth;
+            st.load += (st.pull * inv - st.load) * smooth;
             st.pull = 0.0;
         }
         let limit = ad.break_force;
@@ -2185,8 +2239,36 @@ impl Creature {
         if cell >= self.cells.len() || radius <= 0.0 {
             return false;
         }
+        self.cells[cell].base_radius = radius;
+        self.cells[cell].muscle = 1.0;
+        self.apply_radius(cell, radius);
+        self.exp_dirty = true;
+        true
+    }
+
+    /// A muscle: cell `cell` at `scale` × the size resize_cell() (or its creation) gave
+    /// it, in place, every frame if need be. Unlike resize_cell() it asks for no exposure
+    /// pass and no retopology: the topology stays as it is (docs/colony-frozen.md).
+    pub fn set_cell_muscle(&mut self, cell: usize, scale: f32) -> bool {
+        if cell >= self.cells.len() || !(scale > 0.0) || !scale.is_finite() {
+            return false;
+        }
+        if scale == self.cells[cell].muscle {
+            return true;
+        }
+        self.cells[cell].muscle = scale;
+        let radius = self.cells[cell].base_radius * scale;
+        self.apply_radius(cell, radius);
+        true
+    }
+
+    /// The cell's tuning, rest shape and bead radii (a core's radius) for `radius`.
+    fn apply_radius(&mut self, cell: usize, radius: f32) {
         let old = self.cells[cell].t.radius;
         let f = radius / old.max(1e-6);
+        if f == 1.0 {
+            return;
+        }
         let t = &mut self.cells[cell].t;
         t.radius = radius;
         t.ring_radius *= f;
@@ -2204,13 +2286,16 @@ impl Creature {
                 }
             }
             Kind::Core(k) => {
-                self.cr[k] = radius;
-                self.ctarget[k] = radius;
-                self.cgrow[k] = 0.0;
+                if self.cgrow[k] > 0.0 {
+                    // Still growing to its cell's size after a ring became it.
+                    self.ctarget[k] = (self.ctarget[k] * f).min(radius);
+                    self.cgrow[k] *= f;
+                } else {
+                    self.ctarget[k] = radius;
+                }
+                self.cr[k] = self.ctarget[k];
             }
         }
-        self.exp_dirty = true;
-        true
     }
 
     /// Stick `k`'s gap now (px along its normal; 0 is what it holds).
@@ -2367,6 +2452,7 @@ impl Creature {
                 FROZEN_SELF_NONE => {}
                 FROZEN_SELF_KEPT => self.filter_kept_pairs(contact_slop),
                 FROZEN_SELF_VERLET => self.reuse_own_pairs_with(opt, contact_slop, contact_slop, 0.0),
+                FROZEN_SELF_CELLS => self.cell_pair_contacts(opt.pair_skin, contact_slop, self.frame_now),
                 _ => self.search_own_pairs(opt, contact_slop, contact_slop, false),
             }
             return;
@@ -2762,22 +2848,27 @@ impl Creature {
         if !self.active || self.sticks.is_empty() {
             return 0;
         }
-        let solves = (substeps.max(1) as u32 / opt.stick_every.max(1)).max(1);
-        let inv = 1.0 / solves as f32;
+        let inv = 1.0 / substeps.max(1) as f32;
         let smooth = if ad.load_time > 0.0 { (self.dt / ad.load_time).min(1.0) } else { 1.0 };
+        let limit = ad.break_force;
+        let breaking = self.sticks.iter().any(|st| st.load + (st.pull * inv - st.load) * smooth > limit);
+        if breaking && opt.frozen_breaks {
+            // A wall loaded past the break force breaks now, as in the full model: the
+            // regular pass (loads, breaks, the pair's rest, creep, events). Nothing captures
+            // until the next retopology.
+            return self.after_step(ad, substeps, self.frame_now);
+        }
         let mut sliding = false;
         for st in self.sticks.iter_mut() {
             st.load += (st.pull * inv - st.load) * smooth;
             st.pull = 0.0;
             sliding |= st.mode == JOIN_STICKY && !st.b_core;
         }
-        let mut broken = 0;
-        if opt.frozen_breaks {
-            let limit = ad.break_force;
-            if self.sticks.iter().any(|st| st.load > limit) {
-                broken = self.drop_sticks(|st| st.load > limit);
-                // The pairs rest from the next retopology on (it settles them).
-            }
+        let broken = 0;
+        if breaking && opt.urgent_retopo && !self.retopo_req && self.frame_now >= self.urgent_until {
+            self.retopo_req = true;
+            self.urgent_until = self.frame_now + URGENT_REST;
+            self.urgent += 1;
         }
         let fade = 1.0 - (self.dt / self.core_ease.max(1e-3)).min(1.0);
         for st in self.sticks.iter_mut() {
@@ -3339,14 +3430,22 @@ impl Colony {
             c.capturing = opt.ad.enabled && !opt.ad.paused && !c.capture_paused && (frame - 1 + c.index as u64) % ce == 0;
             c.ns_after = 0;
             c.retopos = 0;
+            c.frame_now = frame;
+            // A switch renumbers particles: only the kept list (FROZEN_SELF_KEPT) needs a
+            // retopology after one; the cell-pair lists and the Verlet list rebuild
+            // themselves.
             c.retopo_now = !opt.frozen
                 || c.retopo_req
-                || !c.vvalid
+                || !c.retopo_done
+                || (!c.vvalid && opt.frozen_self == FROZEN_SELF_KEPT)
                 || (opt.retopo_every > 0 && (frame + c.index as u64) % opt.retopo_every as u64 == 0);
             if opt.frozen {
                 if c.retopo_now && c.active {
                     c.retopo_req = false;
+                    c.retopo_done = true;
                     c.retopos = 1;
+                    // Every retopology runs the exposure pass (and the switches).
+                    c.exp_dirty = true;
                     // The kept list is searched again (and capture reads it whole).
                     c.vvalid = false;
                     c.capturing = opt.ad.enabled && !opt.ad.paused && !c.capture_paused;
@@ -3387,9 +3486,8 @@ impl Colony {
             let t = Instant::now();
             self.for_each(|c| {
                 c.substep = sub as u32;
-                c.stick_every = opt.stick_every.max(1);
                 c.fast_rings = opt.fast_rings;
-                c.substep_own(&opt, opt.stick_every.max(1));
+                c.substep_own(&opt);
             });
             solve += t.elapsed().as_nanos() as u64;
             let t = Instant::now();
@@ -3450,6 +3548,14 @@ impl Colony {
             stats.after_cpu_us += c.ns_after / 1000;
             stats.retopos += c.retopos;
             stats.own_cpu_us += c.ns_own / 1000;
+            stats.cp_rebuilt += c.cp.rebuilt;
+            stats.cp_snaps += c.cp.snaps;
+            stats.cp_lists += c.cp.lists;
+            stats.urgent += c.urgent;
+            c.urgent = 0;
+            c.cp.rebuilt = 0;
+            c.cp.snaps = 0;
+            c.cp.lists = 0;
             if c.retopos > 0 {
                 stats.retopo_cpu_us += (c.ns_own + c.ns_capture + c.ns_after + c.ns_exposure) / 1000;
             }
@@ -3496,6 +3602,7 @@ impl Colony {
             count: AtomicUsize,
             gen: AtomicUsize,
             total: usize,
+            limit: u32,
         }
         impl Barrier {
             fn wait(&self) {
@@ -3507,7 +3614,7 @@ impl Colony {
                     let mut spins = 0u32;
                     while self.gen.load(Ordering::Acquire) == g {
                         spins += 1;
-                        if spins < 20_000 {
+                        if spins < self.limit {
                             std::hint::spin_loop();
                         } else {
                             std::thread::yield_now();
@@ -3522,7 +3629,8 @@ impl Colony {
         let n = self.creatures.len();
         // Phases: 0 forces + own pairs, 1 cross find, 2..2+n_sub substeps, then after.
         let counters: Vec<AtomicUsize> = (0..n_sub + 4).map(|_| AtomicUsize::new(0)).collect();
-        let barrier = Barrier { count: AtomicUsize::new(0), gen: AtomicUsize::new(0), total: threads };
+        let limit = SPIN_LIMIT;
+        let barrier = Barrier { count: AtomicUsize::new(0), gen: AtomicUsize::new(0), total: threads, limit };
         let me = Ptr(self as *mut Colony);
         let cre = Ptr(self.creatures.as_mut_ptr());
         let mut slots: Vec<(Vec<Cross>, usize)> = Vec::new();
@@ -3601,9 +3709,8 @@ impl Colony {
                         c.velocities(opt.max_speed, &opt.cores);
                     }
                     c.substep = sub as u32;
-                    c.stick_every = opt.stick_every.max(1);
                     c.fast_rings = opt.fast_rings;
-                    c.substep_own(&opt, opt.stick_every.max(1));
+                    c.substep_own(&opt);
                 });
                 barrier.wait();
                 if lead {
@@ -4271,17 +4378,23 @@ mod tests {
     /// == serial bit for bit.
     #[test]
     fn frozen_spin_threaded_is_bit_identical_to_serial() {
-        let run = |threads: usize, spin: bool, fast: bool| {
+        // Everything on (adhesion, exposure, automatic cores, anchors, compliant cores,
+        // drag, tension), muscles driven every frame, retopologies on the timer and by
+        // request, both kept own lists: serial, threaded and spinning give the same bits.
+        let run = |threads: usize, spin: bool, fast: bool, own: u8| {
             let mut col = exposing(threads);
             col.opt.ex.auto_cores = true;
             col.opt.ad.core_anchors = true;
             col.opt.cores.contact = 1.0;
             col.opt.drag.enabled = true;
+            col.opt.tension.strength = 750.0;
             col.opt.frozen = true;
             col.opt.retopo_every = 25;
-            col.opt.frozen_self = FROZEN_SELF_VERLET;
+            col.opt.retopo_switches = 3;
+            col.opt.frozen_self = own;
+            col.opt.pair_skin = 8.0;
             col.opt.fast_search = fast;
-            col.opt.stick_every = 2;
+            col.opt.fast_rings = fast;
             col.opt.spin = spin;
             for c in 0..6 {
                 let k = hex(&mut col, Vector2::new(c as f32 * 160.0, (c % 2) as f32 * 30.0), 0.0);
@@ -4293,6 +4406,12 @@ mod tests {
                 if f == 70 {
                     col.creatures[2].retopo_req = true;
                 }
+                for c in col.creatures.iter_mut() {
+                    for cell in 0..c.cells.len() {
+                        let phase = 0.4 * cell as f32 + f as f32 * 0.1;
+                        c.set_cell_muscle(cell, 1.0 + 0.2 * phase.sin());
+                    }
+                }
                 col.step(1.0 / 60.0);
                 if f == 90 {
                     for c in col.creatures.iter_mut() {
@@ -4303,10 +4422,11 @@ mod tests {
             }
             (col, events)
         };
-        for fast in [false, true] {
-            let (a, ea) = run(1, false, fast);
-            let (b, eb) = run(4, true, fast);
-            let (c, ec) = run(4, false, fast);
+        for (fast, own) in [(false, FROZEN_SELF_VERLET), (true, FROZEN_SELF_VERLET), (true, FROZEN_SELF_CELLS)] {
+            let (a, ea) = run(1, false, fast, own);
+            let (b, eb) = run(4, true, fast, own);
+            let (c, ec) = run(4, false, fast, own);
+            assert!(!ea.is_empty());
             assert_eq!(ea, eb);
             assert_eq!(ea, ec);
             for other in [&b, &c] {
@@ -4324,9 +4444,104 @@ mod tests {
                     for (s, t) in ca.sticks.iter().zip(&cb.sticks) {
                         assert_eq!(s.load.to_bits(), t.load.to_bits());
                     }
+                    for (p, q) in ca.tension_f.iter().zip(&cb.tension_f) {
+                        assert_eq!(p.x.to_bits(), q.x.to_bits());
+                    }
                 }
             }
         }
+    }
+
+    /// Every own pair of particles touching at a frame's start (the full search's contacts
+    /// without its motion margin): (bead, bead), (bead, core), (core, core).
+    fn touching_own(c: &Creature) -> (Vec<(u32, u32)>, Vec<(u32, u32)>, Vec<(u32, u32)>) {
+        let (mut bb, mut bc, mut cc) = (Vec::new(), Vec::new(), Vec::new());
+        for i in 0..c.pos.len() {
+            for j in i + 1..c.pos.len() {
+                let (ra, rb) = (c.bead_ring[i], c.bead_ring[j]);
+                if ra == rb {
+                    let ring = &c.rings[ra as usize];
+                    let hop = (i - ring.start).abs_diff(j - ring.start);
+                    if hop.min(ring.n - hop) <= 2 {
+                        continue;
+                    }
+                }
+                if dist(c.pos[i], c.pos[j]) < c.r[i] + c.r[j] {
+                    bb.push((i as u32, j as u32));
+                }
+            }
+            for k in 0..c.cpos.len() {
+                if dist(c.pos[i], c.cpos[k]) < c.r[i] + c.cr[k] {
+                    bc.push((i as u32, k as u32));
+                }
+            }
+        }
+        for k in 0..c.cpos.len() {
+            for l in k + 1..c.cpos.len() {
+                if dist(c.cpos[k], c.cpos[l]) < c.cr[k] + c.cr[l] {
+                    cc.push((k as u32, l as u32));
+                }
+            }
+        }
+        (bb, bc, cc)
+    }
+
+    #[test]
+    fn cell_pair_lists_miss_no_touching_pair() {
+        // Creatures squeezed by a hard push on one cell, bent by muscle waves and thrown
+        // into each other, frozen with the cell-pair lists: every frame, every own pair
+        // touching at the frame's start is among the frame's contacts.
+        let mut col = exposing(1);
+        col.opt.ex.auto_cores = true;
+        col.opt.cores.contact = 1.0;
+        col.opt.drag.enabled = true;
+        col.opt.tension.strength = 750.0;
+        col.opt.frozen = true;
+        col.opt.retopo_every = 30;
+        col.opt.frozen_self = FROZEN_SELF_CELLS;
+        col.opt.pair_skin = 8.0;
+        col.opt.fast_search = true;
+        for c in 0..4 {
+            let k = hex(&mut col, Vector2::new(c as f32 * 150.0, (c % 2) as f32 * 40.0), 0.0);
+            col.creatures[k].push = Vector2::new(if c % 2 == 0 { 1500.0 } else { -1500.0 }, 0.0);
+            col.creatures[k].cells[c].push = Vector2::new(0.0, 9000.0);
+        }
+        let (mut checked, mut rebuilt, mut lists) = (0usize, 0usize, 0usize);
+        for f in 0..240 {
+            for c in col.creatures.iter_mut() {
+                for cell in 0..c.cells.len() {
+                    let phase = 0.7 * cell as f32 - f as f32 * 0.2;
+                    c.set_cell_muscle(cell, 1.0 + 0.3 * phase.sin());
+                }
+            }
+            if f == 120 {
+                for c in col.creatures.iter_mut() {
+                    c.push = -c.push;
+                }
+            }
+            let before: Vec<_> = col.creatures.iter().map(|c| (touching_own(c), c.topology, c.retopo_done)).collect();
+            col.step(1.0 / 60.0);
+            for (c, ((bb, bc, cc), topology, done)) in col.creatures.iter().zip(before) {
+                if c.topology != topology || !done {
+                    // A retopology switched cells (its lists were cleared) or the first one.
+                    continue;
+                }
+                for p in &bb {
+                    assert!(c.bb.contains(p), "frame {}: touching beads {:?} not in the contacts", f, p);
+                }
+                for p in &bc {
+                    assert!(c.bc.contains(p), "frame {}: touching bead and core {:?} not in the contacts", f, p);
+                }
+                for p in &cc {
+                    assert!(c.cc.contains(p), "frame {}: touching cores {:?} not in the contacts", f, p);
+                }
+                checked += bb.len() + bc.len() + cc.len();
+            }
+            rebuilt += col.stats.cp_rebuilt;
+            lists += col.stats.cp_lists;
+        }
+        println!("cell pairs: {} touching pairs checked, lists rebuilt {} of {} judged ({:.1}%)", checked, rebuilt, lists, 100.0 * rebuilt as f32 / lists.max(1) as f32);
+        assert!(checked > 1000);
     }
 
     #[test]

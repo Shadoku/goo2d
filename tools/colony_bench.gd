@@ -90,6 +90,9 @@ var _cells: int = 150
 var _shape: String = "blob"
 var _mix: String = "uniform"
 var _beads: int = 12
+var _frozen_preset: bool = false
+# Options given after --frozen-preset that override it (--skin, --retopo-every, --spin...).
+var _preset_overrides := {}
 var _cores: bool = true
 var _threads: int = 1
 var _substeps: int = 6
@@ -130,9 +133,8 @@ var _zoom: float = 0.0
 var _frozen: bool = false
 var _retopo_every: int = 0
 var _frozen_self: int = 1
-var _frozen_breaks: bool = false
+var _frozen_breaks: bool = true
 var _frozen_creep: bool = true
-var _stick_every: int = 1
 var _fast_search: bool = false
 var _spin: bool = false
 var _fast_rings: bool = false
@@ -222,7 +224,9 @@ func _initialize() -> void:
 		elif arg.begins_with("--water="): _water = value
 		elif arg.begins_with("--exposure-every="): _exp_every_hot.x = int(value)
 		elif arg.begins_with("--reuse="): _reuse = value == "on"
-		elif arg.begins_with("--skin="): _skin = float(value)
+		elif arg.begins_with("--skin="):
+			_skin = float(value)
+			_preset_overrides["pair_skin"] = _skin
 		elif arg.begins_with("--exposure-hot="): _exp_every_hot.y = int(value)
 		elif arg.begins_with("--sleep="): _sleep = float(value)
 		elif arg.begins_with("--coarse="): _coarse = float(value)
@@ -236,13 +240,21 @@ func _initialize() -> void:
 		elif arg.begins_with("--seal="): _seal = float(value)
 		elif arg.begins_with("--zoom="): _zoom = float(value)
 		elif arg == "--frozen": _frozen = true
-		elif arg.begins_with("--retopo-every="): _retopo_every = int(value)
-		elif arg.begins_with("--frozen-self="): _frozen_self = ["none", "kept", "full", "verlet"].find(value)
+		elif arg == "--frozen-preset": _frozen_preset = true
+		elif arg.begins_with("--retopo-every="):
+			_retopo_every = int(value)
+			_preset_overrides["retopo_every"] = _retopo_every
+		elif arg.begins_with("--switches="): _preset_overrides["retopo_switches"] = int(value)
+		elif arg.begins_with("--urgent="): _preset_overrides["urgent_retopo"] = value == "on"
+		elif arg.begins_with("--frozen-self="):
+			_frozen_self = ["none", "kept", "full", "verlet", "cells"].find(value)
+			_preset_overrides["frozen_self"] = _frozen_self
 		elif arg.begins_with("--frozen-breaks="): _frozen_breaks = value == "on"
 		elif arg.begins_with("--frozen-creep="): _frozen_creep = value == "on"
-		elif arg.begins_with("--stick-every="): _stick_every = int(value)
 		elif arg.begins_with("--fast-search="): _fast_search = value == "on"
-		elif arg.begins_with("--spin="): _spin = value == "on"
+		elif arg.begins_with("--spin="):
+			_spin = value == "on"
+			_preset_overrides["spin"] = _spin
 		elif arg.begins_with("--fast-rings="): _fast_rings = value == "on"
 		elif arg == "--ratios": ratios = true
 		elif arg == "--promote-test": promote = true
@@ -600,8 +612,21 @@ func _build_colony(design: Array[Vector3], kinds: PackedByteArray, starts: Array
 		GooTuning.unit = UNIT
 		_colony.set_options(GooColonySim.tension_options(_tension))
 		GooTuning.unit = unit
-	_colony.set_options({ "frozen": _frozen, "retopo_every": _retopo_every, "frozen_self": _frozen_self,
-		"frozen_breaks": _frozen_breaks, "frozen_creep": _frozen_creep, "stick_every": _stick_every, "fast_search": _fast_search, "spin": _spin, "fast_rings": _fast_rings })
+	_colony.set_options({ "cpu_timers": true, "frozen": _frozen, "retopo_every": _retopo_every, "frozen_self": _frozen_self,
+		"frozen_breaks": _frozen_breaks, "frozen_creep": _frozen_creep, "fast_search": _fast_search, "spin": _spin, "fast_rings": _fast_rings })
+	if _frozen_preset:
+		# GooColonySim.frozen_options() at the bench's unit, its retopology, skin and
+		# switches as in the preset (the rest of it is --everything's).
+		var unit := GooTuning.unit
+		GooTuning.unit = UNIT
+		var fo := GooColonySim.frozen_options()
+		GooTuning.unit = unit
+		var keep := {}
+		for key: String in ["frozen", "frozen_self", "pair_skin", "retopo_every", "frozen_breaks", "retopo_switches", "fast_search", "spin", "fast_rings"]:
+			keep[key] = fo[key]
+		for key: String in _preset_overrides:
+			keep[key] = _preset_overrides[key]
+		_colony.set_options(keep)
 	for ci: int in _creatures:
 		var hue := fmod(0.13 + ci * 0.618, 1.0)
 		var floats := PackedFloat32Array()
@@ -963,6 +988,9 @@ func _on_physics(first: bool, delta: float) -> void:
 			_sample("after_cpu", s["after_cpu_us"])
 			_sample("own_cpu", s["own_cpu_us"])
 			_sample("retopos", s["retopos"], false)
+			_sample("urgent", s["urgent"], false)
+			_sample("cp_rebuilt", s["cp_rebuilt"], false)
+			_sample("cp_lists", s["cp_lists"], false)
 			if s["retopos"] > 0:
 				_sample("retopo_each", s["retopo_cpu_us"] / float(s["retopos"]))
 			_switches += s["to_core"] + s["to_ring"]
@@ -1042,7 +1070,7 @@ func _sample(key: String, value: float, usec: bool = true) -> void:
 
 func _report() -> void:
 	print("colony_bench: %d frames after %d warm-up (ms: min / median / p95)" % [_frames, _warmup])
-	var order := ["physics", "kernel", "holds", "after_cpu", "own_cpu", "retopos", "retopo_each", "capture", "settle", "exposure", "exp_runs", "drag_cpu", "tension_cpu", "skipped", "enclosed", "pockets", "lost_runs", "patched", "pair_builds",
+	var order := ["physics", "kernel", "holds", "after_cpu", "own_cpu", "retopos", "urgent", "retopo_each", "cp_rebuilt", "cp_lists", "capture", "settle", "exposure", "exp_runs", "drag_cpu", "tension_cpu", "skipped", "enclosed", "pockets", "lost_runs", "patched", "pair_builds",
 		"sticks", "broken", "script", "push", "draw", "draw_rust", "rs_setup", "rs_render",
 		"forces", "pairs", "own_pairs", "solve", "rings_cpu", "intra_cpu", "cross", "vel", "cross_hits", "intra_pairs", "cross_pairs",
 		"k_pairpass", "k_links", "k_solver", "k_rings", "k_skins"]
