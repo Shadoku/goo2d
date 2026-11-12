@@ -153,7 +153,8 @@ func test_split_pieces_keep_the_parent_bubbles() -> void:
 		_assert_same_bubbles(_bubbles(piece), parent, 0.5, "a split piece at the cut")
 	# Then the pieces drift apart and each carries its part of the field along:
 	# its origin stays where it was relative to its own centre, in the field's
-	# frame (the piece's rest pose turned by its bubble_turn: it turns with it).
+	# frame (the piece's rest pose turned by its bubble_turn: it turns with it,
+	# and grows and deforms with it as it inflates: the field's own px).
 	var offsets: Array[Vector2] = []
 	for piece: Goo2D in pieces:
 		offsets.append(_bubble_offset(piece))
@@ -165,14 +166,13 @@ func test_split_pieces_keep_the_parent_bubbles() -> void:
 		assert_lt(drift, 1e-3, "a piece's bubble field moves with it (offset drifted %.4f px)" % drift)
 
 # The bubble origin a blob last pushed, relative to the centre it pushed with
-# it, turned back into the bubble field's frame (rotation + bubble_turn).
+# it, in the bubble field's own frame and px: minus the centre's place in the
+# field (GooSkin.field_point(), the shader's map, × the field's cell).
 func _bubble_offset(blob: Goo2D) -> Vector2:
 	var material := _goo_material(blob)
 	if material == null:
 		return Vector2.INF
-	var offset := (material.get_shader_parameter("bubble_origin") as Vector2) - (material.get_shader_parameter("center") as Vector2)
-	var turn := float(material.get_shader_parameter("rotation")) + float(material.get_shader_parameter("bubble_turn"))
-	return offset.rotated(-turn)
+	return -GooSkin.field_point(material, material.get_shader_parameter("center") as Vector2) * blob._goo.bubble_cell
 
 func test_merged_ring_keeps_the_bigger_parent_bubbles() -> void:
 	var root := _world()

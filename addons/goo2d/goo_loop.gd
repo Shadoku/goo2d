@@ -204,6 +204,32 @@ static func best_fit_rotation(rest: PackedVector2Array, current: PackedVector2Ar
 		dot_sum += q.dot(p)
 	return atan2(cross_sum, dot_sum)
 
+## The linear map (a Transform2D without origin) that best carries `from` onto
+## `to`, both taken relative to their centroids (point i of one matches point i
+## of the other): least squares, with q = from − its centroid and p = to − its
+## centroid, A = (Σ p qᵀ)(Σ q qᵀ)⁻¹, so A q_i ≈ p_i. A rotation, scale, squash
+## or shear, whatever fits best; the zero matrix when `from` spans no area (all
+## its points on a line).
+static func affine_fit(from: PackedVector2Array, to: PackedVector2Array) -> Transform2D:
+	var count := mini(from.size(), to.size())
+	var from_centre := centroid(from)
+	var to_centre := centroid(to)
+	var qq := Vector3.ZERO
+	var pq := Vector4.ZERO
+	for i: int in count:
+		var q := from[i] - from_centre
+		var p := to[i] - to_centre
+		qq += Vector3(q.x * q.x, q.x * q.y, q.y * q.y)
+		pq += Vector4(p.x * q.x, p.x * q.y, p.y * q.x, p.y * q.y)
+	var det := qq.x * qq.z - qq.y * qq.y
+	if count < 3 or det <= 0.000001 * qq.x * qq.z:
+		return Transform2D(Vector2.ZERO, Vector2.ZERO, Vector2.ZERO)
+	var i00 := qq.z / det
+	var i01 := -qq.y / det
+	var i11 := qq.x / det
+	return Transform2D(Vector2(pq.x * i00 + pq.y * i01, pq.z * i00 + pq.w * i01),
+		Vector2(pq.x * i01 + pq.y * i11, pq.z * i01 + pq.w * i11), Vector2.ZERO)
+
 ## Where each point of `current` would be if the body were its rest shape moved
 ## rigidly onto it: current centroid + (rest_i − rest centroid) rotated by
 ## best_fit_rotation(). The shape-matching force pulls each point toward these.

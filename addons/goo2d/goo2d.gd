@@ -638,6 +638,7 @@ func rebuild_from(bodies: Array[Goo2D], radius: float, ring_tuning: Dictionary,
 	tween.set_parallel()
 	tween.tween_property(self, "target_area", float(tuning["target_area"]), float(tuning["inflate_time"]))
 	tween.tween_property(self, "rest_blend", 1.0, float(tuning["inflate_time"]))
+	_follow_field()
 	_update_skin()
 
 ## Builds this body as one piece of a split ring: beads evenly spaced around the
@@ -685,6 +686,7 @@ func build_from_loop(points: PackedVector2Array, velocities: PackedVector2Array,
 	tween.set_parallel()
 	tween.tween_property(self, "target_area", float(tuning["target_area"]), float(tuning["inflate_time"]))
 	tween.tween_property(self, "rest_blend", 1.0, float(tuning["inflate_time"]))
+	_follow_field()
 	_update_skin()
 
 ## `points` (a closed bead loop) with every two beads more than two apart
@@ -1475,6 +1477,10 @@ func inherit_look(from: Goo2D, from_center: Vector2) -> void:
 	if _count == 0:
 		return
 	_goo.inherit(from._goo, from_center, center(), from.ring_rotation(), ring_rotation())
+	# The field it took over is where this ring's material starts from.
+	_field_refs.clear()
+	if _field_following or _goo.field_matrix() != Transform2D.IDENTITY:
+		_follow_field()
 
 # The skin: the kernel's skin outline of the beads (skin_pieces(), rebuilt
 # every physics frame the ring moved), in the Skin node's space: one polygon,
@@ -1499,17 +1505,175 @@ func _update_skin(delta: float = 0.0) -> void:
 			var sizes: PackedInt32Array = _kernel.skin_piece_sizes(_key)
 			_skin.polygons = skin_piece_indices(sizes) if sizes.size() > 1 else []
 		_shader_points = _kernel.shader_points(_key)
-		_goo.set_rotation(ring_rotation())
+		var turn := ring_rotation()
+		_goo.set_rotation(turn)
+		if _field_following:
+			_measure_field(turn, delta)
 		_goo.update_padded(_shader_points, mini(_count, GooSkin.MAX_POINTS), center(),
 			sqrt(target_area / PI), average_velocity(), delta)
 	else:
-		# The outline did not change: only the motion uniforms.
+		# The outline did not change: only the motion uniforms (and the field,
+		# while it follows the beads: they may have moved all the same).
+		if _field_following:
+			var turn := ring_rotation()
+			_goo.set_rotation(turn)
+			_measure_field(turn, delta)
 		_goo.update_motion(center(), sqrt(target_area / PI), average_velocity(), delta)
 	_skin_resting = false
 	if settled and _goo.smoothed_velocity().length_squared() <= SKIN_REST_SPEED * SKIN_REST_SPEED:
 		_goo.stop()
 		_skin_resting = true
 		_skin_rest_area = target_area
+
+# ---- The skin's field following the material ----
+#
+# The bubble field (and a two-tone division) is fixed in the rest space it was
+# made in. While the body's rest outline changes (a resize, a rest deformation,
+# a merged or cut ring's inflate) its material moves in its rest space, and the
+# field must move with it: each skin update the ring measures how (the affine
+# map that best carries where each bead's piece of the outline sits in the
+# field, its reference, to where it is now in the rest space, about their
+# means: least squares, one pass over the beads) and hands it to the skin
+# (GooSkin.set_field_matrix()). Measured rather than taken from the resize's
+# and deformation's numbers, because the beads lag them (a ring easing 30 ->
+# 80 px in a second is about a tenth smaller than its eased rest outline; a
+# squash pulsed once a second lags it by a few px). The outline is measured
+# (each bead pushed out a bead radius along its normal), not the bead centres,
+# which move against the goo at a re-ring (a ring of more beads has smaller
+# beads, its centres further out). A bead's reference is its outline point's
+# place in the field when the following began; at a re-ring the new beads' are
+# read off the old outline's places where each new bead sits along it (on the
+# smooth curve through them, _refs_along()), so nothing jumps. The
+# following stops FIELD_SETTLE_TIME after the outline last changed, the field
+# kept as it is then; a body that never changes its rest outline is never
+# measured and keeps the identity.
+
+## Seconds after a body's rest outline last changed (a resize's ease, a rest
+## deformation, an inflate) that its skin's field goes on following its beads,
+## while they settle (a ring released from a squash rings down for about a
+## second); then the field is kept as it is.
+const FIELD_SETTLE_TIME: float = 1.0
+
+# True while the field follows the beads; the seconds the rest outline has been
+# still; each bead's place in the field's rest space, about their mean (empty:
+# read again from the field on the next measure).
+var _field_following: bool = false
+var _field_still: float = 0.0
+var _field_refs: PackedVector2Array = PackedVector2Array()
+
+# The rest outline changes: the field follows the beads from now on, from
+# where they are now (before the change moves them: the pressure takes a new
+# area within a step or two).
+func _follow_field() -> void:
+	_field_following = true
+	_field_still = 0.0
+	if _field_refs.size() != _count:
+		_capture_field_refs(ring_rotation(), _bead_radius)
+
+# Each bead's outline point's place in the field now (the ring turned `turn`
+# from its rest pose, its beads of radius `bead`): its references from here on.
+func _capture_field_refs(turn: float, bead: float) -> void:
+	_field_refs = _field_places(_field_outline(bead), turn)
+
+# The places in the skin's field, about their mean, of the global `points` (an
+# outline of this ring turned `turn` from its rest pose).
+func _field_places(points: PackedVector2Array, turn: float) -> PackedVector2Array:
+	var count := points.size()
+	var places := PackedVector2Array()
+	places.resize(count)
+	if count == 0:
+		return places
+	var mean := Vector2.ZERO
+	for point: Vector2 in points:
+		mean += point
+	mean /= count
+	var back := _goo.field_matrix().affine_inverse()
+	for i: int in count:
+		places[i] = back.basis_xform((points[i] - mean).rotated(-turn))
+	return places
+
+# The places in the field of beads `placed` (global) put on the old bead loop
+# `old_loop` (global), whose outline points' places are `old_places`: each
+# where it sits along the old loop (its nearest edge, and how far along it),
+# on the Catmull-Rom curve through the old places; about their mean.
+static func _refs_along(old_loop: PackedVector2Array, old_places: PackedVector2Array,
+		placed: PackedVector2Array) -> PackedVector2Array:
+	var count := old_loop.size()
+	var refs := PackedVector2Array()
+	refs.resize(placed.size())
+	if count < 3 or old_places.size() != count:
+		return PackedVector2Array()
+	var mean := Vector2.ZERO
+	for k: int in placed.size():
+		var best := INF
+		var edge := 0
+		var along := 0.0
+		for j: int in count:
+			var a := old_loop[j]
+			var ab := old_loop[(j + 1) % count] - a
+			var t := clampf((placed[k] - a).dot(ab) / maxf(ab.length_squared(), 0.000001), 0.0, 1.0)
+			var d := placed[k].distance_squared_to(a + ab * t)
+			if d < best:
+				best = d
+				edge = j
+				along = t
+		var p0 := old_places[(edge + count - 1) % count]
+		var p1 := old_places[edge]
+		var p2 := old_places[(edge + 1) % count]
+		var p3 := old_places[(edge + 2) % count]
+		var t2 := along * along
+		var t3 := t2 * along
+		refs[k] = 0.5 * (2.0 * p1 + (p2 - p0) * along + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2
+			+ (3.0 * p1 - p0 - 3.0 * p2 + p3) * t3)
+		mean += refs[k]
+	mean /= placed.size()
+	for k: int in refs.size():
+		refs[k] -= mean
+	return refs
+
+# The collision outline the field is measured on: each bead pushed out `bead`
+# px (its radius) along its normal (the mean of its two edges' normals).
+func _field_outline(bead: float) -> PackedVector2Array:
+	return _outline_of(_frame_points(), bead)
+
+# The bead loop `points` pushed out `bead` px as _field_outline() does.
+static func _outline_of(points: PackedVector2Array, bead: float) -> PackedVector2Array:
+	var count := points.size()
+	if count < 3:
+		return points
+	var normals := GooLoop.edge_normals(points)
+	var outline := PackedVector2Array()
+	outline.resize(count)
+	for i: int in count:
+		outline[i] = points[i] + (normals[(i + count - 1) % count].normalized() + normals[i].normalized()).normalized() \
+			* bead
+	return outline
+
+# One measure of the field (see above), the ring turned `turn` from its rest
+# pose, `delta` seconds after the last.
+func _measure_field(turn: float, delta: float) -> void:
+	var points := _field_outline(_bead_radius)
+	var count := points.size()
+	if count < 3:
+		return
+	if _field_refs.size() != count:
+		_capture_field_refs(turn, _bead_radius)
+	else:
+		# In the rest frame (turned back by `turn`): GooLoop.affine_fit() takes
+		# both about their means.
+		var here := PackedVector2Array()
+		here.resize(count)
+		for i: int in count:
+			here[i] = points[i].rotated(-turn)
+		_goo.set_field_matrix(GooLoop.affine_fit(_field_refs, here))
+	var inflating := _inflate_tween != null and _inflate_tween.is_valid() and _inflate_tween.is_running()
+	if _resizing or inflating or rest_blend < 1.0:
+		_field_still = 0.0
+	else:
+		_field_still += delta
+		if _field_still >= FIELD_SETTLE_TIME:
+			_field_following = false
+			_field_refs.clear()
 
 ## The skin of a CCW bead loop `points` whose beads have radius `bead_radius`,
 ## in the loop's space, as polygons Polygon2D can draw (ones
@@ -1999,6 +2163,9 @@ func _area_lag() -> float:
 # ring_rotation() and a cut fit), and with `scaled` a polygon's `shape` its
 # outline at the eased radius.
 func _push_rest(lag: float, scaled: bool) -> void:
+	# The field follows from where the beads are now, before the new rest (and
+	# bead radius) moves them.
+	_follow_field()
 	var rest := _deformed_rest()
 	var bead := _deformed_bead_radius()
 	var factor := _size_now / _base_radius
@@ -2114,6 +2281,10 @@ func _rering(at_radius: float, goal: int) -> bool:
 		pose.append(centre + point.rotated(turn))
 	var placed := GooLoop.place_like(loop, velocities, pose)
 	var remaining := (1.0 - _size_progress()) * _size_time if _resizing else 0.0
+	# The old outline's places in the skin's field, for the new beads' (below).
+	var old_field := PackedVector2Array()
+	if _field_following or _goo.field_matrix() != Transform2D.IDENTITY:
+		old_field = _field_places(_outline_of(old_points, _bead_radius), turn)
 	_unregister_ring()
 	_configure(ring_tuning)
 	if not sized.is_round():
@@ -2134,6 +2305,14 @@ func _rering(at_radius: float, goal: int) -> bool:
 	rest_blend = 0.0
 	_blend_rate = 1.0 / maxf(float(ring_tuning.get("inflate_time", GooTuning.INFLATE_TIME)), 0.001)
 	_register_ring(_points)
+	# The new beads' places in the skin's field: where they sit along the old
+	# outline, on the smooth curve through its points' places (the new beads
+	# settle onto that curve, not onto the old loop's chords they are placed
+	# on: the goo neither grew nor shrank).
+	_field_refs.clear()
+	if not old_field.is_empty():
+		_field_following = true
+		_field_refs = _refs_along(old_points, old_field, _points)
 	_lag_from = _area_lag()
 	_push_rest(_lag_from, true)
 	_guard_splits()
