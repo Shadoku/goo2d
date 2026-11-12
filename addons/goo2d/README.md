@@ -422,6 +422,23 @@ Dependencies run downward only: `GooWorld2D` → `Goo2D` → (`GooTuning`, `GooS
 takes a shape, `cut_ring()` tunes its pieces). Nothing in the addon knows about the demo's arena,
 blades, dropper or input.
 
+## The colony (experimental)
+
+A second solver beside `GooKernel`, for creatures made of many cells (the colony plan;
+`docs/colony-spike.md`, `docs/colony-adhesion.md` in the addon's repository). It shares only
+the ring math with the kernel and does not collide with `GooWorld2D` bodies. Its cells are
+not nodes: a `GooColony` (RefCounted, Rust, `native/src/colony.rs`) holds creatures, each a
+set of ring cells and core cells with its own storage, stepped on several threads with the
+same result as on one. A creature's cells stick where they touch (adhesion): a ring bead
+within the capture gap of another cell's skin in the same creature sticks to it, held at
+zero gap; anchored walls also hold it at its place along the other skin (creeping), sticky
+walls slide; a wall pulled past the break force parts. A type table and a script hook
+decide which pairs may join; joined and parted events come out after each step.
+`goo_colony_sim.gd` (`GooColonySim`, RefCounted) is the thin GDScript layer: it sets the
+colony up at `GooTuning.unit`, asks `may_adhere(creature, a, b)` about each first touch on
+the main thread, and emits `cells_joined` / `cells_parted`. Surface tension, exposure, walls,
+links, grabs and a look are later milestones; until then it is for tools and tests.
+
 ## Tuning knobs, by what you want to change
 
 Every constant has a `##` doc comment next to it saying what it does and, where it was measured,
