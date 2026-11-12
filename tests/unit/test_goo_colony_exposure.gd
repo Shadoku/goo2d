@@ -685,12 +685,40 @@ func test_a_wall_anchored_on_a_core_turns_it() -> void:
 	assert_lt(results[0], 0.01, "a sticky wall cannot turn the core")
 	assert_gt(results[1], 0.2, "an anchored one does")
 
+# ---- Kept candidates ----
+
+func test_a_swimming_turning_creature_keeps_its_candidate_list() -> void:
+	# One creature of 37 pushed along a circle (it turns all the time): with reuse_pairs
+	# its own candidates are built again only now and then, and it stays as sound as with a
+	# fresh search every frame.
+	var results: Array = []
+	for reuse: bool in [false, true]:
+		var sim := GooColonySim.new(GooColonySim.EXPOSURE_OPTIONS.merged({ "reuse_pairs": reuse, "pair_skin": 4.0 }))
+		var k := sim.add_creature(_hex(3))
+		var builds := 0
+		var worst := { "area_min": INF, "inverted": 0.0 }
+		for f: int in 180:
+			sim.colony.push_creature(k, Vector2.from_angle(f * 0.05) * 250.0)
+			sim.step(DELTA)
+			builds += sim.colony.stats()["pair_builds"]
+			var h := sim.colony.health()
+			worst["area_min"] = minf(worst["area_min"], h["area_min"])
+			worst["inverted"] = maxf(worst["inverted"], h["inverted"])
+		results.append([builds, worst, sim.colony.creature_velocity(k).length()])
+		print("    reuse %s: candidates built %d times in 180 frames; area down to %.2f, %d inside out; speed %.0f px/s" % [
+			reuse, builds, worst["area_min"], int(worst["inverted"]), results[-1][2]])
+	assert_lt(results[1][0], 60, "the list is kept most frames")
+	assert_eq(results[1][1]["inverted"], 0.0)
+	assert_almost_eq(results[1][1]["area_min"], results[0][1]["area_min"], 0.05, "as sound as searching afresh")
+	assert_almost_eq(results[1][2], results[0][2], 20.0, "and it swims alike")
+
 # ---- Determinism ----
 
 func _game(threads: int) -> GooColonySim:
 	var options := GooColonySim.EXPOSURE_OPTIONS.duplicate()
 	options.merge(GooColonySim.DRAG_OPTIONS)
 	options["threads"] = threads
+	options["reuse_pairs"] = true
 	var sim := GooColonySim.new(options)
 	var rng := RandomNumberGenerator.new()
 	rng.seed = 20261112
@@ -730,7 +758,7 @@ func test_threaded_step_equals_serial_with_exposure_cores_and_drag() -> void:
 		var s := serial.colony.stats()
 		switches += s["to_core"] + s["to_ring"]
 		runs += s["exposure_runs"]
-	print("    240 frames, 6 clusters with exposure, auto, compliant and anchored cores and per-cell water drag: %d switches, %d exposure passes, %d events" % [switches, runs, events_a.size() / 4])
+	print("    240 frames, 6 clusters with exposure, auto, compliant and anchored cores, per-cell water drag and kept candidates: %d switches, %d exposure passes, %d events" % [switches, runs, events_a.size() / 4])
 	assert_gt(switches, 0, "cells switched along the way")
 	assert_eq(events_a, events_b, "the same events in the same order")
 	for c: int in serial.colony.creature_count():

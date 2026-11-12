@@ -1033,7 +1033,8 @@ impl GooColony {
     /// (the bead grid's cell over the one its reach needs), "intra_contacts" (bool:
     /// contacts between different cells of one creature), "core_contacts" (bool: with
     /// intra_contacts off, a creature's cores still collide with its beads and cores),
-    /// "slop", "bond_scale"; adhesion's (docs/colony-adhesion.md): "adhesion" (bool),
+    /// "slop", "bond_scale", "reuse_pairs" (bool: a creature's own candidates kept across
+    /// frames), "pair_skin" (px); adhesion's (docs/colony-adhesion.md): "adhesion" (bool),
     /// "capture" (px), "capture_every" (frames), "join_reach" (px), "stick_scale", "anchor_scale", "creep" (/s),
     /// "break_force", "load_time" (s), "break_rest" (s), "ask" (bool: first touches wait for answer()), "capture_paused"
     /// (bool, the whole colony), "core_anchors" (bool: a bead on a core's rim anchored
@@ -1061,6 +1062,8 @@ impl GooColony {
                 "core_contacts" => o.core_contacts = value.try_to::<bool>().unwrap_or(number != 0.0),
                 "slop" => o.slop = number as f32,
                 "bond_scale" => o.bond_scale = number as f32,
+                "reuse_pairs" => o.reuse_pairs = value.try_to::<bool>().unwrap_or(number != 0.0),
+                "pair_skin" => o.pair_skin = (number as f32).max(0.0),
                 "adhesion" => o.ad.enabled = value.try_to::<bool>().unwrap_or(number != 0.0),
                 "capture" => o.ad.capture = (number as f32).max(0.0),
                 "capture_every" => o.ad.capture_every = (number as u32).max(1),
@@ -1169,6 +1172,7 @@ impl GooColony {
         put(&mut d, "total_us", s.total_us as i64);
         put(&mut d, "forces_us", s.forces_us as i64);
         put(&mut d, "pairs_us", s.pairs_us as i64);
+        put(&mut d, "own_pairs_us", s.own_pairs_us as i64);
         put(&mut d, "solve_us", s.solve_us as i64);
         put(&mut d, "cross_us", s.cross_us as i64);
         put(&mut d, "vel_us", s.vel_us as i64);
@@ -1192,6 +1196,7 @@ impl GooColony {
         put(&mut d, "enclosed", s.enclosed as i64);
         put(&mut d, "pockets", s.pockets as i64);
         put(&mut d, "broken_runs", s.broken_runs as i64);
+        put(&mut d, "pair_builds", s.pair_builds as i64);
         put(&mut d, "to_core", s.to_core as i64);
         put(&mut d, "to_ring", s.to_ring as i64);
         put(&mut d, "cross_skipped", s.cross_skipped as i64);

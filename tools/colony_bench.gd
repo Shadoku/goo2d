@@ -39,6 +39,8 @@ extends SceneTree
 ##   --core-anchors=on|off        beads anchored on cores' rims
 ##   --exposure-every=F --exposure-hot=F   the exposure pass's safety net (every F frames,
 ##                                30) and how long it runs every frame after a parting (6)
+##   --reuse=on|off --skin=PX     keep each creature's own contact candidates across frames,
+##                                built with PX of margin (3) and filtered every frame
 ##   --m2                         all of milestone 2 at once: GooColonySim.EXPOSURE_OPTIONS
 ##   --water-drag=on|off          the game's water drag on exposed edges, in the kernel
 ##                                (GooColonySim.DRAG_OPTIONS); the linear damping --drag
@@ -102,6 +104,8 @@ var _core_anchors: bool = false
 var _water_drag: bool = false
 var _water: String = "uniform"
 var _exp_every_hot := Vector2i(30, 6)
+var _reuse: bool = false
+var _skin: float = 3.0
 var _sleep: float = 0.0
 var _coarse: float = 0.0
 var _frames: int = 300
@@ -187,6 +191,8 @@ func _initialize() -> void:
 		elif arg.begins_with("--water-drag="): _water_drag = value == "on"
 		elif arg.begins_with("--water="): _water = value
 		elif arg.begins_with("--exposure-every="): _exp_every_hot.x = int(value)
+		elif arg.begins_with("--reuse="): _reuse = value == "on"
+		elif arg.begins_with("--skin="): _skin = float(value)
 		elif arg.begins_with("--exposure-hot="): _exp_every_hot.y = int(value)
 		elif arg.begins_with("--sleep="): _sleep = float(value)
 		elif arg.begins_with("--coarse="): _coarse = float(value)
@@ -536,7 +542,8 @@ func _cell_floats(at: Vector2, r: float, core: bool, color: Color) -> PackedFloa
 func _build_colony(design: Array[Vector3], kinds: PackedByteArray, starts: Array[Transform2D]) -> void:
 	_colony = GooColony.new()
 	_colony.set_options({ "threads": _threads, "substeps": _substeps, "cell_scale": _cell_scale,
-		"intra_contacts": _intra, "core_contacts": _core_contacts, "bond_scale": _bond_scale, "max_speed": GooTuning.MAX_BEAD_SPEED * UNIT })
+		"intra_contacts": _intra, "core_contacts": _core_contacts, "bond_scale": _bond_scale, "max_speed": GooTuning.MAX_BEAD_SPEED * UNIT,
+		"reuse_pairs": _reuse, "pair_skin": _skin })
 	if _hold == "adhesion":
 		_colony.set_options({ "adhesion": true,
 			"capture": (_capture if _capture > 0.0 else GooColonySim.CAPTURE) * UNIT,
@@ -892,7 +899,7 @@ func _on_physics(first: bool, delta: float) -> void:
 			_sample("settle", s["settle_us"])
 			_sample("sticks", s["sticks"], false)
 			_sample("broken", s["broken"], false)
-			for key: String in ["forces_us", "pairs_us", "solve_us", "cross_us", "vel_us", "rings_cpu_us", "intra_cpu_us"]:
+			for key: String in ["forces_us", "pairs_us", "own_pairs_us", "solve_us", "cross_us", "vel_us", "rings_cpu_us", "intra_cpu_us"]:
 				_sample(key.trim_suffix("_us"), s[key])
 			_sample("cross_hits", s["cross_hits"], false)
 			_sample("intra_pairs", s["intra_pairs"], false)
@@ -904,6 +911,7 @@ func _on_physics(first: bool, delta: float) -> void:
 			_sample("enclosed", s["enclosed"], false)
 			_sample("pockets", s["pockets"], false)
 			_sample("lost_runs", s["broken_runs"], false)
+			_sample("pair_builds", s["pair_builds"], false)
 			_switches += s["to_core"] + s["to_ring"]
 			_switch_frames[0] += s["to_core"]
 			_switch_frames[1] += s["to_ring"]
@@ -977,9 +985,9 @@ func _sample(key: String, value: float, usec: bool = true) -> void:
 
 func _report() -> void:
 	print("colony_bench: %d frames after %d warm-up (ms: min / median / p95)" % [_frames, _warmup])
-	var order := ["physics", "kernel", "holds", "capture", "settle", "exposure", "exp_runs", "drag_cpu", "skipped", "enclosed", "pockets", "lost_runs",
+	var order := ["physics", "kernel", "holds", "capture", "settle", "exposure", "exp_runs", "drag_cpu", "skipped", "enclosed", "pockets", "lost_runs", "pair_builds",
 		"sticks", "broken", "script", "push", "draw", "draw_rust", "rs_setup", "rs_render",
-		"forces", "pairs", "solve", "rings_cpu", "intra_cpu", "cross", "vel", "cross_hits", "intra_pairs", "cross_pairs",
+		"forces", "pairs", "own_pairs", "solve", "rings_cpu", "intra_cpu", "cross", "vel", "cross_hits", "intra_pairs", "cross_pairs",
 		"k_pairpass", "k_links", "k_solver", "k_rings", "k_skins"]
 	for key: String in order:
 		if not _samples.has(key):
@@ -1010,7 +1018,8 @@ func _report() -> void:
 	var line := "RESULT mode=%s n=%d m=%d shape=%s mix=%s beads=%d cores=%s intra=%s threads=%d substeps=%d draw=%s hold=%s" % [
 		_mode, _creatures, _cells, _shape, _mix, _beads, _cores and _mode == "colony", "cores" if _core_contacts else ("on" if _intra else "off"), _threads, _substeps, _draw,
 		_hold + ("/sticky" if _sticky else "")]
-	line += " exposure=%s auto=%s skip=%d contact=%.2f anchors=%s water_drag=%s water=%s" % [_exposure, _auto_cores, _skip, _core_contact, _core_anchors, _water_drag, _water]
+	line += " exposure=%s auto=%s skip=%d contact=%.2f anchors=%s water_drag=%s water=%s reuse=%s" % [_exposure, _auto_cores, _skip, _core_contact, _core_anchors, _water_drag, _water,
+		("%.1f" % _skin) if _reuse else "off"]
 	for key: String in ["physics", "kernel", "holds", "exposure", "drag_cpu", "pairs", "cross", "script", "draw", "rs_setup"]:
 		if _samples.has(key):
 			var list: PackedFloat64Array = _samples[key]

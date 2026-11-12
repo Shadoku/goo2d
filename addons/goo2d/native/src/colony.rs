@@ -388,6 +388,18 @@ pub struct Creature {
     xcc: Vec<(u32, u32)>,
     bc: Vec<(u32, u32)>,
     cc: Vec<(u32, u32)>,
+    // The candidate list kept across frames (Options::reuse_pairs): its pairs, the
+    // positions and mean it was built at, the capture extra it covers, whether it is
+    // valid, and how many times it was built.
+    vbb: Vec<(u32, u32)>,
+    vbc: Vec<(u32, u32)>,
+    vcc: Vec<(u32, u32)>,
+    vpos0: Vec<Vector2>,
+    vcpos0: Vec<Vector2>,
+    vmean0: Vector2,
+    vextra: f32,
+    vvalid: bool,
+    pub vbuilds: usize,
     // Each bead's and core's reach this step against the creature's mean motion, and in
     // absolute terms; the box of every particle grown by its absolute reach.
     reach: Vec<f32>,
@@ -513,6 +525,11 @@ pub struct Options {
     pub slop: f32,
     /// Bond stiffness as a multiple of the cells' skin stiffness.
     pub bond_scale: f32,
+    /// Keep each creature's own contact candidates across frames, built with `pair_skin`
+    /// px of margin and filtered each frame (milestone 2's saving; off: searched afresh
+    /// every frame, as before).
+    pub reuse_pairs: bool,
+    pub pair_skin: f32,
     pub ad: Adhesion,
     pub ex: Exposure,
     pub cores: Cores,
@@ -531,6 +548,8 @@ impl Default for Options {
             core_contacts: false,
             slop: 0.5,
             bond_scale: 1.0,
+            reuse_pairs: false,
+            pair_skin: 3.0,
             ad: Adhesion::default(),
             ex: Exposure::default(),
             cores: Cores::default(),
@@ -545,6 +564,8 @@ pub struct Stats {
     pub total_us: u64,
     pub forces_us: u64,
     pub pairs_us: u64,
+    /// Of pairs_us: the candidates within each creature (the rest is between creatures).
+    pub own_pairs_us: u64,
     /// The parallel region of each substep (prediction, rings, bonds, own contacts).
     pub solve_us: u64,
     pub cross_us: u64,
@@ -579,6 +600,8 @@ pub struct Stats {
     pub pockets: usize,
     /// Beads exposed only because their run found no loop (should stay near 0).
     pub broken_runs: usize,
+    /// Creatures whose kept candidate list was built again this step (reuse_pairs).
+    pub pair_builds: usize,
     pub to_core: usize,
     pub to_ring: usize,
     pub cross_skipped: usize,
@@ -594,6 +617,7 @@ pub struct Colony {
     /// Pairs of creatures (a < b) that met faster than Exposure::skip_speed: until when
     /// they collide whole.
     fast_until: BTreeMap<(u32, u32), u64>,
+    own_pairs_us: u64,
     frame: u64,
     pub stats: Stats,
 }
@@ -608,6 +632,7 @@ impl Default for Colony {
             cross: Vec::new(),
             cross_skipped: 0,
             fast_until: BTreeMap::new(),
+            own_pairs_us: 0,
             frame: 0,
             stats: Stats::default(),
         }
@@ -746,6 +771,7 @@ impl Creature {
         self.bonded.extend(std::iter::repeat(0u8).take(n));
         self.stuck.extend(std::iter::repeat(0u32).take(n));
         self.exposed.extend(std::iter::repeat(1u8).take(n));
+        self.vvalid = false;
         self.rings.push(CRing { cell, start, n, rest, rest_edges, rest_bend, w, open: n as u32 });
         self.cells[cell].kind = Kind::Ring(idx);
         idx
@@ -764,6 +790,7 @@ impl Creature {
         self.cdamp.push(t.linear_damp);
         self.ccell.push(cell as u32);
         self.cexposed.push(1);
+        self.vvalid = false;
         self.crot.push(0.0);
         self.crot_prev.push(0.0);
         self.comega.push(0.0);
@@ -2106,6 +2133,31 @@ impl Creature {
         let common = self.push + opt.gravity;
         let active = self.active;
         let margin = |v: Vector2, a: Vector2| PAIR_SLACK * (len(v) * dt + 0.5 * len(a) * dt * dt) + PAIR_PAD;
+        // With the list kept across frames, motion is measured against the creature's
+        // rigid motion (its mean and its spin), plus what the spin moves two neighbours
+        // apart: a turning creature then keeps its list.
+        let (centre, spin, spin_pad) = if opt.reuse_pairs && active {
+            let mut c = Vector2::ZERO;
+            for &p in self.pos.iter().chain(self.cpos.iter()) {
+                c += p;
+            }
+            c = c / (n + nc).max(1) as f32;
+            let (mut l, mut inertia) = (0.0f32, 0.0f32);
+            for (p, v) in self.pos.iter().zip(&self.vel).chain(self.cpos.iter().zip(&self.cvel)) {
+                let d = *p - c;
+                l += cross(d, *v - mean);
+                inertia += len_sq(d);
+            }
+            let w = if inertia > 0.0 { l / inertia } else { 0.0 };
+            let rmax = self.r.iter().chain(self.cr.iter()).copied().fold(0.0f32, f32::max);
+            (c, w, PAIR_SLACK * w.abs() * (2.0 * rmax + opt.slop) * dt)
+        } else {
+            (Vector2::ZERO, 0.0, 0.0)
+        };
+        let rigid = |p: Vector2| {
+            let d = p - centre;
+            mean + Vector2::new(-d.y, d.x) * spin
+        };
         self.reach.clear();
         self.abs_reach.clear();
         self.creach.clear();
@@ -2113,7 +2165,7 @@ impl Creature {
         let mut bounds: Option<Rect> = None;
         for i in 0..n {
             let a = self.force[i] * self.w[i];
-            let (rel, abs) = if active { (margin(self.vel[i] - mean, a - common), margin(self.vel[i], a)) } else { (0.0, 0.0) };
+            let (rel, abs) = if active { (margin(self.vel[i] - rigid(self.pos[i]), a - common) + spin_pad, margin(self.vel[i], a)) } else { (0.0, 0.0) };
             self.reach.push(self.r[i] + rel);
             self.abs_reach.push(self.r[i] + abs);
             let q = self.r[i] + abs;
@@ -2122,7 +2174,7 @@ impl Creature {
         }
         for k in 0..nc {
             let a = self.cforce[k] * self.cw[k];
-            let (rel, abs) = if active { (margin(self.cvel[k] - mean, a - common), margin(self.cvel[k], a)) } else { (0.0, 0.0) };
+            let (rel, abs) = if active { (margin(self.cvel[k] - rigid(self.cpos[k]), a - common) + spin_pad, margin(self.cvel[k], a)) } else { (0.0, 0.0) };
             self.creach.push(self.cr[k] + rel);
             self.cabs_reach.push(self.cr[k] + abs);
             let q = self.cr[k] + abs;
@@ -2147,6 +2199,19 @@ impl Creature {
         let extra = if capturing { opt.ad.capture + 0.3 * rmax } else { 0.0 };
         let slop = opt.slop + extra;
         let contact_slop = opt.slop;
+        if opt.reuse_pairs && !cores_only {
+            self.reuse_own_pairs(opt, slop, contact_slop, rmax);
+            return;
+        }
+        self.search_own_pairs(opt, slop, contact_slop, cores_only);
+    }
+
+    /// The candidates within the creature by its grids: bead pairs (not within two of
+    /// each other on one ring), bead and core, core and core, each within the sum of
+    /// their reaches and `slop` (into bb, bc, cc when within `contact_slop`, else into the
+    /// capture-only lists).
+    fn search_own_pairs(&mut self, opt: Options, slop: f32, contact_slop: f32, cores_only: bool) {
+        let (n, nc) = (self.pos.len(), self.cpos.len());
         let intra = true;
         let qmax = self.reach.iter().copied().fold(0.0f32, f32::max);
         let cell = ((2.0 * qmax + slop) * opt.cell_scale).max(1.0);
@@ -2259,6 +2324,125 @@ impl Creature {
         }
     }
 
+    /// The candidates within the creature from a list kept across frames (Options::
+    /// reuse_pairs): every pair within the particles' radii, `skin` px each and the slop
+    /// when it was built, filtered each frame into this frame's lists by their reaches now.
+    /// It is built again when a particle's motion margin plus how far it moved against the
+    /// creature's mean since could exceed the skin, after a switch, or when the capture
+    /// gap it was built with no longer covers this frame's. Deterministic: rebuilt and
+    /// filtered on the creature's own data, in a fixed order.
+    fn reuse_own_pairs(&mut self, opt: Options, slop: f32, contact_slop: f32, rmax: f32) {
+        let (n, nc) = (self.pos.len(), self.cpos.len());
+        let skin = opt.pair_skin;
+        // The extra the list must cover: capture's whenever adhesion is on.
+        let extra = if opt.ad.enabled { opt.ad.capture + 0.3 * rmax } else { 0.0 };
+        let mut mean = Vector2::ZERO;
+        for &p in self.pos.iter().chain(self.cpos.iter()) {
+            mean += p;
+        }
+        mean = mean / (n + nc).max(1) as f32;
+        let mut valid = self.vvalid && self.vextra >= extra && self.vpos0.len() == n && self.vcpos0.len() == nc;
+        if valid {
+            // How far each particle moved since the build against the creature's rigid
+            // motion (its mean's shift and its best-fit turn): pair distances change by at
+            // most the two particles' moves.
+            let (mut cs, mut dt) = (0.0f32, 0.0f32);
+            for (p, q) in self.pos.iter().zip(&self.vpos0).chain(self.cpos.iter().zip(&self.vcpos0)) {
+                let (a, b) = (*q - self.vmean0, *p - mean);
+                cs += cross(a, b);
+                dt += dot(a, b);
+            }
+            let norm_len = (cs * cs + dt * dt).sqrt();
+            let (c, sn) = if norm_len > 0.0 { (dt / norm_len, cs / norm_len) } else { (1.0, 0.0) };
+            let place = |q: Vector2| {
+                let a = q - self.vmean0;
+                mean + Vector2::new(a.x * c - a.y * sn, a.x * sn + a.y * c)
+            };
+            for i in 0..n {
+                if self.reach[i] - self.r[i] + len(self.pos[i] - place(self.vpos0[i])) > skin {
+                    valid = false;
+                    break;
+                }
+            }
+            if valid {
+                for k in 0..nc {
+                    if self.creach[k] - self.cr[k] + len(self.cpos[k] - place(self.vcpos0[k])) > skin {
+                        valid = false;
+                        break;
+                    }
+                }
+            }
+        }
+        if !valid {
+            // Built with reaches of radius + skin, everything within in one list.
+            let (reach, creach) = (std::mem::take(&mut self.reach), std::mem::take(&mut self.creach));
+            self.reach = (0..n).map(|i| self.r[i] + skin).collect();
+            self.creach = (0..nc).map(|k| self.cr[k] + skin).collect();
+            let master_slop = opt.slop + extra;
+            self.search_own_pairs(opt, master_slop, master_slop, false);
+            self.reach = reach;
+            self.creach = creach;
+            self.vbb = std::mem::take(&mut self.bb);
+            self.vbc = std::mem::take(&mut self.bc);
+            self.vcc = std::mem::take(&mut self.cc);
+            self.vpos0.clear();
+            self.vpos0.extend_from_slice(&self.pos);
+            self.vcpos0.clear();
+            self.vcpos0.extend_from_slice(&self.cpos);
+            self.vmean0 = mean;
+            self.vextra = extra;
+            self.vvalid = true;
+            self.vbuilds += 1;
+        }
+        // This frame's lists, by the reaches now.
+        self.bb.clear();
+        self.xbb.clear();
+        self.bc.clear();
+        self.xbc.clear();
+        self.cc.clear();
+        self.xcc.clear();
+        for &(i, j) in &self.vbb {
+            let (iu, ju) = (i as usize, j as usize);
+            let base = self.reach[iu] + self.reach[ju];
+            let dsq = dist_sq(self.pos[iu], self.pos[ju]);
+            let touch = base + contact_slop;
+            if dsq < touch * touch {
+                self.bb.push((i, j));
+            } else {
+                let within = base + slop;
+                if dsq < within * within {
+                    self.xbb.push((i, j));
+                }
+            }
+        }
+        for &(i, k) in &self.vbc {
+            let base = self.reach[i as usize] + self.creach[k as usize];
+            let dsq = dist_sq(self.pos[i as usize], self.cpos[k as usize]);
+            let touch = base + contact_slop;
+            if dsq < touch * touch {
+                self.bc.push((i, k));
+            } else {
+                let within = base + slop;
+                if dsq < within * within {
+                    self.xbc.push((i, k));
+                }
+            }
+        }
+        for &(a, b) in &self.vcc {
+            let base = self.creach[a as usize] + self.creach[b as usize];
+            let dsq = dist_sq(self.cpos[a as usize], self.cpos[b as usize]);
+            let touch = base + contact_slop;
+            if dsq < touch * touch {
+                self.cc.push((a, b));
+            } else {
+                let within = base + slop;
+                if dsq < within * within {
+                    self.xcc.push((a, b));
+                }
+            }
+        }
+    }
+
     // ---- Promotion and demotion ----
 
     /// Removes core `k`, renumbering the later ones.
@@ -2283,6 +2467,7 @@ impl Creature {
         self.cdamp.remove(k);
         self.ccell.remove(k);
         self.cexposed.remove(k);
+        self.vvalid = false;
         self.crot.remove(k);
         self.crot_prev.remove(k);
         self.comega.remove(k);
@@ -2331,6 +2516,7 @@ impl Creature {
         self.bead_ring.drain(range.clone());
         self.stuck.drain(range.clone());
         self.exposed.drain(range.clone());
+        self.vvalid = false;
         if self.drag_f.len() >= range.end {
             self.drag_f.drain(range.clone());
         }
@@ -2788,6 +2974,7 @@ impl Colony {
         let t = Instant::now();
         self.build_pairs();
         stats.pairs_us = t.elapsed().as_micros() as u64;
+        stats.own_pairs_us = self.own_pairs_us;
         let ad = opt.ad;
         if ad.enabled {
             let t = Instant::now();
@@ -2836,6 +3023,8 @@ impl Colony {
             stats.intra_cpu_us += c.ns_intra / 1000;
             stats.intra_pairs += c.bb.len() + c.bc.len() + c.cc.len();
             stats.drag_cpu_us += c.ns_drag / 1000;
+            stats.pair_builds += c.vbuilds;
+            c.vbuilds = 0;
             stats.exposure_runs += c.exp_runs;
             stats.exposure_us += c.ns_exposure / 1000;
             stats.to_core += c.to_core;
@@ -2865,7 +3054,9 @@ impl Colony {
     /// absolute terms) overlap, and only their particles inside the overlap.
     fn build_pairs(&mut self) {
         let opt = self.opt;
+        let t = Instant::now();
         self.for_each(|c| c.build_own_pairs(opt));
+        self.own_pairs_us = t.elapsed().as_micros() as u64;
         let mut overlapping = Vec::new();
         let skip = if opt.ex.enabled { opt.ex.skip } else { exposure::SKIP_NONE };
         let frame = self.frame;
@@ -3309,6 +3500,7 @@ mod tests {
             col.opt.cores.soft = true;
             col.opt.cores.contact = 0.3;
             col.opt.drag.enabled = true;
+            col.opt.reuse_pairs = true;
             for c in 0..6 {
                 let k = hex(&mut col, Vector2::new(c as f32 * 160.0, (c % 2) as f32 * 30.0), 0.0);
                 col.creatures[k].push = Vector2::new(if c % 2 == 0 { 900.0 } else { -900.0 }, 0.0);
