@@ -11,6 +11,8 @@ crate-type = ["cdylib"]
 
 [dependencies]
 godot = { version = "0.5", features = ["api-4-7"] }
+# GooColony's threaded step (src/colony.rs, the colony spike): pure Rust, no C toolchain.
+rayon = "1"
 
 [profile.release]
 opt-level = 3

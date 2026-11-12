@@ -14,6 +14,7 @@
 //! `tests/unit/test_goo_kernel.gd` to check against the GDScript reference
 //! implementations on random loops.
 
+mod colony;
 mod consts;
 mod forces;
 mod geom;
@@ -304,6 +305,9 @@ impl GooKernel {
         put(&mut d, "untangle_separation_speed", s.untangle_separation_speed);
         put(&mut d, "last_substeps", self.k.last_substeps as i64);
         put(&mut d, "last_capped", self.k.last_capped as i64);
+        put(&mut d, "last_step_usec", self.k.last_step_usec as i64);
+        let phases: Vec<i64> = self.k.last_phase_usec.iter().map(|&u| u as i64).collect();
+        put(&mut d, "last_phase_usec", PackedInt64Array::from(phases.as_slice()));
         d
     }
 
@@ -980,5 +984,318 @@ impl GooKernel {
     #[func]
     fn convex_hull(points: PackedVector2Array) -> PackedVector2Array {
         pv2(&geom::convex_hull(points.as_slice()))
+    }
+}
+
+
+/// The colony spike (docs/colony-spike.md, src/colony.rs): creatures of many goo cells
+/// that are not nodes, with core cells, bonds holding them together, threaded stepping
+/// and batch drawing. Used by tools/colony_bench.gd and its tests only.
+#[derive(GodotClass)]
+#[class(base = RefCounted, init)]
+pub struct GooColony {
+    c: colony::Colony,
+    attr: Vec<u8>,
+    base: Base<RefCounted>,
+}
+
+#[godot_api]
+impl GooColony {
+    /// Floats per cell add_creature() takes.
+    #[constant]
+    const CELL_STRIDE: i64 = colony::CELL_STRIDE as i64;
+    /// Floats per core in core_instances().
+    #[constant]
+    const INSTANCE_FLOATS: i64 = colony::INSTANCE_FLOATS as i64;
+    /// Rim vertices of a core's disc in the mesh.
+    #[constant]
+    const CORE_SIDES: i64 = colony::CORE_SIDES as i64;
+
+    /// Any of: "threads", "substeps", "gravity" (Vector2), "max_speed", "cell_scale"
+    /// (the bead grid's cell over the one its reach needs), "intra_contacts" (bool:
+    /// contacts between different cells of one creature), "core_contacts" (bool: with
+    /// intra_contacts off, a creature's cores still collide with its beads and cores),
+    /// "slop", "bond_scale".
+    #[func]
+    fn set_options(&mut self, options: VarDictionary) {
+        for (key, value) in options.iter_shared() {
+            let name = key.to_string();
+            let number = value.try_to::<f64>().or_else(|_| value.try_to::<i64>().map(|i| i as f64)).unwrap_or(0.0);
+            let o = &mut self.c.opt;
+            match name.as_str() {
+                "threads" => self.c.set_threads(number as usize),
+                "substeps" => o.substeps = (number as usize).max(1),
+                "gravity" => o.gravity = value.try_to::<Vector2>().unwrap_or(o.gravity),
+                "max_speed" => o.max_speed = number as f32,
+                "cell_scale" => o.cell_scale = (number as f32).max(0.1),
+                "intra_contacts" => o.intra_contacts = value.try_to::<bool>().unwrap_or(number != 0.0),
+                "core_contacts" => o.core_contacts = value.try_to::<bool>().unwrap_or(number != 0.0),
+                "slop" => o.slop = number as f32,
+                "bond_scale" => o.bond_scale = number as f32,
+                other => godot_error!("GooColony.set_options(): unknown option '{}'", other),
+            }
+        }
+    }
+
+    /// Adds a creature of `cells` (CELL_STRIDE floats each, see colony.rs); its index.
+    #[func]
+    fn add_creature(&mut self, cells: PackedFloat32Array) -> i64 {
+        self.c.add_creature(cells.as_slice()) as i64
+    }
+
+    /// Bonds creature `c`'s touching cells (within `capture` px); how many bonds.
+    #[func]
+    fn build_bonds(&mut self, c: i64, capture: f64) -> i64 {
+        let scale = self.c.opt.bond_scale;
+        match self.c.creatures.get_mut(c as usize) {
+            Some(cr) => cr.build_bonds(capture as f32, scale) as i64,
+            None => -1,
+        }
+    }
+
+    #[func]
+    fn creature_count(&self) -> i64 {
+        self.c.creatures.len() as i64
+    }
+
+    /// Sets creature `c`'s push (an acceleration, px/s², for every step until changed).
+    #[func]
+    fn push_creature(&mut self, c: i64, acceleration: Vector2) {
+        if let Some(cr) = self.c.creatures.get_mut(c as usize) {
+            cr.push = acceleration;
+        }
+    }
+
+    /// A sleeping creature is not stepped and does not move when touched.
+    #[func]
+    fn set_asleep(&mut self, c: i64, asleep: bool) {
+        if let Some(cr) = self.c.creatures.get_mut(c as usize) {
+            cr.asleep = asleep;
+        }
+    }
+
+    /// Creature `c` is stepped every `every` frames (on frames where frame + phase is a
+    /// multiple of it), each time over `every` frames' time.
+    #[func]
+    fn set_every(&mut self, c: i64, every: i64, phase: i64) {
+        if let Some(cr) = self.c.creatures.get_mut(c as usize) {
+            cr.every = every.max(1) as u32;
+            cr.phase = phase.max(0) as u32;
+        }
+    }
+
+    #[func]
+    fn step(&mut self, delta: f64) {
+        self.c.step(delta as f32);
+    }
+
+    /// The last step's timing (microseconds) and counts.
+    #[func]
+    fn stats(&self) -> VarDictionary {
+        let s = &self.c.stats;
+        let mut d = VarDictionary::new();
+        put(&mut d, "total_us", s.total_us as i64);
+        put(&mut d, "forces_us", s.forces_us as i64);
+        put(&mut d, "pairs_us", s.pairs_us as i64);
+        put(&mut d, "solve_us", s.solve_us as i64);
+        put(&mut d, "cross_us", s.cross_us as i64);
+        put(&mut d, "vel_us", s.vel_us as i64);
+        put(&mut d, "rings_cpu_us", s.rings_cpu_us as i64);
+        put(&mut d, "bonds_cpu_us", s.bonds_cpu_us as i64);
+        put(&mut d, "intra_cpu_us", s.intra_cpu_us as i64);
+        put(&mut d, "intra_pairs", s.intra_pairs as i64);
+        put(&mut d, "cross_pairs", s.cross_pairs as i64);
+        put(&mut d, "cross_hits", s.cross_hits as i64);
+        put(&mut d, "draw_build_us", s.draw_build_us as i64);
+        let (mut beads, mut cores, mut rings, mut bonds) = (0usize, 0usize, 0usize, 0usize);
+        for c in &self.c.creatures {
+            beads += c.bead_count();
+            cores += c.core_count();
+            rings += c.rings.len();
+            bonds += c.bonds.len();
+        }
+        put(&mut d, "beads", beads as i64);
+        put(&mut d, "cores", cores as i64);
+        put(&mut d, "rings", rings as i64);
+        put(&mut d, "bonds", bonds as i64);
+        d
+    }
+
+    /// colony.rs's health(): fastest, area_min, area_max, inverted, stretch, overlap.
+    #[func]
+    fn health(&self) -> VarDictionary {
+        let h = self.c.health();
+        let mut d = VarDictionary::new();
+        for (k, name) in ["fastest", "area_min", "area_max", "inverted", "stretch", "overlap"].iter().enumerate() {
+            put(&mut d, name, h[k] as f64);
+        }
+        d
+    }
+
+    #[func]
+    fn creature_center(&self, c: i64) -> Vector2 {
+        self.c.creatures.get(c as usize).map(|cr| cr.center()).unwrap_or(Vector2::ZERO)
+    }
+
+    #[func]
+    fn creature_velocity(&self, c: i64) -> Vector2 {
+        self.c.creatures.get(c as usize).map(|cr| cr.velocity()).unwrap_or(Vector2::ZERO)
+    }
+
+    /// Creature `c`'s particles: every bead (ring after ring), then every core.
+    #[func]
+    fn creature_points(&self, c: i64) -> PackedVector2Array {
+        match self.c.creatures.get(c as usize) {
+            Some(cr) => {
+                let mut v = cr.pos.clone();
+                v.extend_from_slice(&cr.cpos);
+                PackedVector2Array::from(v)
+            }
+            None => PackedVector2Array::new(),
+        }
+    }
+
+    /// [beads, cores, rings, bonds, topology version] of creature `c`.
+    #[func]
+    fn creature_info(&self, c: i64) -> PackedInt64Array {
+        match self.c.creatures.get(c as usize) {
+            Some(cr) => PackedInt64Array::from(
+                [cr.bead_count() as i64, cr.core_count() as i64, cr.rings.len() as i64, cr.bonds.len() as i64, cr.topology as i64]
+                    .as_slice(),
+            ),
+            None => PackedInt64Array::new(),
+        }
+    }
+
+    /// 0 ring, 1 core, -1 none.
+    #[func]
+    fn cell_kind(&self, c: i64, cell: i64) -> i64 {
+        match self.c.creatures.get(c as usize).and_then(|cr| cr.cells.get(cell as usize)) {
+            Some(x) => match x.kind {
+                colony::Kind::Ring(_) => 0,
+                colony::Kind::Core(_) => 1,
+            },
+            None => -1,
+        }
+    }
+
+    #[func]
+    fn cell_center(&self, c: i64, cell: i64) -> Vector2 {
+        match self.c.creatures.get(c as usize) {
+            Some(cr) if (cell as usize) < cr.cells.len() => cr.cell_center(cell as usize),
+            _ => Vector2::ZERO,
+        }
+    }
+
+    /// Core cell `cell` becomes a ring (see colony.rs); the deepest overlap left, or -1.
+    #[func]
+    fn promote(&mut self, c: i64, cell: i64, capture: f64) -> f64 {
+        let scale = self.c.opt.bond_scale;
+        match self.c.creatures.get_mut(c as usize) {
+            Some(cr) if (cell as usize) < cr.cells.len() => cr.promote(cell as usize, capture as f32, scale) as f64,
+            _ => -1.0,
+        }
+    }
+
+    /// Ring cell `cell` becomes a core; the deepest overlap it makes, or -1.
+    #[func]
+    fn demote(&mut self, c: i64, cell: i64, capture: f64) -> f64 {
+        let scale = self.c.opt.bond_scale;
+        match self.c.creatures.get_mut(c as usize) {
+            Some(cr) if (cell as usize) < cr.cells.len() => cr.demote(cell as usize, capture as f32, scale) as f64,
+            _ => -1.0,
+        }
+    }
+
+    /// Creature `c`'s mesh for RenderingServer.mesh_add_surface_from_arrays(): [vertices
+    /// (PackedVector2Array), colours, UVs, custom0 (PackedFloat32Array, 4 per vertex),
+    /// indices]. With `rings_only` the cores are left out (drawn as instances).
+    #[func]
+    fn mesh_arrays(&self, c: i64, rings_only: bool) -> VarArray {
+        let mut out = VarArray::new();
+        let Some(cr) = self.c.creatures.get(c as usize) else { return out };
+        let (colors, uvs, custom, indices) = cr.mesh_static(rings_only);
+        let verts = cr.positions(rings_only);
+        let cols: Vec<Color> = colors.iter().map(|c| Color::from_rgba(c[0], c[1], c[2], c[3])).collect();
+        let flat: Vec<f32> = custom.iter().flat_map(|x| x.iter().copied()).collect();
+        out.push(&PackedVector2Array::from(verts).to_variant());
+        out.push(&PackedColorArray::from(cols).to_variant());
+        out.push(&PackedVector2Array::from(uvs).to_variant());
+        out.push(&PackedFloat32Array::from(flat).to_variant());
+        out.push(&PackedInt32Array::from(indices).to_variant());
+        out
+    }
+
+    #[func]
+    fn vertex_count(&self, c: i64, rings_only: bool) -> i64 {
+        self.c.creatures.get(c as usize).map(|cr| cr.vertex_count(rings_only) as i64).unwrap_or(0)
+    }
+
+    /// Creature `c`'s vertex positions now, as the bytes of Godot's 2D vertex buffer
+    /// (for RenderingServer.mesh_surface_update_vertex_region()). Adds its build time
+    /// to stats()'s draw_build_us.
+    #[func]
+    fn mesh_positions(&mut self, c: i64, rings_only: bool) -> PackedByteArray {
+        let t = std::time::Instant::now();
+        let mut bytes = PackedByteArray::new();
+        if let Some(cr) = self.c.creatures.get(c as usize) {
+            bytes.resize(cr.vertex_count(rings_only) * 8);
+            cr.write_positions(rings_only, bytes.as_mut_slice());
+        }
+        self.c.stats.draw_build_us += t.elapsed().as_micros() as u64;
+        bytes
+    }
+
+    /// Every creature's positions in one buffer, creature after creature.
+    #[func]
+    fn all_mesh_positions(&mut self, rings_only: bool) -> PackedByteArray {
+        let t = std::time::Instant::now();
+        let total: usize = self.c.creatures.iter().map(|cr| cr.vertex_count(rings_only)).sum();
+        let mut bytes = PackedByteArray::new();
+        bytes.resize(total * 8);
+        let slice = bytes.as_mut_slice();
+        let mut o = 0;
+        for cr in &self.c.creatures {
+            let n = cr.vertex_count(rings_only) * 8;
+            cr.write_positions(rings_only, &mut slice[o..o + n]);
+            o += n;
+        }
+        self.c.stats.draw_build_us += t.elapsed().as_micros() as u64;
+        bytes
+    }
+
+    /// Creature `c`'s attribute buffer (colour of `color_bytes` 4 or 16, UV, custom0),
+    /// for RenderingServer.mesh_surface_update_attribute_region().
+    #[func]
+    fn mesh_attributes(&mut self, c: i64, rings_only: bool, color_bytes: i64) -> PackedByteArray {
+        let t = std::time::Instant::now();
+        let mut attr = std::mem::take(&mut self.attr);
+        if let Some(cr) = self.c.creatures.get(c as usize) {
+            cr.write_attributes(rings_only, color_bytes as usize, &mut attr);
+        }
+        let bytes = PackedByteArray::from(attr.as_slice());
+        self.attr = attr;
+        self.c.stats.draw_build_us += t.elapsed().as_micros() as u64;
+        bytes
+    }
+
+    /// Creature `c`'s cores as MultiMesh instance data (INSTANCE_FLOATS each: a 2D
+    /// transform, colour, custom data).
+    #[func]
+    fn core_instances(&mut self, c: i64) -> PackedFloat32Array {
+        let t = std::time::Instant::now();
+        let mut out = PackedFloat32Array::new();
+        if let Some(cr) = self.c.creatures.get(c as usize) {
+            out.resize(cr.core_count() * colony::INSTANCE_FLOATS);
+            cr.write_core_instances(out.as_mut_slice());
+        }
+        self.c.stats.draw_build_us += t.elapsed().as_micros() as u64;
+        out
+    }
+
+    /// Zeroes stats()'s draw_build_us (the bench calls it at each frame's start).
+    #[func]
+    fn reset_draw_clock(&mut self) {
+        self.c.stats.draw_build_us = 0;
     }
 }
