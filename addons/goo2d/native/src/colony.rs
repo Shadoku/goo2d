@@ -242,6 +242,12 @@ pub const CORE_SIDES: usize = 12;
 /// custom data (4), MultiMesh's layout with colours and custom data.
 pub const INSTANCE_FLOATS: usize = 16;
 const PAIR_SLACK: f32 = 1.5;
+pub const FROZEN_SELF_NONE: u8 = 0;
+pub const FROZEN_SELF_KEPT: u8 = 1;
+pub const FROZEN_SELF_FULL: u8 = 2;
+/// The kept list, searched again when a particle's motion could exceed its skin (a
+/// Verlet list, contacts only between retopologies).
+pub const FROZEN_SELF_VERLET: u8 = 3;
 const PAIR_PAD: f32 = 1.0;
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -420,6 +426,8 @@ pub struct Creature {
     mean_vel: Vector2,
     grid: Grid,
     cgrid: Grid,
+    dgrid: crate::grid::DenseGrid,
+    dcgrid: crate::grid::DenseGrid,
     /// The push for every step until changed: an acceleration, px/s².
     pub push: Vector2,
     pub asleep: bool,
@@ -518,6 +526,16 @@ pub struct Creature {
     core_ease: f32,
     ns_drag: u64,
     ns_exposure: u64,
+    /// Frozen topology: a retopology asked for, whether this frame is one, the CPU time of
+    /// the after-step pass, retopologies this step, the substep index.
+    pub retopo_req: bool,
+    retopo_now: bool,
+    ns_after: u64,
+    retopos: usize,
+    substep: u32,
+    ns_own: u64,
+    stick_every: u32,
+    fast_rings: bool,
     exp_runs: usize,
     to_core: usize,
     to_ring: usize,
@@ -560,6 +578,28 @@ pub struct Options {
     /// every frame, as before).
     pub reuse_pairs: bool,
     pub pair_skin: f32,
+    /// Frozen topology (explore-frozen): capture, the full break/settle pass, exposure
+    /// and switching and the own-candidate search run only on a creature's retopology
+    /// frames (requested, or every `retopo_every` frames staggered by creature).
+    pub frozen: bool,
+    /// 0: only when requested.
+    pub retopo_every: u32,
+    /// Between retopologies, a creature's own contacts: FROZEN_SELF_NONE (sticks alone),
+    /// FROZEN_SELF_KEPT (the list found at the last retopology, `pair_skin` px of margin,
+    /// filtered each frame), FROZEN_SELF_FULL (searched every frame as before).
+    pub frozen_self: u8,
+    /// Sticks may break between retopologies (else only at one).
+    pub frozen_breaks: bool,
+    /// Anchors creep between retopologies.
+    pub frozen_creep: bool,
+    /// Sticks solved every this many substeps (1: every one).
+    pub stick_every: u32,
+    /// The own-candidate search with grid cells of the usual reach (explore-frozen).
+    pub fast_search: bool,
+    /// The step's phases on a spinning team (step_spin()) instead of a fork per phase.
+    pub spin: bool,
+    /// The ring constraints without a modulo or a division per constraint.
+    pub fast_rings: bool,
     pub ad: Adhesion,
     pub ex: Exposure,
     pub cores: Cores,
@@ -581,6 +621,15 @@ impl Default for Options {
             bond_scale: 1.0,
             reuse_pairs: false,
             pair_skin: 3.0,
+            frozen: false,
+            retopo_every: 0,
+            frozen_self: FROZEN_SELF_KEPT,
+            frozen_breaks: false,
+            frozen_creep: true,
+            stick_every: 1,
+            fast_search: false,
+            spin: false,
+            fast_rings: false,
             ad: Adhesion::default(),
             ex: Exposure::default(),
             cores: Cores::default(),
@@ -642,6 +691,12 @@ pub struct Stats {
     pub cross_skipped: usize,
     /// Milestone 3: the surface tension (CPU, summed over creatures and substeps).
     pub tension_cpu_us: u64,
+    pub after_cpu_us: u64,
+    pub retopos: usize,
+    pub own_cpu_us: u64,
+    /// The CPU time of this step's retopologies (their creatures' own search, capture,
+    /// after-step and exposure passes).
+    pub retopo_cpu_us: u64,
 }
 
 pub struct Colony {
@@ -676,6 +731,41 @@ impl Default for Colony {
     }
 }
 
+/// kernel::distances() without the modulo per constraint (the wrap handled apart) and one
+/// reciprocal instead of a division per component (explore-frozen).
+#[inline]
+fn ring_distances(pos: &mut [Vector2], prev: &[Vector2], rest: &[f32], hop: usize, stiffness: f32, damping: f32, w: f32, h: f32) {
+    let n = pos.len();
+    if stiffness <= 0.0 || rest.len() != n || hop >= n {
+        return;
+    }
+    let alpha = 1.0 / stiffness;
+    let alpha_t = alpha / (h * h);
+    let gamma = alpha * damping / h;
+    let inv_denom = 1.0 / ((1.0 + gamma) * 2.0 * w + alpha_t);
+    let mut one = |i: usize, j: usize| {
+        let d = pos[j] - pos[i];
+        let lsq = d.x * d.x + d.y * d.y;
+        if lsq < 1e-12 {
+            return;
+        }
+        let length = lsq.sqrt();
+        let dir = d * (1.0 / length);
+        let c = length - rest[i];
+        let moving = dot(dir, (pos[j] - prev[j]) - (pos[i] - prev[i]));
+        let dl = (-c - gamma * moving) * inv_denom;
+        let corr = dir * (w * dl);
+        pos[i] -= corr;
+        pos[j] += corr;
+    };
+    for i in 0..n - hop {
+        one(i, i + hop);
+    }
+    for i in n - hop..n {
+        one(i, i + hop - n);
+    }
+}
+
 fn circle(center: Vector2, radius: f32, n: usize) -> Vec<Vector2> {
     (0..n)
         .map(|i| {
@@ -685,8 +775,21 @@ fn circle(center: Vector2, radius: f32, n: usize) -> Vec<Vector2> {
         .collect()
 }
 
-fn ns(since: Instant) -> u64 {
-    since.elapsed().as_nanos() as u64
+/// This thread's CPU time (robust to the machine being shared: a preempted thread does
+/// not count the time it waited).
+#[derive(Clone, Copy)]
+pub struct CpuClock(u64);
+impl CpuClock {
+    #[inline]
+    pub fn now() -> CpuClock {
+        let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
+        CpuClock(ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64)
+    }
+}
+
+fn ns(since: CpuClock) -> u64 {
+    CpuClock::now().0.saturating_sub(since.0)
 }
 
 /// Two distinct elements of a slice, mutably.
@@ -954,7 +1057,7 @@ impl Creature {
         self.core_frame(&opt.cores);
         self.anchored_on_cores = self.sticks.iter().any(|st| st.b_core && !st.a_core && st.mode == JOIN_ANCHORED);
         if opt.drag.enabled {
-            let t = Instant::now();
+            let t = CpuClock::now();
             self.apply_drag(&opt.drag, opt.ex.enabled);
             self.ns_drag += ns(t);
         }
@@ -1066,6 +1169,7 @@ impl Creature {
     /// kernel.rs's solve_ring() on each ring: skin and bending distances, shape matching,
     /// the stretch limit.
     fn solve_rings(&mut self) {
+        let fast_rings = self.fast_rings;
         let h = self.h;
         let h2 = h * h;
         for ring in &self.rings {
@@ -1077,8 +1181,13 @@ impl Creature {
             let pos = &mut self.pos[ring.start..ring.start + n];
             let prev = &self.prev[ring.start..ring.start + n];
             let w = ring.w;
-            distances(pos, prev, &ring.rest_edges, 1, t.skin_k, t.skin_d, w, h);
-            distances(pos, prev, &ring.rest_bend, 2, t.bend_k, t.bend_d, w, h);
+            if fast_rings {
+                ring_distances(pos, prev, &ring.rest_edges, 1, t.skin_k, t.skin_d, w, h);
+                ring_distances(pos, prev, &ring.rest_bend, 2, t.bend_k, t.bend_d, w, h);
+            } else {
+                distances(pos, prev, &ring.rest_edges, 1, t.skin_k, t.skin_d, w, h);
+                distances(pos, prev, &ring.rest_bend, 2, t.bend_k, t.bend_d, w, h);
+            }
             if t.shape_k > 0.0 {
                 let cc = centroid(pos);
                 let (mut cs, mut dt) = (0.0f32, 0.0f32);
@@ -1097,7 +1206,7 @@ impl Creature {
                 }
             }
             for i in 0..n {
-                let j = (i + 1) % n;
+                let j = if i + 1 == n { 0 } else { i + 1 };
                 let e = pos[j] - pos[i];
                 let length = len(e);
                 let limit = MAX_STRETCH as f32 * ring.rest_edges[i];
@@ -1218,28 +1327,28 @@ impl Creature {
         }
     }
 
-    fn substep_own(&mut self, opt: &Options) {
+    fn substep_own(&mut self, opt: &Options, stick_every: u32) {
         if !self.active {
             return;
         }
         if opt.tension.on() {
-            let t = Instant::now();
+            let t = CpuClock::now();
             self.apply_tension(&opt.tension);
             self.ns_tension += ns(t);
         }
         self.predict(&opt.cores);
-        let t = Instant::now();
+        let t = CpuClock::now();
         self.solve_rings();
         self.ns_rings += ns(t);
-        let t = Instant::now();
+        let t = CpuClock::now();
         self.solve_bonds();
         self.ns_bonds += ns(t);
-        if !self.sticks.is_empty() {
-            let t = Instant::now();
+        if !self.sticks.is_empty() && self.substep % stick_every == stick_every - 1 {
+            let t = CpuClock::now();
             self.solve_sticks();
             self.ns_sticks += ns(t);
         }
-        let t = Instant::now();
+        let t = CpuClock::now();
         self.solve_intra();
         self.ns_intra += ns(t);
     }
@@ -1605,7 +1714,9 @@ impl Creature {
     /// stick's bead also held at its place along the edge, more softly; a sticky one's
     /// place follows the bead (hopping to the next edge past an end).
     fn solve_sticks(&mut self) {
-        let inv_h2 = 1.0 / (self.h * self.h);
+        // Solved every stick_every substeps: the compliance over that span.
+        let he = self.h * self.stick_every.max(1) as f32;
+        let inv_h2 = 1.0 / (he * he);
         // Each core's turn as (cos, sin), once a substep (anchored sticks on its rim).
         if self.anchored_on_cores {
             self.crot_cs.clear();
@@ -1820,7 +1931,7 @@ impl Creature {
         let inv = 1.0 / substeps.max(1) as f32;
         let smooth = if ad.load_time > 0.0 { (self.dt / ad.load_time).min(1.0) } else { 1.0 };
         for st in self.sticks.iter_mut() {
-            st.load += (st.pull * inv - st.load) * smooth;
+            st.load += (st.pull * inv * self.stick_every.max(1) as f32 - st.load) * smooth;
             st.pull = 0.0;
         }
         let limit = ad.break_force;
@@ -2158,6 +2269,12 @@ impl Creature {
 
     /// This step's candidates within the creature (see Colony::build_pairs()).
     fn build_own_pairs(&mut self, opt: Options) {
+        let t = CpuClock::now();
+        self.build_own_pairs_inner(opt);
+        self.ns_own = ns(t);
+    }
+
+    fn build_own_pairs_inner(&mut self, opt: Options) {
         self.bb.clear();
         self.xbb.clear();
         self.xbc.clear();
@@ -2241,6 +2358,19 @@ impl Creature {
         let extra = if capturing { opt.ad.capture + 0.3 * rmax } else { 0.0 };
         let slop = opt.slop + extra;
         let contact_slop = opt.slop;
+        if opt.frozen && !cores_only {
+            if self.retopo_now {
+                self.reuse_own_pairs(opt, slop, contact_slop, rmax);
+                return;
+            }
+            match opt.frozen_self {
+                FROZEN_SELF_NONE => {}
+                FROZEN_SELF_KEPT => self.filter_kept_pairs(contact_slop),
+                FROZEN_SELF_VERLET => self.reuse_own_pairs_with(opt, contact_slop, contact_slop, 0.0),
+                _ => self.search_own_pairs(opt, contact_slop, contact_slop, false),
+            }
+            return;
+        }
         if opt.reuse_pairs && !cores_only {
             self.reuse_own_pairs(opt, slop, contact_slop, rmax);
             return;
@@ -2253,6 +2383,9 @@ impl Creature {
     /// their reaches and `slop` (into bb, bc, cc when within `contact_slop`, else into the
     /// capture-only lists).
     fn search_own_pairs(&mut self, opt: Options, slop: f32, contact_slop: f32, cores_only: bool) {
+        if opt.fast_search && !cores_only && self.search_own_pairs_fast(slop, contact_slop) {
+            return;
+        }
         let (n, nc) = (self.pos.len(), self.cpos.len());
         let intra = true;
         let qmax = self.reach.iter().copied().fold(0.0f32, f32::max);
@@ -2366,6 +2499,115 @@ impl Creature {
         }
     }
 
+    /// search_own_pairs() with grid cells sized by the usual reach, not the largest
+    /// (explore-frozen): one fast particle made every cell of its creature's grid huge.
+    /// A pair is found from the side with the larger reach (ties: the lower index), whose
+    /// span covers both reaches; a core faster than the cap finds its beads itself.
+    fn search_own_pairs_fast(&mut self, slop: f32, contact_slop: f32) -> bool {
+        let (n, nc) = (self.pos.len(), self.cpos.len());
+        let rmax = self.r.iter().copied().fold(0.0f32, f32::max);
+        let qmax = self.reach.iter().copied().fold(0.0f32, f32::max);
+        let qcap = qmax.min(1.5 * rmax + PAIR_PAD);
+        let cell = (2.0 * qcap + slop).max(1.0);
+        let mut grid = std::mem::take(&mut self.dgrid);
+        let mut cgrid = std::mem::take(&mut self.dcgrid);
+        let crmax = self.cr.iter().copied().fold(0.0f32, f32::max);
+        let cqmax = self.creach.iter().copied().fold(0.0f32, f32::max);
+        let ccap = cqmax.min(crmax + 2.0 * rmax + PAIR_PAD);
+        let ccell = (qcap + ccap + slop).max(2.0 * ccap + slop).max(1.0);
+        let ok = grid.build(&self.pos, cell, 0.0, 8 * n + 256) && cgrid.build(&self.cpos, ccell, 0.0, 8 * nc + 256);
+        if !ok {
+            self.dgrid = grid;
+            self.dcgrid = cgrid;
+            return false;
+        }
+        let (bb, xbb, bc, xbc, cc, xcc) = (&mut self.bb, &mut self.xbb, &mut self.bc, &mut self.xbc, &mut self.cc, &mut self.xcc);
+        let push = |list_t: &mut Vec<(u32, u32)>, list_x: &mut Vec<(u32, u32)>, a: u32, b: u32, dsq: f32, base: f32| {
+            let within = base + slop;
+            if dsq < within * within {
+                let touch = base + contact_slop;
+                if dsq < touch * touch {
+                    list_t.push((a, b));
+                } else {
+                    list_x.push((a, b));
+                }
+            }
+        };
+        let (pos, cpos, reach, creach, bead_ring, rings) = (&self.pos, &self.cpos, &self.reach, &self.creach, &self.bead_ring, &self.rings);
+        for li in 0..n {
+            let qi = reach[li];
+            let pi = pos[li];
+            let ra = bead_ring[li];
+            let span = ((2.0 * qi + slop) / cell).ceil().max(1.0) as i32;
+            let (cx, cy) = grid.cells[li];
+            for dy in -span..=span {
+                for kk in grid.row(cy + dy, cx - span, cx + span) {
+                    let lj = grid.items[kk] as usize;
+                    let qj = reach[lj];
+                    // Found from the side with the larger reach (ties: the lower index).
+                    if qj > qi || (qj == qi && lj <= li) {
+                        continue;
+                    }
+                    let rb = bead_ring[lj];
+                    if ra == rb {
+                        let ring = &rings[ra as usize];
+                        let hop = (li - ring.start).abs_diff(lj - ring.start);
+                        if hop.min(ring.n - hop) <= 2 {
+                            continue;
+                        }
+                    }
+                    let (a, b) = if li < lj { (li, lj) } else { (lj, li) };
+                    push(bb, xbb, a as u32, b as u32, dist_sq(pi, pos[lj]), qi + qj);
+                }
+            }
+            if nc == 0 {
+                continue;
+            }
+            let span = ((qi + ccap + slop) / ccell).ceil().max(1.0) as i32;
+            let (cx, cy) = cgrid.cell_of(pi);
+            for dy in -span..=span {
+                for kk in cgrid.row(cy + dy, cx - span, cx + span) {
+                    let lk = cgrid.items[kk] as usize;
+                    if creach[lk] > ccap {
+                        continue;
+                    }
+                    push(bc, xbc, li as u32, lk as u32, dist_sq(pi, cpos[lk]), qi + creach[lk]);
+                }
+            }
+        }
+        for lk in 0..nc {
+            let qk = creach[lk];
+            let pk = cpos[lk];
+            // A core faster than the cap: its beads, from its side.
+            if qk > ccap && n > 0 {
+                let span = ((qk + qmax + slop) / cell).ceil() as i32;
+                let (cx, cy) = grid.cell_of(pk);
+                for dy in -span..=span {
+                    for kk in grid.row(cy + dy, cx - span, cx + span) {
+                        let li = grid.items[kk] as usize;
+                        push(bc, xbc, li as u32, lk as u32, dist_sq(pos[li], pk), reach[li] + qk);
+                    }
+                }
+            }
+            let span = ((2.0 * qk + slop) / ccell).ceil().max(1.0) as i32;
+            let (cx, cy) = cgrid.cells[lk];
+            for dy in -span..=span {
+                for kk in cgrid.row(cy + dy, cx - span, cx + span) {
+                    let lj = cgrid.items[kk] as usize;
+                    let qj = creach[lj];
+                    if qj > qk || (qj == qk && lj <= lk) {
+                        continue;
+                    }
+                    let (a, b) = if lk < lj { (lk, lj) } else { (lj, lk) };
+                    push(cc, xcc, a as u32, b as u32, dist_sq(pk, cpos[lj]), qk + qj);
+                }
+            }
+        }
+        self.dgrid = grid;
+        self.dcgrid = cgrid;
+        true
+    }
+
     /// The candidates within the creature from a list kept across frames (Options::
     /// reuse_pairs): every pair within the particles' radii, `skin` px each and the slop
     /// when it was built, filtered each frame into this frame's lists by their reaches now.
@@ -2374,10 +2616,14 @@ impl Creature {
     /// gap it was built with no longer covers this frame's. Deterministic: rebuilt and
     /// filtered on the creature's own data, in a fixed order.
     fn reuse_own_pairs(&mut self, opt: Options, slop: f32, contact_slop: f32, rmax: f32) {
-        let (n, nc) = (self.pos.len(), self.cpos.len());
-        let skin = opt.pair_skin;
         // The extra the list must cover: capture's whenever adhesion is on.
         let extra = if opt.ad.enabled { opt.ad.capture + 0.3 * rmax } else { 0.0 };
+        self.reuse_own_pairs_with(opt, slop, contact_slop, extra);
+    }
+
+    fn reuse_own_pairs_with(&mut self, opt: Options, slop: f32, contact_slop: f32, extra: f32) {
+        let (n, nc) = (self.pos.len(), self.cpos.len());
+        let skin = opt.pair_skin;
         let mut mean = Vector2::ZERO;
         for &p in self.pos.iter().chain(self.cpos.iter()) {
             mean += p;
@@ -2483,6 +2729,92 @@ impl Creature {
                 }
             }
         }
+    }
+
+    /// Frozen topology: this frame's contact lists from the list kept at the last
+    /// retopology, by the reaches now (contacts only: nothing captures).
+    fn filter_kept_pairs(&mut self, contact_slop: f32) {
+        for &(i, j) in &self.vbb {
+            let (iu, ju) = (i as usize, j as usize);
+            let touch = self.reach[iu] + self.reach[ju] + contact_slop;
+            if dist_sq(self.pos[iu], self.pos[ju]) < touch * touch {
+                self.bb.push((i, j));
+            }
+        }
+        for &(i, k) in &self.vbc {
+            let touch = self.reach[i as usize] + self.creach[k as usize] + contact_slop;
+            if dist_sq(self.pos[i as usize], self.cpos[k as usize]) < touch * touch {
+                self.bc.push((i, k));
+            }
+        }
+        for &(a, b) in &self.vcc {
+            let touch = self.creach[a as usize] + self.creach[b as usize] + contact_slop;
+            if dist_sq(self.cpos[a as usize], self.cpos[b as usize]) < touch * touch {
+                self.cc.push((a, b));
+            }
+        }
+    }
+
+    /// Frozen topology, between retopologies: each stick's load; breaks (when
+    /// `frozen_breaks`) without settling pairs or events (the next retopology settles
+    /// them); the switched sticks' gaps eased; anchors creeping (when `frozen_creep`).
+    fn after_step_frozen(&mut self, ad: &Adhesion, opt: &Options, substeps: usize) -> usize {
+        if !self.active || self.sticks.is_empty() {
+            return 0;
+        }
+        let solves = (substeps.max(1) as u32 / opt.stick_every.max(1)).max(1);
+        let inv = 1.0 / solves as f32;
+        let smooth = if ad.load_time > 0.0 { (self.dt / ad.load_time).min(1.0) } else { 1.0 };
+        let mut sliding = false;
+        for st in self.sticks.iter_mut() {
+            st.load += (st.pull * inv - st.load) * smooth;
+            st.pull = 0.0;
+            sliding |= st.mode == JOIN_STICKY && !st.b_core;
+        }
+        let mut broken = 0;
+        if opt.frozen_breaks {
+            let limit = ad.break_force;
+            if self.sticks.iter().any(|st| st.load > limit) {
+                broken = self.drop_sticks(|st| st.load > limit);
+                // The pairs rest from the next retopology on (it settles them).
+            }
+        }
+        let fade = 1.0 - (self.dt / self.core_ease.max(1e-3)).min(1.0);
+        for st in self.sticks.iter_mut() {
+            if st.gap0 != 0.0 {
+                st.gap0 = if st.gap0.abs() < 1e-3 { 0.0 } else { st.gap0 * fade };
+            }
+        }
+        if opt.frozen_creep {
+            let keep = 1.0 - (ad.creep * self.dt).min(1.0);
+            for k in 0..self.sticks.len() {
+                let st = self.sticks[k];
+                if st.mode != JOIN_ANCHORED || st.a_core {
+                    continue;
+                }
+                let p = self.pos[st.a as usize];
+                if st.b_core {
+                    let kb = st.b as usize;
+                    let tension = self.core_tangent_offset(p, kb, st.anchor) - st.offset;
+                    let here = self.core_angle(p, kb);
+                    let off = self.core_tangent_offset(p, kb, here) - tension * keep;
+                    self.sticks[k].anchor = here;
+                    self.sticks[k].adir = Vector2::new(here.cos(), here.sin());
+                    self.sticks[k].offset = off;
+                    continue;
+                }
+                let rb = st.b as usize;
+                let tension = self.tangent_offset(p, rb, st.anchor) - st.offset;
+                let here = st.s;
+                let off = self.tangent_offset(p, rb, here) - tension * keep;
+                self.sticks[k].anchor = here;
+                self.sticks[k].offset = off;
+            }
+        }
+        if sliding || broken > 0 {
+            self.rebuild_stuck();
+        }
+        broken
     }
 
     // ---- Promotion and demotion ----
@@ -3005,8 +3337,30 @@ impl Colony {
             c.to_ring = 0;
             let ce = opt.ad.capture_every.max(1) as u64;
             c.capturing = opt.ad.enabled && !opt.ad.paused && !c.capture_paused && (frame - 1 + c.index as u64) % ce == 0;
+            c.ns_after = 0;
+            c.retopos = 0;
+            c.retopo_now = !opt.frozen
+                || c.retopo_req
+                || !c.vvalid
+                || (opt.retopo_every > 0 && (frame + c.index as u64) % opt.retopo_every as u64 == 0);
+            if opt.frozen {
+                if c.retopo_now && c.active {
+                    c.retopo_req = false;
+                    c.retopos = 1;
+                    // The kept list is searched again (and capture reads it whole).
+                    c.vvalid = false;
+                    c.capturing = opt.ad.enabled && !opt.ad.paused && !c.capture_paused;
+                } else {
+                    c.capturing = false;
+                }
+            }
         }
         let mut stats = Stats { draw_build_us: self.stats.draw_build_us, ..Default::default() };
+        if opt.spin && self.pool.is_some() {
+            self.step_spin(&mut stats, n_sub, frame);
+            self.finish_stats(stats, clock, 0, 0, 0);
+            return;
+        }
         let t = Instant::now();
         self.for_each(|c| {
             if c.active {
@@ -3021,27 +3375,42 @@ impl Colony {
         let ad = opt.ad;
         if ad.enabled {
             let t = Instant::now();
-            self.for_each(|c| c.made = c.capture(&ad, frame));
+            self.for_each(|c| {
+                let tc = CpuClock::now();
+                c.made = c.capture(&ad, frame);
+                c.ns_capture = ns(tc);
+            });
             stats.capture_us = t.elapsed().as_micros() as u64;
         }
         let (mut solve, mut cross, mut vel) = (0u64, 0u64, 0u64);
-        for _ in 0..n_sub {
+        for sub in 0..n_sub {
             let t = Instant::now();
-            self.for_each(|c| c.substep_own(&opt));
-            solve += ns(t);
+            self.for_each(|c| {
+                c.substep = sub as u32;
+                c.stick_every = opt.stick_every.max(1);
+                c.fast_rings = opt.fast_rings;
+                c.substep_own(&opt, opt.stick_every.max(1));
+            });
+            solve += t.elapsed().as_nanos() as u64;
             let t = Instant::now();
             stats.cross_hits = self.solve_cross();
-            cross += ns(t);
+            cross += t.elapsed().as_nanos() as u64;
             let t = Instant::now();
             self.for_each(|c| c.velocities(opt.max_speed, &opt.cores));
-            vel += ns(t);
+            vel += t.elapsed().as_nanos() as u64;
         }
         let t = Instant::now();
         // The tension runs along the exposure pass's outline: it runs the pass too.
         let ex_on = opt.ex.enabled || opt.tension.on();
         self.for_each(|c| {
             let events = c.events.len();
-            c.broken = c.after_step(&ad, n_sub, frame);
+            let ta = CpuClock::now();
+            c.broken = if opt.frozen && !c.retopo_now {
+                c.after_step_frozen(&ad, &opt, n_sub)
+            } else {
+                c.after_step(&ad, n_sub, frame)
+            };
+            c.ns_after += ns(ta);
             // A pair parted: beads may be exposed now (single sticks made or broken along a
             // wall do not change the outline; a join only encloses, which the next regular
             // pass finds).
@@ -3050,11 +3419,15 @@ impl Colony {
                 c.exp_hot = true;
             }
             // The exposure pass in the same parallel region (one fork less, better balance).
-            if ex_on {
+            if ex_on && !(opt.frozen && !c.retopo_now) {
                 c.post_step(&opt, frame);
             }
         });
         stats.settle_us = t.elapsed().as_micros() as u64;
+        self.finish_stats(stats, clock, solve, cross, vel);
+    }
+
+    fn finish_stats(&mut self, mut stats: Stats, clock: Instant, solve: u64, cross: u64, vel: u64) {
         for c in self.creatures.iter_mut() {
             stats.sticks_cpu_us += c.ns_sticks / 1000;
             stats.sticks += c.sticks.len();
@@ -3074,6 +3447,12 @@ impl Colony {
             stats.tension_cpu_us += c.ns_tension / 1000;
             stats.to_core += c.to_core;
             stats.to_ring += c.to_ring;
+            stats.after_cpu_us += c.ns_after / 1000;
+            stats.retopos += c.retopos;
+            stats.own_cpu_us += c.ns_own / 1000;
+            if c.retopos > 0 {
+                stats.retopo_cpu_us += (c.ns_own + c.ns_capture + c.ns_after + c.ns_exposure) / 1000;
+            }
             if c.exp_valid {
                 let open = c.exposed.iter().filter(|&&e| e != 0).count();
                 stats.exposed += open;
@@ -3085,11 +3464,183 @@ impl Colony {
         }
         stats.cross_skipped = self.cross_skipped;
         stats.cross_pairs = self.cross.len();
-        stats.solve_us = solve / 1000;
-        stats.cross_us = cross / 1000;
-        stats.vel_us = vel / 1000;
+        if solve + cross + vel > 0 {
+            stats.solve_us = solve / 1000;
+            stats.cross_us = cross / 1000;
+            stats.vel_us = vel / 1000;
+        }
         stats.total_us = clock.elapsed().as_micros() as u64;
         self.stats = stats;
+    }
+
+    /// step()'s phases on the pool's threads at once (explore-frozen, Options::spin): one
+    /// broadcast a frame instead of a fork per phase; each parallel phase hands out
+    /// creatures (or creature pairs) by an atomic counter, a spin barrier between phases,
+    /// the serial parts (which creatures overlap, the contacts between creatures) on thread
+    /// 0 while the others wait. Each creature's work is the same code on its own data in
+    /// the same order, and the serial parts run in the same order, so the result is
+    /// bit-identical to the serial step. Velocities are merged into the next substep's
+    /// phase (and the last into the after-step phase), capture into the first substep's.
+    fn step_spin(&mut self, stats: &mut Stats, n_sub: usize, frame: u64) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Ptr<T>(*mut T);
+        unsafe impl<T> Send for Ptr<T> {}
+        unsafe impl<T> Sync for Ptr<T> {}
+        impl<T> Ptr<T> {
+            #[inline]
+            fn get(&self) -> *mut T {
+                self.0
+            }
+        }
+        struct Barrier {
+            count: AtomicUsize,
+            gen: AtomicUsize,
+            total: usize,
+        }
+        impl Barrier {
+            fn wait(&self) {
+                let g = self.gen.load(Ordering::Acquire);
+                if self.count.fetch_add(1, Ordering::AcqRel) + 1 == self.total {
+                    self.count.store(0, Ordering::Relaxed);
+                    self.gen.fetch_add(1, Ordering::Release);
+                } else {
+                    let mut spins = 0u32;
+                    while self.gen.load(Ordering::Acquire) == g {
+                        spins += 1;
+                        if spins < 20_000 {
+                            std::hint::spin_loop();
+                        } else {
+                            std::thread::yield_now();
+                        }
+                    }
+                }
+            }
+        }
+        let opt = self.opt;
+        let ad = opt.ad;
+        let threads = self.pool_threads.max(1);
+        let n = self.creatures.len();
+        // Phases: 0 forces + own pairs, 1 cross find, 2..2+n_sub substeps, then after.
+        let counters: Vec<AtomicUsize> = (0..n_sub + 4).map(|_| AtomicUsize::new(0)).collect();
+        let barrier = Barrier { count: AtomicUsize::new(0), gen: AtomicUsize::new(0), total: threads };
+        let me = Ptr(self as *mut Colony);
+        let cre = Ptr(self.creatures.as_mut_ptr());
+        let mut slots: Vec<(Vec<Cross>, usize)> = Vec::new();
+        let slots_ptr = Ptr(&mut slots as *mut Vec<(Vec<Cross>, usize)>);
+        let mut overlapping: Vec<(usize, usize, u8)> = Vec::new();
+        let ov_ptr = Ptr(&mut overlapping as *mut Vec<(usize, usize, u8)>);
+        let times = Ptr(stats as *mut Stats);
+        let ex_on = opt.ex.enabled || opt.tension.on();
+        let slots_base = AtomicUsize::new(0);
+        let run = |phase: usize, count: usize, f: &dyn Fn(usize)| loop {
+            let i = counters[phase].fetch_add(1, Ordering::Relaxed);
+            if i >= count {
+                break;
+            }
+            f(i);
+        };
+        let pool = self.pool.as_ref().unwrap();
+        pool.broadcast(|ctx| {
+            let lead = ctx.index() == 0;
+            let creature = |i: usize| unsafe { &mut *cre.get().add(i) };
+            let mut t = Instant::now();
+            let (mut solve, mut cross) = (0u64, 0u64);
+            run(0, n, &|i| {
+                let c = creature(i);
+                if c.active {
+                    c.frame_forces(&opt);
+                }
+                c.build_own_pairs(opt);
+            });
+            barrier.wait();
+            if lead {
+                unsafe {
+                    (*times.get()).pairs_us = t.elapsed().as_micros() as u64;
+                    *ov_ptr.get() = (*me.get()).overlapping();
+                    let m = (*ov_ptr.get()).len();
+                    *slots_ptr.get() = (0..m).map(|_| (Vec::new(), 0)).collect();
+                    slots_base.store((*slots_ptr.get()).as_mut_ptr() as usize, Ordering::Release);
+                }
+            }
+            barrier.wait();
+            {
+                let ov = unsafe { &*ov_ptr.get() };
+                let creatures: &[Creature] = unsafe { std::slice::from_raw_parts(cre.get(), n) };
+                let slots = slots_base.load(Ordering::Acquire) as *mut (Vec<Cross>, usize) as usize;
+                run(1, ov.len(), &|k| {
+                    let (a, b, mode) = ov[k];
+                    let r = find_cross(creatures, a, b, opt.slop, mode);
+                    unsafe { *(slots as *mut (Vec<Cross>, usize)).add(k) = r };
+                });
+            }
+            barrier.wait();
+            if lead {
+                unsafe {
+                    let col = &mut *me.get();
+                    col.cross.clear();
+                    col.cross_skipped = 0;
+                    for (list, skipped) in (*slots_ptr.get()).drain(..) {
+                        col.cross.extend_from_slice(&list);
+                        col.cross_skipped += skipped;
+                    }
+                    (*times.get()).own_pairs_us = (*times.get()).pairs_us;
+                    (*times.get()).pairs_us = t.elapsed().as_micros() as u64;
+                }
+                t = Instant::now();
+            }
+            for sub in 0..n_sub {
+                run(2 + sub, n, &|i| {
+                    let c = creature(i);
+                    if sub == 0 {
+                        if ad.enabled {
+                            let tc = CpuClock::now();
+                            c.made = c.capture(&ad, frame);
+                            c.ns_capture = ns(tc);
+                        }
+                    } else {
+                        c.velocities(opt.max_speed, &opt.cores);
+                    }
+                    c.substep = sub as u32;
+                    c.stick_every = opt.stick_every.max(1);
+                    c.fast_rings = opt.fast_rings;
+                    c.substep_own(&opt, opt.stick_every.max(1));
+                });
+                barrier.wait();
+                if lead {
+                    solve += t.elapsed().as_nanos() as u64;
+                    t = Instant::now();
+                    unsafe {
+                        (*times.get()).cross_hits = (*me.get()).solve_cross();
+                    }
+                    cross += t.elapsed().as_nanos() as u64;
+                    t = Instant::now();
+                }
+                barrier.wait();
+            }
+            run(2 + n_sub, n, &|i| {
+                let c = creature(i);
+                c.velocities(opt.max_speed, &opt.cores);
+                let events = c.events.len();
+                let ta = CpuClock::now();
+                c.broken = if opt.frozen && !c.retopo_now { c.after_step_frozen(&ad, &opt, n_sub) } else { c.after_step(&ad, n_sub, frame) };
+                c.ns_after += ns(ta);
+                if c.events[events..].iter().any(|e| e.0 == EVENT_PARTED) {
+                    c.exp_dirty = true;
+                    c.exp_hot = true;
+                }
+                if ex_on && !(opt.frozen && !c.retopo_now) {
+                    c.post_step(&opt, frame);
+                }
+            });
+            barrier.wait();
+            if lead {
+                unsafe {
+                    (*times.get()).solve_us = solve / 1000;
+                    (*times.get()).cross_us = cross / 1000;
+                    (*times.get()).settle_us = t.elapsed().as_micros() as u64;
+                }
+            }
+        });
     }
 
     /// This step's contact candidates. Within each creature (in parallel): its own beads
@@ -3103,6 +3654,24 @@ impl Colony {
         let t = Instant::now();
         self.for_each(|c| c.build_own_pairs(opt));
         self.own_pairs_us = t.elapsed().as_micros() as u64;
+        let overlapping = self.overlapping();
+        let creatures = &self.creatures;
+        let find = |&(a, b, mode): &(usize, usize, u8)| find_cross(creatures, a, b, opt.slop, mode);
+        let lists: Vec<(Vec<Cross>, usize)> = match &self.pool {
+            Some(pool) => pool.install(|| overlapping.par_iter().map(find).collect()),
+            None => overlapping.iter().map(find).collect(),
+        };
+        self.cross.clear();
+        self.cross_skipped = 0;
+        for (list, skipped) in lists {
+            self.cross.extend_from_slice(&list);
+            self.cross_skipped += skipped;
+        }
+    }
+
+    /// The pairs of creatures whose boxes overlap this step, with the skip mode of each.
+    fn overlapping(&mut self) -> Vec<(usize, usize, u8)> {
+        let opt = self.opt;
         let mut overlapping = Vec::new();
         let skip = if opt.ex.enabled { opt.ex.skip } else { exposure::SKIP_NONE };
         let frame = self.frame;
@@ -3130,18 +3699,7 @@ impl Colony {
         if !self.fast_until.is_empty() {
             self.fast_until.retain(|_, until| frame < *until);
         }
-        let creatures = &self.creatures;
-        let find = |&(a, b, mode): &(usize, usize, u8)| find_cross(creatures, a, b, opt.slop, mode);
-        let lists: Vec<(Vec<Cross>, usize)> = match &self.pool {
-            Some(pool) => pool.install(|| overlapping.par_iter().map(find).collect()),
-            None => overlapping.iter().map(find).collect(),
-        };
-        self.cross.clear();
-        self.cross_skipped = 0;
-        for (list, skipped) in lists {
-            self.cross.extend_from_slice(&list);
-            self.cross_skipped += skipped;
-        }
+        overlapping
     }
 
     /// The contacts between creatures, serially, in the order build_pairs() found them. A
@@ -3190,6 +3748,112 @@ impl Colony {
     /// another particle of its creature (beyond 1 px), the sticks' largest stretch and
     /// squeeze (px beyond and below zero gap) and largest load, how many sticks, how
     /// many particles are not finite].
+    /// Pass-through counts, independent of any candidate list (explore-frozen): every
+    /// particle (bead or core centre) whose centre lies inside another cell (inside a
+    /// ring's polygon of bead centres, or within a core's radius) of its own creature,
+    /// and of another creature: [own particles inside, other-creature particles inside,
+    /// rings inside out, smallest ring area over target, deepest core-into-core overlap
+    /// within a creature (px), the same between creatures].
+    pub fn soundness(&self) -> [f32; 6] {
+        // Every cell: (creature, cell, centre, bound radius, ring index or core index).
+        struct C {
+            cr: u32,
+            cell: u32,
+            at: Vector2,
+            rad: f32,
+            ring: Option<usize>,
+            core: usize,
+        }
+        let mut cells: Vec<C> = Vec::new();
+        let mut inverted = 0.0f32;
+        let mut amin = f32::INFINITY;
+        for (ci, c) in self.creatures.iter().enumerate() {
+            for (ri, ring) in c.rings.iter().enumerate() {
+                let pts = &c.pos[ring.start..ring.start + ring.n];
+                let at = centroid(pts);
+                let rad = pts.iter().map(|&p| dist(p, at)).fold(0.0f32, f32::max);
+                cells.push(C { cr: ci as u32, cell: ring.cell as u32, at, rad, ring: Some(ri), core: 0 });
+                if !is_ccw(pts) {
+                    inverted += 1.0;
+                }
+                let t = &c.cells[ring.cell].t;
+                amin = amin.min((outline_area(pts, t.bead_radius as f64) / t.target_area.max(1e-3) as f64) as f32);
+            }
+            for k in 0..c.cpos.len() {
+                cells.push(C { cr: ci as u32, cell: c.ccell[k], at: c.cpos[k], rad: c.cr[k], ring: None, core: k });
+            }
+        }
+        if cells.is_empty() {
+            return [0.0; 6];
+        }
+        let rmax = cells.iter().map(|x| x.rad).fold(1.0f32, f32::max);
+        let size = 2.0 * rmax;
+        let mut grid: std::collections::HashMap<(i32, i32), Vec<u32>> = std::collections::HashMap::new();
+        let key = |p: Vector2| ((p.x / size).floor() as i32, (p.y / size).floor() as i32);
+        for (i, x) in cells.iter().enumerate() {
+            grid.entry(key(x.at)).or_default().push(i as u32);
+        }
+        let (mut own_in, mut cross_in) = (0.0f32, 0.0f32);
+        let (mut own_cc, mut cross_cc) = (0.0f32, 0.0f32);
+        let mut test = |ci: u32, cell: u32, p: Vector2, core_r: f32| {
+            let (kx, ky) = key(p);
+            let mut inside = None;
+            for dy in -1..=1 {
+                for dx in -1..=1 {
+                    let Some(list) = grid.get(&(kx + dx, ky + dy)) else { continue };
+                    for &j in list {
+                        let x = &cells[j as usize];
+                        if x.cr == ci && x.cell == cell {
+                            continue;
+                        }
+                        if dist_sq(p, x.at) > (x.rad + core_r) * (x.rad + core_r) {
+                            continue;
+                        }
+                        let c = &self.creatures[x.cr as usize];
+                        let hit = match x.ring {
+                            Some(ri) => {
+                                let ring = &c.rings[ri];
+                                point_in_polygon(p, &c.pos[ring.start..ring.start + ring.n])
+                            }
+                            None => {
+                                if core_r > 0.0 {
+                                    let depth = core_r + x.rad - dist(p, x.at);
+                                    if x.cr == ci {
+                                        own_cc = own_cc.max(depth);
+                                    } else {
+                                        cross_cc = cross_cc.max(depth);
+                                    }
+                                }
+                                dist(p, x.at) < x.rad
+                            }
+                        };
+                        if hit {
+                            inside = Some(x.cr == ci);
+                        }
+                    }
+                }
+            }
+            match inside {
+                Some(true) => own_in += 1.0,
+                Some(false) => cross_in += 1.0,
+                None => {}
+            }
+        };
+        for (ci, c) in self.creatures.iter().enumerate() {
+            for i in 0..c.pos.len() {
+                let cell = c.rings[c.bead_ring[i] as usize].cell as u32;
+                test(ci as u32, cell, c.pos[i], 0.0);
+            }
+            for k in 0..c.cpos.len() {
+                test(ci as u32, c.ccell[k], c.cpos[k], c.cr[k]);
+            }
+        }
+        if amin == f32::INFINITY {
+            amin = 1.0;
+        }
+        [own_in, cross_in, inverted, amin, own_cc, cross_cc]
+    }
+
     pub fn health(&self) -> [f32; 13] {
         let (mut core_min, mut core_max) = (f32::INFINITY, 0.0f32);
         for c in &self.creatures {
@@ -3598,6 +4262,69 @@ mod tests {
             }
             for (f, g) in ca.drag_f.iter().zip(&cb.drag_f) {
                 assert_eq!(f.x.to_bits(), g.x.to_bits());
+            }
+        }
+    }
+
+    /// explore-frozen: the frozen topology (retopology every 25 frames and by request),
+    /// the dense own search, sticks every other substep and the spinning team, threaded
+    /// == serial bit for bit.
+    #[test]
+    fn frozen_spin_threaded_is_bit_identical_to_serial() {
+        let run = |threads: usize, spin: bool, fast: bool| {
+            let mut col = exposing(threads);
+            col.opt.ex.auto_cores = true;
+            col.opt.ad.core_anchors = true;
+            col.opt.cores.contact = 1.0;
+            col.opt.drag.enabled = true;
+            col.opt.frozen = true;
+            col.opt.retopo_every = 25;
+            col.opt.frozen_self = FROZEN_SELF_VERLET;
+            col.opt.fast_search = fast;
+            col.opt.stick_every = 2;
+            col.opt.spin = spin;
+            for c in 0..6 {
+                let k = hex(&mut col, Vector2::new(c as f32 * 160.0, (c % 2) as f32 * 30.0), 0.0);
+                col.creatures[k].push = Vector2::new(if c % 2 == 0 { 900.0 } else { -900.0 }, 0.0);
+                col.creatures[k].cells[3].push = Vector2::new(0.0, 6000.0);
+            }
+            let mut events = Vec::new();
+            for f in 0..200 {
+                if f == 70 {
+                    col.creatures[2].retopo_req = true;
+                }
+                col.step(1.0 / 60.0);
+                if f == 90 {
+                    for c in col.creatures.iter_mut() {
+                        c.push = -c.push;
+                    }
+                }
+                events.extend(col.take_events());
+            }
+            (col, events)
+        };
+        for fast in [false, true] {
+            let (a, ea) = run(1, false, fast);
+            let (b, eb) = run(4, true, fast);
+            let (c, ec) = run(4, false, fast);
+            assert_eq!(ea, eb);
+            assert_eq!(ea, ec);
+            for other in [&b, &c] {
+                for (ca, cb) in a.creatures.iter().zip(&other.creatures) {
+                    assert_eq!(ca.pos.len(), cb.pos.len());
+                    assert_eq!(ca.cpos.len(), cb.cpos.len());
+                    for (p, q) in ca.pos.iter().zip(&cb.pos).chain(ca.cpos.iter().zip(&cb.cpos)) {
+                        assert_eq!(p.x.to_bits(), q.x.to_bits());
+                        assert_eq!(p.y.to_bits(), q.y.to_bits());
+                    }
+                    for (p, q) in ca.vel.iter().zip(&cb.vel) {
+                        assert_eq!(p.x.to_bits(), q.x.to_bits());
+                    }
+                    assert_eq!(ca.sticks.len(), cb.sticks.len());
+                    for (s, t) in ca.sticks.iter().zip(&cb.sticks) {
+                        assert_eq!(s.load.to_bits(), t.load.to_bits());
+                    }
+                }
             }
         }
     }

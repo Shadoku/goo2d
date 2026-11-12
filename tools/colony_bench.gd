@@ -126,6 +126,17 @@ var _pair_passes: bool = true
 var _seal: float = CAPTURE
 # Screen px per canvas px, following creature 0 (0: the whole arena fits the window).
 var _zoom: float = 0.0
+# explore-frozen: frozen topology and its knobs.
+var _frozen: bool = false
+var _retopo_every: int = 0
+var _frozen_self: int = 1
+var _frozen_breaks: bool = false
+var _frozen_creep: bool = true
+var _stick_every: int = 1
+var _fast_search: bool = false
+var _spin: bool = false
+var _fast_rings: bool = false
+var _sound: Dictionary = {}
 
 var _rng := RandomNumberGenerator.new()
 var _frame: int = 0
@@ -224,6 +235,15 @@ func _initialize() -> void:
 		elif arg.begins_with("--pair-passes="): _pair_passes = value == "on"
 		elif arg.begins_with("--seal="): _seal = float(value)
 		elif arg.begins_with("--zoom="): _zoom = float(value)
+		elif arg == "--frozen": _frozen = true
+		elif arg.begins_with("--retopo-every="): _retopo_every = int(value)
+		elif arg.begins_with("--frozen-self="): _frozen_self = ["none", "kept", "full", "verlet"].find(value)
+		elif arg.begins_with("--frozen-breaks="): _frozen_breaks = value == "on"
+		elif arg.begins_with("--frozen-creep="): _frozen_creep = value == "on"
+		elif arg.begins_with("--stick-every="): _stick_every = int(value)
+		elif arg.begins_with("--fast-search="): _fast_search = value == "on"
+		elif arg.begins_with("--spin="): _spin = value == "on"
+		elif arg.begins_with("--fast-rings="): _fast_rings = value == "on"
 		elif arg == "--ratios": ratios = true
 		elif arg == "--promote-test": promote = true
 		else:
@@ -580,6 +600,8 @@ func _build_colony(design: Array[Vector3], kinds: PackedByteArray, starts: Array
 		GooTuning.unit = UNIT
 		_colony.set_options(GooColonySim.tension_options(_tension))
 		GooTuning.unit = unit
+	_colony.set_options({ "frozen": _frozen, "retopo_every": _retopo_every, "frozen_self": _frozen_self,
+		"frozen_breaks": _frozen_breaks, "frozen_creep": _frozen_creep, "stick_every": _stick_every, "fast_search": _fast_search, "spin": _spin, "fast_rings": _fast_rings })
 	for ci: int in _creatures:
 		var hue := fmod(0.13 + ci * 0.618, 1.0)
 		var floats := PackedFloat32Array()
@@ -938,6 +960,11 @@ func _on_physics(first: bool, delta: float) -> void:
 			_sample("pockets", s["pockets"], false)
 			_sample("lost_runs", s["broken_runs"], false)
 			_sample("pair_builds", s["pair_builds"], false)
+			_sample("after_cpu", s["after_cpu_us"])
+			_sample("own_cpu", s["own_cpu_us"])
+			_sample("retopos", s["retopos"], false)
+			if s["retopos"] > 0:
+				_sample("retopo_each", s["retopo_cpu_us"] / float(s["retopos"]))
 			_switches += s["to_core"] + s["to_ring"]
 			_switch_frames[0] += s["to_core"]
 			_switch_frames[1] += s["to_ring"]
@@ -988,6 +1015,10 @@ func _on_process(first: bool) -> void:
 		for key: String in h:
 			var worst: float = _health.get(key, -INF if key != "area_min" else INF)
 			_health[key] = minf(worst, h[key]) if key == "area_min" else maxf(worst, h[key])
+		var snd: Dictionary = {} if OS.get_environment("COLONY_NO_SOUND") == "1" else _colony.soundness()
+		for key: String in snd:
+			var w: float = _sound.get(key, -INF if key != "area_min" else INF)
+			_sound[key] = minf(w, snd[key]) if key == "area_min" else maxf(w, snd[key])
 	if _frame == _warmup + _frames:
 		_done = true
 		_report()
@@ -1011,10 +1042,21 @@ func _sample(key: String, value: float, usec: bool = true) -> void:
 
 func _report() -> void:
 	print("colony_bench: %d frames after %d warm-up (ms: min / median / p95)" % [_frames, _warmup])
-	var order := ["physics", "kernel", "holds", "capture", "settle", "exposure", "exp_runs", "drag_cpu", "tension_cpu", "skipped", "enclosed", "pockets", "lost_runs", "patched", "pair_builds",
+	var order := ["physics", "kernel", "holds", "after_cpu", "own_cpu", "retopos", "retopo_each", "capture", "settle", "exposure", "exp_runs", "drag_cpu", "tension_cpu", "skipped", "enclosed", "pockets", "lost_runs", "patched", "pair_builds",
 		"sticks", "broken", "script", "push", "draw", "draw_rust", "rs_setup", "rs_render",
 		"forces", "pairs", "own_pairs", "solve", "rings_cpu", "intra_cpu", "cross", "vel", "cross_hits", "intra_pairs", "cross_pairs",
 		"k_pairpass", "k_links", "k_solver", "k_rings", "k_skins"]
+	if OS.get_environment("COLONY_SPIKES") == "1" and _samples.has("physics"):
+		var phys: PackedFloat64Array = _samples["physics"]
+		var idx: Array = range(phys.size())
+		idx.sort_custom(func(x: int, y: int) -> bool: return phys[x] > phys[y])
+		for k: int in mini(12, idx.size()):
+			var i: int = idx[k]
+			var line := "  spike frame %d:" % i
+			for key: String in ["physics", "kernel", "script", "pairs", "own_pairs", "own_cpu", "solve", "cross", "settle", "pair_builds", "retopos", "cross_pairs"]:
+				if _samples.has(key) and (_samples[key] as PackedFloat64Array).size() > i:
+					line += " %s=%.2f" % [key, _samples[key][i]]
+			print(line)
 	for key: String in order:
 		if not _samples.has(key):
 			continue
@@ -1026,6 +1068,9 @@ func _report() -> void:
 		print("  health (worst over the measured frames, every 10th): fastest %.0f px/s, ring area %.2f..%.2f of target, %d inside out, bond stretch %.2f, overlap %.2f px, sticks stretched %.2f / squeezed %.2f px, load %.0f, %d not finite" % [
 			_health["fastest"], _health["area_min"], _health["area_max"], int(_health["inverted"]), _health["stretch"], _health["overlap"],
 			_health["stick_stretch"], _health["stick_squeeze"], _health["stick_load"], int(_health["not_finite"])])
+	if not _sound.is_empty():
+		print("  soundness (worst over the measured frames, every 10th): own particles inside own cells %d, particles inside another creature %d, inside out %d, ring area min %.2f, core overlap own %.2f / cross %.2f px" % [
+			int(_sound["own_inside"]), int(_sound["cross_inside"]), int(_sound["inverted"]), _sound["area_min"], _sound["own_core_overlap"], _sound["cross_core_overlap"]])
 	if _mode == "colony" and (_exposure or _tension > 0.0):
 		var st := _colony.stats()
 		print("  milestone 2: %d rings and %d cores at the end; over every frame, warm-up included, %d rings became cores and %d cores rings" % [

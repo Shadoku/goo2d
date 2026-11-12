@@ -124,6 +124,7 @@ name = "goo2d_kernel"
 version = "0.2.0"
 dependencies = [
  "godot",
+ "libc",
  "rayon",
 ]
 

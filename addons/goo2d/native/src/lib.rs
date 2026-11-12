@@ -1066,6 +1066,15 @@ impl GooColony {
                 "slop" => o.slop = number as f32,
                 "bond_scale" => o.bond_scale = number as f32,
                 "reuse_pairs" => o.reuse_pairs = value.try_to::<bool>().unwrap_or(number != 0.0),
+                "frozen" => o.frozen = value.try_to::<bool>().unwrap_or(number != 0.0),
+                "retopo_every" => o.retopo_every = number.max(0.0) as u32,
+                "frozen_self" => o.frozen_self = number as u8,
+                "frozen_breaks" => o.frozen_breaks = value.try_to::<bool>().unwrap_or(number != 0.0),
+                "frozen_creep" => o.frozen_creep = value.try_to::<bool>().unwrap_or(number != 0.0),
+                "stick_every" => o.stick_every = (number as u32).max(1),
+                "fast_search" => o.fast_search = value.try_to::<bool>().unwrap_or(number != 0.0),
+                "spin" => o.spin = value.try_to::<bool>().unwrap_or(number != 0.0),
+                "fast_rings" => o.fast_rings = value.try_to::<bool>().unwrap_or(number != 0.0),
                 "pair_skin" => o.pair_skin = (number as f32).max(0.0),
                 "adhesion" => o.ad.enabled = value.try_to::<bool>().unwrap_or(number != 0.0),
                 "capture" => o.ad.capture = (number as f32).max(0.0),
@@ -1210,6 +1219,10 @@ impl GooColony {
         put(&mut d, "to_ring", s.to_ring as i64);
         put(&mut d, "cross_skipped", s.cross_skipped as i64);
         put(&mut d, "tension_cpu_us", s.tension_cpu_us as i64);
+        put(&mut d, "after_cpu_us", s.after_cpu_us as i64);
+        put(&mut d, "retopos", s.retopos as i64);
+        put(&mut d, "own_cpu_us", s.own_cpu_us as i64);
+        put(&mut d, "retopo_cpu_us", s.retopo_cpu_us as i64);
         let (mut beads, mut cores, mut rings, mut bonds) = (0usize, 0usize, 0usize, 0usize);
         for c in &self.c.creatures {
             beads += c.bead_count();
@@ -1237,6 +1250,27 @@ impl GooColony {
             put(&mut d, name, h[k] as f64);
         }
         d
+    }
+
+    /// colony.rs's soundness() (explore-frozen): own_inside, cross_inside, inverted,
+    /// area_min, own_core_overlap, cross_core_overlap.
+    #[func]
+    fn soundness(&self) -> VarDictionary {
+        let h = self.c.soundness();
+        let mut d = VarDictionary::new();
+        for (k, name) in ["own_inside", "cross_inside", "inverted", "area_min", "own_core_overlap", "cross_core_overlap"].iter().enumerate() {
+            put(&mut d, name, h[k] as f64);
+        }
+        d
+    }
+
+    /// Frozen topology: creature `c` retopologises in its next step (capture, breaks
+    /// settled, exposure and switches, its own candidates searched again).
+    #[func]
+    fn request_retopology(&mut self, c: i64) {
+        if let Some(cr) = self.c.creatures.get_mut(c as usize) {
+            cr.retopo_req = true;
+        }
     }
 
     #[func]

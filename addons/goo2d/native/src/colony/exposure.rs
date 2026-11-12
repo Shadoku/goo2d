@@ -710,7 +710,7 @@ impl Creature {
         if !self.exp_dirty {
             return;
         }
-        let t = Instant::now();
+        let t = super::CpuClock::now();
         let gap = if ex.gap >= 0.0 { ex.gap } else { opt.ad.capture };
         self.compute_exposure(gap, gap * ex.core_gap);
         self.exp_runs += 1;
