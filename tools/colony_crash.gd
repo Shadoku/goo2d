@@ -6,7 +6,7 @@ extends SceneTree
 ##   godot --headless --fixed-fps 60 --path . -s tools/colony_crash.gd -- [--rings=3] [--threads=4] [--beads=12]
 ##
 ## --rings: rings of cells around the middle one (3: 37 cells, 5: 91); --beads: beads of
-## the smallest cell (12 is GooTuning's). Each row settles 30 frames in its own model, then
+## the smallest cell (12 is GooTuning's); --substeps (6). Each row settles 30 frames in its own model, then
 ## the clusters meet at 300 and at 600 px/s each; the table has the worst over the 90
 ## frames after the throw.
 
@@ -15,6 +15,7 @@ const DELTA: float = 1.0 / 60.0
 var _rings: int = 3
 var _threads: int = 4
 var _beads: int = 12
+var _substeps: int = 6
 
 func _initialize() -> void:
 	for arg: String in OS.get_cmdline_user_args():
@@ -22,6 +23,7 @@ func _initialize() -> void:
 		if arg.begins_with("--rings="): _rings = int(value)
 		elif arg.begins_with("--threads="): _threads = int(value)
 		elif arg.begins_with("--beads="): _beads = int(value)
+		elif arg.begins_with("--substeps="): _substeps = int(value)
 		else: push_error("colony_crash: unknown option %s" % arg)
 	GooTuning.unit = 0.5
 	var full := GooColonySim.everything_options()
@@ -45,6 +47,7 @@ func _initialize() -> void:
 func _throw(options: Dictionary, speed: float) -> Dictionary:
 	var opts := options.duplicate()
 	opts["threads"] = _threads
+	opts["substeps"] = _substeps
 	var sim := GooColonySim.new(opts)
 	var gap := (_rings + 1) * 2.0 * GooTuning.min_radius() * 1.1
 	var a := _add(sim, _hex(_rings, Vector2(-gap, 0)))

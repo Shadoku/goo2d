@@ -186,10 +186,11 @@ impl Creature {
                         if den > 1e-12 {
                             z = num / den;
                         }
-                        dev = 0.0;
+                        let mut dev2 = 0.0f32;
                         for i in s..s + n {
-                            dev = dev.max(len(self.pos[i] - c - cmul(z, cp.q[i])));
+                            dev2 = dev2.max(len_sq(self.pos[i] - c - cmul(z, cp.q[i])));
                         }
+                        dev = dev2.sqrt();
                     }
                     if dev > snap_at {
                         let mut rho = 0.0f32;
@@ -204,12 +205,15 @@ impl Creature {
                         z = Vector2::new(1.0, 0.0);
                         dev = 0.0;
                     }
-                    let (mut ext, mut rmax, mut mv) = (0.0f32, 0.0f32, 0.0f32);
+                    // The largest distance from the centre plus the largest bead radius (at
+                    // least each bead's reach), one square root each.
+                    let (mut ext2, mut rmax, mut mv2) = (0.0f32, 0.0f32, 0.0f32);
                     for i in s..s + n {
-                        ext = ext.max(len(self.pos[i] - c) + self.r[i]);
+                        ext2 = ext2.max(len_sq(self.pos[i] - c));
                         rmax = rmax.max(self.r[i]);
-                        mv = mv.max(len(self.vel[i] - v));
+                        mv2 = mv2.max(len_sq(self.vel[i] - v));
                     }
+                    let (ext, mv) = (ext2.sqrt() + rmax, mv2.sqrt());
                     cp.c[cell] = c;
                     cp.z[cell] = z;
                     cp.dev[cell] = dev;
@@ -383,7 +387,9 @@ impl Creature {
                 let m = motion(&cp, a, b);
                 let mut ok = e.valid && e.epoch_a == cp.epoch[a] && e.epoch_b == cp.epoch[b];
                 if ok {
-                    let w = unit(unit(cmul_conj(e.z_a, cp.z[a])) + unit(cmul_conj(e.z_b, cp.z[b])));
+                    // Any common turn w gives a bound; the two cells' turns since t summed (as
+                    // complex numbers, both near unit length) is their mean, near enough.
+                    let w = unit(cmul_conj(e.z_a, cp.z[a]) + cmul_conj(e.z_b, cp.z[b]));
                     let bound = len(cmul_conj(w, cp.c[a] - cp.c[b]) - (e.c_a - e.c_b))
                         + len(cmul_conj(w, cp.z[a]) - e.z_a) * cp.rho[a]
                         + len(cmul_conj(w, cp.z[b]) - e.z_b) * cp.rho[b]
@@ -396,7 +402,7 @@ impl Creature {
                     ok = bound < e.margin;
                 }
                 if !ok {
-                    let list_margin = margin.max(m + 0.5 * margin);
+                    let list_margin = margin + m;
                     self.build_cell_pair(e, a, list_margin + contact_slop);
                     e.epoch_a = cp.epoch[a];
                     e.epoch_b = cp.epoch[b];

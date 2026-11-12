@@ -578,6 +578,7 @@ pub struct Creature {
     cp: cellpairs::CellPairs,
     /// The colony's frame number in this step.
     frame_now: u64,
+    ns_cp: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -730,6 +731,8 @@ pub struct Stats {
     pub cp_rebuilt: usize,
     pub cp_snaps: usize,
     pub cp_lists: usize,
+    /// Of own_cpu_us: the cell-pair lists' part.
+    pub cp_cpu_us: u64,
     /// Urgent retopologies asked this step (a stick past the break force).
     pub urgent: usize,
 }
@@ -1108,6 +1111,16 @@ impl Creature {
 
     // ---- Stepping (each creature on its own data) ----
 
+    /// Frozen topology: a retopology frame starts with the exposure pass and the switches
+    /// it calls for (at the end of a frame the pass would be one creature's long tail
+    /// while the others wait; at the start it runs beside the others' contact search, on
+    /// the same positions). The tension runs along the pass's outline, so it runs it too.
+    fn retopo_start(&mut self, opt: &Options, ex_on: bool, frame: u64) {
+        if opt.frozen && ex_on && self.retopo_now {
+            self.post_step(opt, frame);
+        }
+    }
+
     fn frame_forces(&mut self, opt: &Options) {
         let gravity = opt.gravity;
         self.core_frame(&opt.cores);
@@ -1328,12 +1341,8 @@ impl Creature {
         let inv_h2 = 1.0 / (self.h * self.h);
         let bb = if self.solve_bb { self.bb.len() } else { 0 };
         for k in 0..bb {
+            // (Pairs stuck to each other's ring left out once a frame: drop_stuck_contacts().)
             let (i, j) = (self.bb[k].0 as usize, self.bb[k].1 as usize);
-            // Joined cells do not collide where they are stuck: a stuck bead's gap to the
-            // ring it is stuck to is the stick's to hold.
-            if self.stuck[i] == self.bead_ring[j] + 1 || self.stuck[j] == self.bead_ring[i] + 1 {
-                continue;
-            }
             let reach = self.r[i] + self.r[j];
             let d = self.pos[i] - self.pos[j];
             let dsq = len_sq(d);
@@ -1383,9 +1392,24 @@ impl Creature {
         }
     }
 
+    /// Joined cells do not collide where they are stuck: a stuck bead's gap to the ring it
+    /// is stuck to is the stick's to hold. Who is stuck to what changes only after the
+    /// step (and in capture, before the first substep), so the frame's bead contacts drop
+    /// such pairs once, before the first substep, not in every substep's solve.
+    fn drop_stuck_contacts(&mut self) {
+        let (stuck, bead_ring) = (&self.stuck, &self.bead_ring);
+        self.bb.retain(|&(i, j)| {
+            let (i, j) = (i as usize, j as usize);
+            !(stuck[i] == bead_ring[j] + 1 || stuck[j] == bead_ring[i] + 1)
+        });
+    }
+
     fn substep_own(&mut self, opt: &Options) {
         if !self.active {
             return;
+        }
+        if self.substep == 0 {
+            self.drop_stuck_contacts();
         }
         if opt.tension.on() {
             let t = CpuClock::now();
@@ -1465,7 +1489,7 @@ impl Creature {
         let e = (s.max(0.0) as usize).min(n - 1);
         let t = (s - e as f32).clamp(0.0, 1.0);
         let j = ring.start + e;
-        let k = ring.start + (e + 1) % n;
+        let k = if e + 1 == n { ring.start } else { j + 1 };
         let edge = self.pos[k] - self.pos[j];
         let l = len(edge);
         let tan = if l > 1e-6 { edge / l } else { Vector2::new(1.0, 0.0) };
@@ -2445,14 +2469,25 @@ impl Creature {
         let contact_slop = opt.slop;
         if opt.frozen && !cores_only {
             if self.retopo_now {
-                self.reuse_own_pairs(opt, slop, contact_slop, rmax);
+                if matches!(opt.frozen_self, FROZEN_SELF_KEPT | FROZEN_SELF_VERLET) {
+                    // The kept list is built here, for the frames up to the next one.
+                    self.reuse_own_pairs(opt, slop, contact_slop, rmax);
+                } else {
+                    // This frame's candidates alone (capture's gap included): the cell-pair
+                    // lists keep their own.
+                    self.search_own_pairs(opt, slop, contact_slop, false);
+                }
                 return;
             }
             match opt.frozen_self {
                 FROZEN_SELF_NONE => {}
                 FROZEN_SELF_KEPT => self.filter_kept_pairs(contact_slop),
                 FROZEN_SELF_VERLET => self.reuse_own_pairs_with(opt, contact_slop, contact_slop, 0.0),
-                FROZEN_SELF_CELLS => self.cell_pair_contacts(opt.pair_skin, contact_slop, self.frame_now),
+                FROZEN_SELF_CELLS => {
+                    let tq = CpuClock::now();
+                    self.cell_pair_contacts(opt.pair_skin, contact_slop, self.frame_now);
+                    self.ns_cp += ns(tq);
+                }
                 _ => self.search_own_pairs(opt, contact_slop, contact_slop, false),
             }
             return;
@@ -3461,7 +3496,9 @@ impl Colony {
             return;
         }
         let t = Instant::now();
+        let ex_on = opt.ex.enabled || opt.tension.on();
         self.for_each(|c| {
+            c.retopo_start(&opt, ex_on, frame);
             if c.active {
                 c.frame_forces(&opt);
             }
@@ -3498,8 +3535,6 @@ impl Colony {
             vel += t.elapsed().as_nanos() as u64;
         }
         let t = Instant::now();
-        // The tension runs along the exposure pass's outline: it runs the pass too.
-        let ex_on = opt.ex.enabled || opt.tension.on();
         self.for_each(|c| {
             let events = c.events.len();
             let ta = CpuClock::now();
@@ -3516,8 +3551,9 @@ impl Colony {
                 c.exp_dirty = true;
                 c.exp_hot = true;
             }
-            // The exposure pass in the same parallel region (one fork less, better balance).
-            if ex_on && !(opt.frozen && !c.retopo_now) {
+            // The exposure pass in the same parallel region (one fork less, better balance);
+            // frozen, at the start of a retopology frame instead.
+            if ex_on && !opt.frozen {
                 c.post_step(&opt, frame);
             }
         });
@@ -3551,6 +3587,8 @@ impl Colony {
             stats.cp_rebuilt += c.cp.rebuilt;
             stats.cp_snaps += c.cp.snaps;
             stats.cp_lists += c.cp.lists;
+            stats.cp_cpu_us += c.ns_cp / 1000;
+            c.ns_cp = 0;
             stats.urgent += c.urgent;
             c.urgent = 0;
             c.cp.rebuilt = 0;
@@ -3628,7 +3666,7 @@ impl Colony {
         let threads = self.pool_threads.max(1);
         let n = self.creatures.len();
         // Phases: 0 forces + own pairs, 1 cross find, 2..2+n_sub substeps, then after.
-        let counters: Vec<AtomicUsize> = (0..n_sub + 4).map(|_| AtomicUsize::new(0)).collect();
+        let counters: Vec<AtomicUsize> = (0..n_sub + 5).map(|_| AtomicUsize::new(0)).collect();
         let limit = SPIN_LIMIT;
         let barrier = Barrier { count: AtomicUsize::new(0), gen: AtomicUsize::new(0), total: threads, limit };
         let me = Ptr(self as *mut Colony);
@@ -3647,14 +3685,23 @@ impl Colony {
             }
             f(i);
         };
+        // Creatures retopologising this frame are handed out first: their phases cost several
+        // times the others', and started last they would hold every thread at the barrier.
+        let mut order: Vec<usize> = (0..n).filter(|&i| self.creatures[i].retopo_now && self.creatures[i].active).collect();
+        order.extend((0..n).filter(|&i| !(self.creatures[i].retopo_now && self.creatures[i].active)));
+        let order = &order;
+        // The creatures in no overlapping pair this frame, and the others (thread 0 fills it).
+        let mut groups: (Vec<usize>, Vec<usize>) = (Vec::new(), Vec::new());
+        let groups_ptr = Ptr(&mut groups as *mut (Vec<usize>, Vec<usize>));
         let pool = self.pool.as_ref().unwrap();
         pool.broadcast(|ctx| {
             let lead = ctx.index() == 0;
-            let creature = |i: usize| unsafe { &mut *cre.get().add(i) };
+            let creature = |i: usize| unsafe { &mut *cre.get().add(order[i]) };
             let mut t = Instant::now();
             let (mut solve, mut cross) = (0u64, 0u64);
             run(0, n, &|i| {
                 let c = creature(i);
+                c.retopo_start(&opt, ex_on, frame);
                 if c.active {
                     c.frame_forces(&opt);
                 }
@@ -3666,6 +3713,14 @@ impl Colony {
                     (*times.get()).pairs_us = t.elapsed().as_micros() as u64;
                     *ov_ptr.get() = (*me.get()).overlapping();
                     let m = (*ov_ptr.get()).len();
+                    let mut paired = vec![false; n];
+                    for &(a, b, _) in (*ov_ptr.get()).iter() {
+                        paired[a] = true;
+                        paired[b] = true;
+                    }
+                    let g = &mut *groups_ptr.get();
+                    g.0 = order.iter().copied().filter(|&i| !paired[i]).collect();
+                    g.1 = order.iter().copied().filter(|&i| paired[i]).collect();
                     *slots_ptr.get() = (0..m).map(|_| (Vec::new(), 0)).collect();
                     slots_base.store((*slots_ptr.get()).as_mut_ptr() as usize, Ordering::Release);
                 }
@@ -3696,36 +3751,28 @@ impl Colony {
                 }
                 t = Instant::now();
             }
-            for sub in 0..n_sub {
-                run(2 + sub, n, &|i| {
-                    let c = creature(i);
-                    if sub == 0 {
-                        if ad.enabled {
-                            let tc = CpuClock::now();
-                            c.made = c.capture(&ad, frame);
-                            c.ns_capture = ns(tc);
-                        }
-                    } else {
-                        c.velocities(opt.max_speed, &opt.cores);
+            // A creature in no overlapping pair (most of them, often all) has nothing to wait
+            // for between its substeps: its whole frame in one go (one hand-out, its data
+            // warm in cache, no barrier). The others go substep by substep, the contacts
+            // between creatures solved on thread 0 after each. Each creature runs the same
+            // code in the same order either way, so the result is bit-identical to serial.
+            let groups = unsafe { &*groups_ptr.get() };
+            let (alone, paired) = (&groups.0, &groups.1);
+            let frame_of = |c: &mut Creature, sub: usize| {
+                if sub == 0 {
+                    if ad.enabled {
+                        let tc = CpuClock::now();
+                        c.made = c.capture(&ad, frame);
+                        c.ns_capture = ns(tc);
                     }
-                    c.substep = sub as u32;
-                    c.fast_rings = opt.fast_rings;
-                    c.substep_own(&opt);
-                });
-                barrier.wait();
-                if lead {
-                    solve += t.elapsed().as_nanos() as u64;
-                    t = Instant::now();
-                    unsafe {
-                        (*times.get()).cross_hits = (*me.get()).solve_cross();
-                    }
-                    cross += t.elapsed().as_nanos() as u64;
-                    t = Instant::now();
+                } else {
+                    c.velocities(opt.max_speed, &opt.cores);
                 }
-                barrier.wait();
-            }
-            run(2 + n_sub, n, &|i| {
-                let c = creature(i);
+                c.substep = sub as u32;
+                c.fast_rings = opt.fast_rings;
+                c.substep_own(&opt);
+            };
+            let after = |c: &mut Creature| {
                 c.velocities(opt.max_speed, &opt.cores);
                 let events = c.events.len();
                 let ta = CpuClock::now();
@@ -3735,10 +3782,34 @@ impl Colony {
                     c.exp_dirty = true;
                     c.exp_hot = true;
                 }
-                if ex_on && !(opt.frozen && !c.retopo_now) {
+                if ex_on && !opt.frozen {
                     c.post_step(&opt, frame);
                 }
+            };
+            run(n_sub + 4, alone.len(), &|i| {
+                let c = unsafe { &mut *cre.get().add(alone[i]) };
+                for sub in 0..n_sub {
+                    frame_of(c, sub);
+                }
+                after(c);
             });
+            if !paired.is_empty() {
+                for sub in 0..n_sub {
+                    run(2 + sub, paired.len(), &|i| frame_of(unsafe { &mut *cre.get().add(paired[i]) }, sub));
+                    barrier.wait();
+                    if lead {
+                        solve += t.elapsed().as_nanos() as u64;
+                        t = Instant::now();
+                        unsafe {
+                            (*times.get()).cross_hits = (*me.get()).solve_cross();
+                        }
+                        cross += t.elapsed().as_nanos() as u64;
+                        t = Instant::now();
+                    }
+                    barrier.wait();
+                }
+                run(2 + n_sub, paired.len(), &|i| after(unsafe { &mut *cre.get().add(paired[i]) }));
+            }
             barrier.wait();
             if lead {
                 unsafe {
@@ -4486,6 +4557,52 @@ mod tests {
         (bb, bc, cc)
     }
 
+    /// Not a check: a frozen swimming crowd for a profiler (valgrind --tool=callgrind on the
+    /// test binary with `--ignored profile_frozen_swim`).
+    #[test]
+    #[ignore]
+    fn profile_frozen_swim() {
+        let mut col = exposing(1);
+        col.opt.ex.auto_cores = true;
+        col.opt.ad.core_anchors = true;
+        col.opt.cores.contact = 1.0;
+        col.opt.drag.enabled = true;
+        col.opt.tension.strength = 750.0;
+        col.opt.frozen = true;
+        col.opt.retopo_every = 30;
+        col.opt.retopo_switches = 8;
+        col.opt.frozen_self = FROZEN_SELF_CELLS;
+        col.opt.pair_skin = 8.0;
+        col.opt.fast_search = true;
+        col.opt.fast_rings = true;
+        col.opt.reuse_pairs = true;
+        let r = 14.0;
+        for w in 0..4 {
+            let mut cells = Vec::new();
+            for c in 0..30 {
+                for j in 0..5 {
+                    let mut f = real_cell(c as f32 * 2.0 * r + (j % 2) as f32 * r, w as f32 * 300.0 + j as f32 * 3f32.sqrt() * r, r, 0.0);
+                    if j > 0 && j < 4 && c > 0 && c < 29 {
+                        f[3] = 1.0;
+                    }
+                    cells.extend(f);
+                }
+            }
+            col.add_creature(&cells);
+        }
+        for f in 0..240 {
+            for c in col.creatures.iter_mut() {
+                for cell in 0..c.cells.len() {
+                    let (u, v) = ((cell / 5) as f32 / 29.0, (cell % 5) as f32 / 2.0 - 1.0);
+                    let phase = std::f32::consts::TAU * (1.5 * u + 0.5 * f as f32 / 60.0);
+                    c.set_cell_muscle(cell, 1.0 + 0.3 * phase.sin() * v);
+                }
+            }
+            col.step(1.0 / 60.0);
+        }
+        println!("profile: sticks {}", col.stats.sticks);
+    }
+
     #[test]
     fn cell_pair_lists_miss_no_touching_pair() {
         // Creatures squeezed by a hard push on one cell, bent by muscle waves and thrown
@@ -4519,11 +4636,21 @@ mod tests {
                     c.push = -c.push;
                 }
             }
-            let before: Vec<_> = col.creatures.iter().map(|c| (touching_own(c), c.topology, c.retopo_done)).collect();
+            let before: Vec<_> = col
+                .creatures
+                .iter()
+                .map(|c| {
+                    let (mut bb, bc, cc) = touching_own(c);
+                    // Beads stuck to the other's ring are the stick's to hold, not contacts.
+                    bb.retain(|&(i, j)| !(c.stuck[i as usize] == c.bead_ring[j as usize] + 1 || c.stuck[j as usize] == c.bead_ring[i as usize] + 1));
+                    ((bb, bc, cc), c.topology, c.retopo_done)
+                })
+                .collect();
             col.step(1.0 / 60.0);
             for (c, ((bb, bc, cc), topology, done)) in col.creatures.iter().zip(before) {
-                if c.topology != topology || !done {
-                    // A retopology switched cells (its lists were cleared) or the first one.
+                if c.topology != topology || !done || c.retopos > 0 {
+                    // A retopology (it may have switched cells, clearing its lists, or stuck
+                    // new beads), or the first one.
                     continue;
                 }
                 for p in &bb {

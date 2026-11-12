@@ -162,7 +162,7 @@ func _physics_process(delta: float) -> bool:
 		_head_y = Vector2(minf(_head_y.x, centers[head_i].y - body.y), maxf(_head_y.y, centers[head_i].y - body.y))
 		for key: String in ["own_cpu_us", "own_pairs_us", "pairs_us", "solve_us", "settle_us", "cross_us", "rings_cpu_us", "sticks_cpu_us",
 				"intra_cpu_us", "tension_cpu_us", "drag_cpu_us", "exposure_runs", "exposure_us", "retopos", "retopo_cpu_us", "urgent",
-				"pair_builds", "cp_rebuilt", "cp_lists", "cp_snaps", "to_core", "to_ring", "broken", "made"]:
+				"pair_builds", "cp_rebuilt", "cp_lists", "cp_snaps", "cp_cpu_us", "to_core", "to_ring", "broken", "made"]:
 			_sums[key] = _sums.get(key, 0.0) + float(stt[key])
 		if _trace:
 			print("frame %d step %.2f pairs %.2f solve %.2f settle %.2f retopos %d urgent %d cp_rebuilt %d/%d" % [_frame, stt["total_us"] / 1000.0,

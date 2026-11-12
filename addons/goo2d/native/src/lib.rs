@@ -1228,6 +1228,7 @@ impl GooColony {
         put(&mut d, "cp_rebuilt", s.cp_rebuilt as i64);
         put(&mut d, "cp_snaps", s.cp_snaps as i64);
         put(&mut d, "cp_lists", s.cp_lists as i64);
+        put(&mut d, "cp_cpu_us", s.cp_cpu_us as i64);
         put(&mut d, "urgent", s.urgent as i64);
         let (mut beads, mut cores, mut rings, mut bonds) = (0usize, 0usize, 0usize, 0usize);
         for c in &self.c.creatures {
