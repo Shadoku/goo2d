@@ -15,7 +15,14 @@ extends SceneTree
 ## beside a closed ring of 10 cells round a pocket and an open one of 9 round a bay (2 s).
 ## crash: two clusters of 37 with cores thrown at each other at 300 px/s each, compliant
 ## cores, at the impact (8 frames after the throw). Every scene runs with GooColonySim.EXPOSURE_OPTIONS.
-## GooTuning.unit 0.5, drawn 4 screen px per px (exposure and crash: 3).
+## Milestone 3's (docs/colony-tension.md), with GooColonySim.tension_options() (or
+## --tension=T, the strength at unit 1): ragged: a ragged cluster of 30 as placed (left,
+## not stepped), after 5 s without tension (middle) and with it (right). wall: two equal
+## cells (top) and a cell beside one 1.6 times its size (bottom) after 3 s, without tension
+## (left) and with it (right). worm: a single file of 12 cells (top) and a worm three cells
+## wide (bottom) after 5 s, without tension (left) and with it (right).
+## GooTuning.unit 0.5, drawn 4 screen px per px (exposure and crash: 3; ragged, worm: 2;
+## wall: 5).
 
 const UNIT: float = 0.5
 const ZOOM: float = 4.0
@@ -29,6 +36,7 @@ var _frame: int = 0
 var _frames: int = 0
 var _pull: float = 0.0
 var _cells: Array[Vector3] = []
+var _tension: float = -1.0
 
 class View extends Node2D:
 	var sim: GooColonySim
@@ -104,13 +112,15 @@ func _initialize() -> void:
 	for arg: String in args:
 		if arg.begins_with("--scene="):
 			which = arg.get_slice("=", 1)
+		elif arg.begins_with("--tension="):
+			_tension = arg.get_slice("=", 1).to_float()
 		elif not arg.begins_with("--"):
 			_out = arg
 	if _out.is_empty():
 		push_error("colony_shot: give an output directory")
 		quit(1)
 		return
-	_scenes = PackedStringArray(["rest", "pull", "collide", "exposure", "crash"]) if which == "all" else PackedStringArray([which])
+	_scenes = PackedStringArray(["rest", "pull", "collide", "exposure", "crash", "ragged", "wall", "worm"]) if which == "all" else PackedStringArray([which])
 	GooTuning.unit = UNIT
 	RenderingServer.set_default_clear_color(Color(0.08, 0.09, 0.12))
 	_next_scene()
@@ -122,10 +132,20 @@ func _next_scene() -> void:
 	if _scene >= _scenes.size():
 		quit(0)
 		return
-	_sim = GooColonySim.new(GooColonySim.EXPOSURE_OPTIONS)
+	var options := GooColonySim.EXPOSURE_OPTIONS.duplicate()
+	if _scenes[_scene] in ["ragged", "wall", "worm"]:
+		options.merge(GooColonySim.tension_options() if _tension < 0.0 else GooColonySim.tension_options(_tension), true)
+	_sim = GooColonySim.new(options)
 	_view = View.new()
 	_view.sim = _sim
-	var zoom := 3.0 if _scenes[_scene] in ["crash", "exposure"] else ZOOM
+	var zoom := ZOOM
+	match _scenes[_scene]:
+		"crash", "exposure":
+			zoom = 3.0
+		"ragged", "worm":
+			zoom = 2.0
+		"wall":
+			zoom = 5.0
 	_view.scale = Vector2(zoom, zoom)
 	_view.position = Vector2(960, 540)
 	root.add_child(_view)
@@ -163,7 +183,83 @@ func _next_scene() -> void:
 			_add(hex, Vector2(-120, 0), 0.0)
 			_add(hex, Vector2(120, 14), 0.0)
 			_frames = 30 + 8
+		"ragged":
+			var cells := ragged_cluster(30, 3)
+			for i: int in 3:
+				var k := _sim.add_creature(_offset(cells, Vector2((i - 1) * 300.0, 0)))
+				if i == 0:
+					_sim.colony.set_asleep(k, true)
+				elif i == 1:
+					_sim.colony.set_creature_tension(k, 0.0)
+			_frames = 300
+		"wall":
+			var r := GooTuning.min_radius()
+			for row: int in 2:
+				var r2 := r if row == 0 else 1.6 * r
+				for i: int in 2:
+					var at := Vector2((i - 0.5) * 110.0, (row - 0.5) * 70.0)
+					var k := _sim.add_creature([{ "position": at + Vector2(-r, 0), "radius": r }, { "position": at + Vector2(r2, 0), "radius": r2 }])
+					if i == 0:
+						_sim.colony.set_creature_tension(k, 0.0)
+			_frames = 180
+		"worm":
+			for row: int in 2:
+				var cells := worm_cells(12 if row == 0 else 10, 1 if row == 0 else 3, 1)
+				for i: int in 2:
+					var k := _sim.add_creature(_offset(cells, Vector2((i - 0.5) * 400.0 - 150.0, (row - 0.5) * 160.0)))
+					if i == 0:
+						_sim.colony.set_creature_tension(k, 0.0)
+			_frames = 300
 	_view.queue_redraw()
+
+static func _offset(cells: Array, by: Vector2) -> Array:
+	var out: Array = []
+	for c: Dictionary in cells:
+		var d := c.duplicate()
+		d["position"] = (c["position"] as Vector2) + by
+		out.append(d)
+	return out
+
+## A ragged cluster of `count` cells of the smallest size: each new cell touches a cell
+## picked at random, in a random direction, where it overlaps none (a random walk of
+## branches: deep bays, arms one cell wide). Centred.
+static func ragged_cluster(count: int, seed_value: int) -> Array:
+	var rng := RandomNumberGenerator.new()
+	rng.seed = seed_value
+	var r := GooTuning.min_radius()
+	var at: Array[Vector2] = [Vector2.ZERO]
+	while at.size() < count:
+		var p := at[rng.randi() % at.size()] + Vector2.from_angle(rng.randf() * TAU) * 2.0 * r
+		var free := true
+		for q: Vector2 in at:
+			if q.distance_to(p) < 2.0 * r - 0.01:
+				free = false
+				break
+		if free:
+			at.append(p)
+	var mean := Vector2.ZERO
+	for p: Vector2 in at:
+		mean += p
+	mean /= at.size()
+	var cells: Array = []
+	for p: Vector2 in at:
+		cells.append({ "position": p - mean, "radius": r })
+	return cells
+
+## A worm `length` cells long and `wide` cells wide (rows offset half a cell, touching),
+## each cell jittered by up to 0.3 px (seeded): centred.
+static func worm_cells(length: int, wide: int, seed_value: int) -> Array:
+	var rng := RandomNumberGenerator.new()
+	rng.seed = seed_value
+	var r := GooTuning.min_radius()
+	var cells: Array = []
+	var span := Vector2((length - 1) * 2.0 * r + (r if wide > 1 else 0.0), (wide - 1) * sqrt(3.0) * r)
+	for i: int in length:
+		for j: int in wide:
+			var p := Vector2(i * 2.0 * r + (r if j % 2 == 1 else 0.0), j * sqrt(3.0) * r) - span * 0.5
+			p += Vector2(rng.randf_range(-0.3, 0.3), rng.randf_range(-0.3, 0.3))
+			cells.append({ "position": p, "radius": r })
+	return cells
 
 func _add(cells: Array[Vector3], at: Vector2, angle: float) -> int:
 	var list: Array = []

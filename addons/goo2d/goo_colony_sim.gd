@@ -41,6 +41,30 @@ const SKIP_SPEED: float = 1600.0
 const DRAG_OPTIONS: Dictionary = { "drag": true, "drag_density": 1.0, "drag_normal": 0.1, "drag_tangent": 0.01,
 	"drag_linear_normal": 60.0, "drag_linear_tangent": 8.0, "drag_max_step": 0.5 }
 
+## Milestone 3's surface tension (docs/colony-tension.md): the force each edge of a
+## creature's surface pulls with, at unit 1 (tension_options() scales it by
+## GooTuning.unit, as forces scale). At 1500 two touching cells of the smallest size zip
+## their wall from 3 sticks to 4, their centres from 0.92 to 0.80 of a diameter apart,
+## squeezed to about 0.91 of their area; see the doc for what it costs a designed shape.
+const TENSION: float = 1500.0
+
+## The surface tension on, `strength` at unit 1 (the option is a force at the current
+## unit); pockets keep their size (`tension_pockets` 0). It runs the exposure pass, whose
+## surface it pulls along. Merge it with EXPOSURE_OPTIONS (or use everything_options()).
+static func tension_options(strength: float = TENSION) -> Dictionary:
+	return { "tension": strength * GooTuning.unit, "tension_pockets": 0.0 }
+
+## Everything the fluid game's creatures use (docs/colony-tension.md): adhesion (always on
+## in GooColonySim), EXPOSURE_OPTIONS, DRAG_OPTIONS, the surface tension at `strength` (at
+## unit 1) and the creature's own contact candidates kept across frames (reuse_pairs,
+## pair_skin 4 px at unit 1).
+static func everything_options(strength: float = TENSION) -> Dictionary:
+	var options := EXPOSURE_OPTIONS.duplicate()
+	options.merge(DRAG_OPTIONS)
+	options.merge(tension_options(strength))
+	options.merge({ "reuse_pairs": true, "pair_skin": 4.0 * GooTuning.unit })
+	return options
+
 var colony: GooColony
 
 ## Ask may_adhere() once about each pair of cells that touch for the first time (until

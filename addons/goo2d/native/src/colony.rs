@@ -3694,4 +3694,151 @@ mod tests {
             }
         }
     }
+
+    /// Momentum and angular momentum (orbital and the cores' spin) of creature `c`.
+    fn momenta(c: &Creature) -> (Vector2, f64) {
+        let mut p = Vector2::ZERO;
+        let mut l = 0.0f64;
+        for i in 0..c.pos.len() {
+            let m = 1.0 / c.w[i];
+            p += c.vel[i] * m;
+            l += (cross(c.pos[i], c.vel[i]) * m) as f64;
+        }
+        for k in 0..c.cpos.len() {
+            let m = 1.0 / c.cw[k];
+            p += c.cvel[k] * m;
+            l += (cross(c.cpos[k], c.cvel[k]) * m) as f64 + (c.comega[k] / c.cwrot[k]) as f64;
+        }
+        (p, l)
+    }
+
+    #[test]
+    fn tension_adds_no_net_force_or_torque_even_through_cores() {
+        // A hex cluster whose two rim cells are cores on the outline (the hops onto them push
+        // the cores and turn them), off the origin, moving and spinning: one tension
+        // impulse changes neither momentum nor angular momentum beyond rounding.
+        let mut col = exposing(1);
+        col.opt.tension.strength = 3000.0;
+        col.opt.tension.pockets = 1.0;
+        let k = hex(&mut col, Vector2::new(300.0, -200.0), 1.0);
+        for _ in 0..20 {
+            col.step(1.0 / 60.0);
+        }
+        let c = &mut col.creatures[k];
+        assert!(c.demote(0, 2.5, 1.0) >= 0.0);
+        assert!(c.demote(4, 2.5, 1.0) >= 0.0);
+        c.update_exposure_now(2.5, 5.0);
+        let centre = c.center();
+        for i in 0..c.pos.len() {
+            let r = c.pos[i] - centre;
+            c.vel[i] = Vector2::new(-r.y, r.x) * 0.7 + Vector2::new(40.0, 10.0);
+        }
+        for q in 0..c.cpos.len() {
+            let r = c.cpos[q] - centre;
+            c.cvel[q] = Vector2::new(-r.y, r.x) * 0.7 + Vector2::new(40.0, 10.0);
+            c.comega[q] = 0.3;
+        }
+        let core_hops = c.loops.iter().flat_map(|l| l.pts.iter()).filter(|p| p.core).count();
+        let (p0, l0) = momenta(c);
+        let omega0: Vec<f32> = c.comega.clone();
+        c.apply_tension(&col.opt.tension);
+        let (p1, l1) = momenta(c);
+        let impulse: f32 = c.tension_f.iter().map(|f| len(*f)).sum::<f32>() * c.h;
+        let reach = c.tension_x.iter().map(|x| len(*x)).fold(0.0f32, f32::max);
+        let turned = c.comega.iter().zip(&omega0).filter(|(a, b)| a != b).count();
+        println!(
+            "{} edges, {} loop points on cores, {} cores turned; impulse {:.4}; momentum change {:?} ({:.2e} of it), angular {:.3e} ({:.2e} of impulse × reach)",
+            c.tension_f.len() / 2,
+            core_hops,
+            turned,
+            impulse,
+            p1 - p0,
+            len(p1 - p0) / impulse,
+            l1 - l0,
+            (l1 - l0).abs() / (impulse * reach) as f64
+        );
+        assert!(core_hops > 0 && turned > 0, "the outline runs along a core and turns it");
+        assert!(len(p1 - p0) <= 1e-5 * impulse, "no net force");
+        assert!((l1 - l0).abs() <= 1e-5 * (impulse * reach) as f64, "no net torque");
+    }
+
+    #[test]
+    fn threaded_tension_is_bit_identical_to_serial_and_strength_zero_changes_nothing() {
+        let run = |threads: usize, strength: f32| {
+            let mut col = exposing(threads);
+            col.opt.ex.auto_cores = true;
+            col.opt.ad.core_anchors = true;
+            col.opt.cores.contact = 1.0;
+            col.opt.drag.enabled = true;
+            col.opt.reuse_pairs = true;
+            col.opt.tension.strength = strength;
+            col.opt.tension.pockets = 0.5;
+            col.opt.tension.types[1] = 2.0;
+            for c in 0..6 {
+                let k = hex(&mut col, Vector2::new(c as f32 * 160.0, (c % 2) as f32 * 30.0), 0.0);
+                col.creatures[k].push = Vector2::new(if c % 2 == 0 { 900.0 } else { -900.0 }, 0.0);
+                col.creatures[k].cells[5].ctype = 1;
+                if c == 3 {
+                    col.creatures[k].tension_scale = 0.5;
+                }
+            }
+            let mut events = Vec::new();
+            for f in 0..200 {
+                col.step(1.0 / 60.0);
+                if f == 90 {
+                    for c in col.creatures.iter_mut() {
+                        c.push = -c.push;
+                    }
+                }
+                events.extend(col.take_events());
+            }
+            (col, events)
+        };
+        let same = |a: &Colony, b: &Colony| {
+            a.creatures.iter().zip(&b.creatures).all(|(ca, cb)| {
+                ca.pos.len() == cb.pos.len()
+                    && ca.cpos.len() == cb.cpos.len()
+                    && ca.pos.iter().zip(&cb.pos).chain(ca.cpos.iter().zip(&cb.cpos)).chain(ca.vel.iter().zip(&cb.vel)).all(|(p, q)| p.x.to_bits() == q.x.to_bits() && p.y.to_bits() == q.y.to_bits())
+                    && ca.crot.iter().zip(&cb.crot).all(|(p, q)| p.to_bits() == q.to_bits())
+                    && ca.tension_f.iter().zip(&cb.tension_f).all(|(p, q)| p.x.to_bits() == q.x.to_bits() && p.y.to_bits() == q.y.to_bits())
+                    && ca.exposed == cb.exposed
+            })
+        };
+        let (a, ea) = run(1, 2000.0);
+        let (b, eb) = run(4, 2000.0);
+        let edges: usize = a.creatures.iter().map(|c| c.tension_f.len() / 2).sum();
+        println!("tension on: {} edges in the last substep, {} events, {} cores", edges, ea.len(), a.creatures.iter().map(|c| c.core_count()).sum::<usize>());
+        assert!(edges > 0);
+        assert_eq!(ea, eb);
+        assert!(same(&a, &b), "threaded == serial with tension");
+        // Strength 0: the very same as a colony whose options never mention it.
+        let (z, ez) = run(1, 0.0);
+        let mut plain = {
+            let mut col = exposing(1);
+            col.opt.ex.auto_cores = true;
+            col.opt.ad.core_anchors = true;
+            col.opt.cores.contact = 1.0;
+            col.opt.drag.enabled = true;
+            col.opt.reuse_pairs = true;
+            col
+        };
+        for c in 0..6 {
+            let k = hex(&mut plain, Vector2::new(c as f32 * 160.0, (c % 2) as f32 * 30.0), 0.0);
+            plain.creatures[k].push = Vector2::new(if c % 2 == 0 { 900.0 } else { -900.0 }, 0.0);
+            plain.creatures[k].cells[5].ctype = 1;
+        }
+        let mut ep = Vec::new();
+        for f in 0..200 {
+            plain.step(1.0 / 60.0);
+            if f == 90 {
+                for c in plain.creatures.iter_mut() {
+                    c.push = -c.push;
+                }
+            }
+            ep.extend(plain.take_events());
+        }
+        assert_eq!(ez, ep);
+        assert!(same(&z, &plain), "strength 0 is the run without it");
+        assert!(!same(&a, &z), "and tension does something");
+    }
 }
