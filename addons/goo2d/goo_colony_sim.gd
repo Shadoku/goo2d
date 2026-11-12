@@ -23,6 +23,24 @@ const JOIN_REACH: float = 8.0
 ## with the unit, accelerations do, so forces scale with it).
 const BREAK_FORCE: float = 24000.0
 
+## Milestone 2's parts on (docs/colony-exposure.md): exposure (the particles of cells
+## with no exposed bead take no part in contacts with other creatures met slower than
+## SKIP_SPEED), rings wholly enclosed becoming cores and exposed cores rings again, cores'
+## contacts with their own creature compliant (1 × the cell's skin stiffness: an impact
+## squashes the outer cells less), beads anchored on cores' rims. Pass it (merged with your
+## own) to new(). The water drag is separate: DRAG_OPTIONS.
+const EXPOSURE_OPTIONS: Dictionary = { "exposure": true, "auto_cores": true, "core_contact": 1.0, "core_anchors": true }
+## Creatures meeting faster than this (mean velocities, px/s at unit 1) collide whole: at
+## 1200 px/s an outer layer is crushed enough to let the other's beads through to the
+## skipped cells behind it; at 600 it is not.
+const SKIP_SPEED: float = 1600.0
+## The water drag on exposed edges, with the fluid game's numbers (its GameSettings:
+## WATER_DENSITY 1, DRAG_NORMAL 0.1, DRAG_TANGENT 0.01, DRAG_LINEAR_NORMAL 60,
+## DRAG_LINEAR_TANGENT 8, DRAG_MAX_STEP_FRACTION 0.5, tuned at unit 0.5). Cells meant to
+## swim in it want no damping of their own: cell_floats()'s `linear_damp` 0.
+const DRAG_OPTIONS: Dictionary = { "drag": true, "drag_density": 1.0, "drag_normal": 0.1, "drag_tangent": 0.01,
+	"drag_linear_normal": 60.0, "drag_linear_tangent": 8.0, "drag_max_step": 0.5 }
+
 var colony: GooColony
 
 ## Ask may_adhere() once about each pair of cells that touch for the first time (until
@@ -42,7 +60,7 @@ func _init(options: Dictionary = {}) -> void:
 	colony = GooColony.new()
 	var unit := GooTuning.unit
 	colony.set_options({ "adhesion": true, "capture": CAPTURE * unit, "join_reach": JOIN_REACH * unit,
-		"break_force": BREAK_FORCE * unit, "max_speed": GooTuning.MAX_BEAD_SPEED * unit })
+		"break_force": BREAK_FORCE * unit, "max_speed": GooTuning.MAX_BEAD_SPEED * unit, "skip_speed": SKIP_SPEED * unit })
 	if not options.is_empty():
 		colony.set_options(options)
 

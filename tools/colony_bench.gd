@@ -28,6 +28,24 @@ extends SceneTree
 ##   --capture=PX --break=F       adhesion's capture gap and break force at unit 1 (scaled
 ##                                by UNIT; GooColonySim's CAPTURE and BREAK_FORCE by
 ##                                default); --sticky: sticky-only walls
+##   --exposure=on|off            milestone 2 (docs/colony-exposure.md): exposure, pockets
+##                                and the outline computed in the step (adhesion only)
+##   --auto-cores=on|off          rings wholly enclosed become cores, exposed cores rings
+##   --skip=none|cells|beads      what of a creature takes no part in contacts with others
+##                                (none: the default; cells: cells with no exposed bead;
+##                                beads: every enclosed bead; both unsound, see the doc)
+##   --core-contact=X             cores' contacts with their own creature compliant (0.3 in
+##                                GooColonySim.EXPOSURE_OPTIONS; 0 rigid)
+##   --core-anchors=on|off        beads anchored on cores' rims
+##   --exposure-every=F --exposure-hot=F   the exposure pass's safety net (every F frames,
+##                                30) and how long it runs every frame after a parting (6)
+##   --m2                         all of milestone 2 at once: GooColonySim.EXPOSURE_OPTIONS
+##   --water-drag=on|off          the game's water drag on exposed edges, in the kernel
+##                                (GooColonySim.DRAG_OPTIONS); the linear damping --drag
+##                                stays unless --drag=0
+##   --water=uniform|cells        the water's velocity: one per creature (zero), or each
+##                                cell's sampled in GDScript from a stand-in vortex every frame
+##                                (what feeding a FlowField's velocities costs)
 ##   --sleep=F                    the fraction of creatures asleep (colony mode)
 ##   --coarse=F                   the fraction stepped every other frame (colony mode)
 ##   --frames=F --warmup=W        measured frames after W warm-up frames (300, 60)
@@ -76,6 +94,14 @@ var _hold: String = "bonds"
 var _capture: float = -1.0
 var _break: float = -1.0
 var _sticky: bool = false
+var _exposure: bool = false
+var _auto_cores: bool = false
+var _skip: int = 0
+var _core_contact: float = 0.0
+var _core_anchors: bool = false
+var _water_drag: bool = false
+var _water: String = "uniform"
+var _exp_every_hot := Vector2i(30, 6)
 var _sleep: float = 0.0
 var _coarse: float = 0.0
 var _frames: int = 300
@@ -120,6 +146,8 @@ var _t_push: int = 0
 var _t_proc_first: int = 0
 var _design_cache: Dictionary = {}
 var _done: bool = false
+var _switches: int = 0
+var _switch_frames: PackedInt64Array = PackedInt64Array([0, 0])
 
 # ---- Setup ----
 
@@ -146,6 +174,20 @@ func _initialize() -> void:
 		elif arg.begins_with("--capture="): _capture = float(value)
 		elif arg.begins_with("--break="): _break = float(value)
 		elif arg == "--sticky": _sticky = true
+		elif arg.begins_with("--exposure="): _exposure = value == "on"
+		elif arg.begins_with("--auto-cores="): _auto_cores = value == "on"
+		elif arg.begins_with("--skip="): _skip = ["none", "cells", "beads"].find(value)
+		elif arg.begins_with("--core-contact="): _core_contact = float(value)
+		elif arg.begins_with("--core-anchors="): _core_anchors = value == "on"
+		elif arg == "--m2":
+			_exposure = true
+			_auto_cores = true
+			_core_contact = GooColonySim.EXPOSURE_OPTIONS["core_contact"]
+			_core_anchors = true
+		elif arg.begins_with("--water-drag="): _water_drag = value == "on"
+		elif arg.begins_with("--water="): _water = value
+		elif arg.begins_with("--exposure-every="): _exp_every_hot.x = int(value)
+		elif arg.begins_with("--exposure-hot="): _exp_every_hot.y = int(value)
 		elif arg.begins_with("--sleep="): _sleep = float(value)
 		elif arg.begins_with("--coarse="): _coarse = float(value)
 		elif arg.begins_with("--frames="): _frames = int(value)
@@ -502,6 +544,11 @@ func _build_colony(design: Array[Vector3], kinds: PackedByteArray, starts: Array
 			"break_force": (_break if _break > 0.0 else GooColonySim.BREAK_FORCE) * UNIT })
 		if _sticky:
 			_colony.set_join_mode(0, 0, GooColony.JOIN_STICKY)
+		_colony.set_options({ "exposure": _exposure, "auto_cores": _auto_cores, "skip_enclosed": maxi(_skip, 0),
+			"skip_speed": GooColonySim.SKIP_SPEED * UNIT, "core_contact": _core_contact, "core_anchors": _core_anchors,
+			"exposure_every": _exp_every_hot.x, "exposure_hot": _exp_every_hot.y })
+	if _water_drag:
+		_colony.set_options(GooColonySim.DRAG_OPTIONS)
 	for ci: int in _creatures:
 		var hue := fmod(0.13 + ci * 0.618, 1.0)
 		var floats := PackedFloat32Array()
@@ -780,6 +827,8 @@ func _push_all(delta: float) -> void:
 		match _mode:
 			"colony":
 				_colony.push_creature(ci, push)
+				if _water_drag and _water == "cells":
+					_colony.set_cell_water(ci, _vortex(_colony.creature_cell_centers(ci)))
 			"nodes":
 				for body: Goo2D in _bodies[ci]:
 					body.apply_impulse(push * delta * body.body_mass() / body.particle_count())
@@ -788,6 +837,19 @@ func _push_all(delta: float) -> void:
 				var masses: PackedFloat32Array = _bead_masses[ci]
 				for k: int in keys.size():
 					_kernel.apply_impulse(keys[k], push * delta * masses[k])
+
+## A stand-in for the game's FlowField: one slow vortex over the arena, sampled per point
+## in GDScript as velocities_at() would be.
+func _vortex(points: PackedVector2Array) -> PackedVector2Array:
+	var out := PackedVector2Array()
+	out.resize(points.size())
+	var centre := _arena.get_center()
+	var radius := 0.5 * _arena.size.length()
+	for i: int in points.size():
+		var rel := points[i] - centre
+		var x := rel.length() / radius
+		out[i] = rel.orthogonal().normalized() * (4.0 * x * (1.0 - x) * 60.0) if x < 1.0 else Vector2.ZERO
+	return out
 
 func _center(ci: int) -> Vector2:
 	match _mode:
@@ -835,6 +897,15 @@ func _on_physics(first: bool, delta: float) -> void:
 			_sample("cross_hits", s["cross_hits"], false)
 			_sample("intra_pairs", s["intra_pairs"], false)
 			_sample("cross_pairs", s["cross_pairs"], false)
+			_sample("exposure", s["exposure_us"])
+			_sample("exp_runs", s["exposure_runs"], false)
+			_sample("drag_cpu", s["drag_cpu_us"])
+			_sample("skipped", s["cross_skipped"], false)
+			_sample("enclosed", s["enclosed"], false)
+			_sample("pockets", s["pockets"], false)
+			_switches += s["to_core"] + s["to_ring"]
+			_switch_frames[0] += s["to_core"]
+			_switch_frames[1] += s["to_ring"]
 		"nodes":
 			var solver := _world.kernel().solver()
 			kernel_us = solver["last_step_usec"]
@@ -905,7 +976,8 @@ func _sample(key: String, value: float, usec: bool = true) -> void:
 
 func _report() -> void:
 	print("colony_bench: %d frames after %d warm-up (ms: min / median / p95)" % [_frames, _warmup])
-	var order := ["physics", "kernel", "holds", "capture", "settle", "sticks", "broken", "script", "push", "draw", "draw_rust", "rs_setup", "rs_render",
+	var order := ["physics", "kernel", "holds", "capture", "settle", "exposure", "exp_runs", "drag_cpu", "skipped", "enclosed", "pockets",
+		"sticks", "broken", "script", "push", "draw", "draw_rust", "rs_setup", "rs_render",
 		"forces", "pairs", "solve", "rings_cpu", "intra_cpu", "cross", "vel", "cross_hits", "intra_pairs", "cross_pairs",
 		"k_pairpass", "k_links", "k_solver", "k_rings", "k_skins"]
 	for key: String in order:
@@ -919,6 +991,10 @@ func _report() -> void:
 		print("  health (worst over the measured frames, every 10th): fastest %.0f px/s, ring area %.2f..%.2f of target, %d inside out, bond stretch %.2f, overlap %.2f px, sticks stretched %.2f / squeezed %.2f px, load %.0f, %d not finite" % [
 			_health["fastest"], _health["area_min"], _health["area_max"], int(_health["inverted"]), _health["stretch"], _health["overlap"],
 			_health["stick_stretch"], _health["stick_squeeze"], _health["stick_load"], int(_health["not_finite"])])
+	if _mode == "colony" and _exposure:
+		var st := _colony.stats()
+		print("  milestone 2: %d rings and %d cores at the end; over every frame, warm-up included, %d rings became cores and %d cores rings" % [
+			st["rings"], st["cores"], _switch_frames[0], _switch_frames[1]])
 	if _mode == "colony" and _hold == "adhesion":
 		var loads := PackedFloat32Array()
 		for ci: int in _creatures:
@@ -933,7 +1009,8 @@ func _report() -> void:
 	var line := "RESULT mode=%s n=%d m=%d shape=%s mix=%s beads=%d cores=%s intra=%s threads=%d substeps=%d draw=%s hold=%s" % [
 		_mode, _creatures, _cells, _shape, _mix, _beads, _cores and _mode == "colony", "cores" if _core_contacts else ("on" if _intra else "off"), _threads, _substeps, _draw,
 		_hold + ("/sticky" if _sticky else "")]
-	for key: String in ["physics", "kernel", "holds", "script", "draw", "rs_setup"]:
+	line += " exposure=%s auto=%s skip=%d contact=%.2f anchors=%s water_drag=%s water=%s" % [_exposure, _auto_cores, _skip, _core_contact, _core_anchors, _water_drag, _water]
+	for key: String in ["physics", "kernel", "holds", "exposure", "drag_cpu", "pairs", "cross", "script", "draw", "rs_setup"]:
 		if _samples.has(key):
 			var list: PackedFloat64Array = _samples[key]
 			line += " %s=%.2f/%.2f" % [key + "_ms", list[list.size() / 2], list[mini(int(list.size() * 0.95), list.size() - 1)]]

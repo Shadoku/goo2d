@@ -1036,7 +1036,15 @@ impl GooColony {
     /// "slop", "bond_scale"; adhesion's (docs/colony-adhesion.md): "adhesion" (bool),
     /// "capture" (px), "capture_every" (frames), "join_reach" (px), "stick_scale", "anchor_scale", "creep" (/s),
     /// "break_force", "load_time" (s), "break_rest" (s), "ask" (bool: first touches wait for answer()), "capture_paused"
-    /// (bool, the whole colony).
+    /// (bool, the whole colony), "core_anchors" (bool: a bead on a core's rim anchored
+    /// when the table says so); milestone 2's (docs/colony-exposure.md): "exposure"
+    /// (bool), "exposure_gap" (px; below 0: the capture gap), "core_gap" (× the gap for a
+    /// core's virtual beads), "exposure_every", "exposure_hot" (frames), "skip_enclosed" (SKIP_NONE, SKIP_CELLS
+    /// (or true: the default), SKIP_BEADS),
+    /// "auto_cores" (bool), "to_core_time", "to_ring_time", "switch_rest", "core_ease"
+    /// (s), "soft_cores" (bool), "core_stiffness", "core_damping", "core_min_radius",
+    /// "core_max_radius", "core_contact" (× the core cell's skin stiffness; 0 rigid), "skip_speed" (px/s), "drag" (bool), "drag_density", "drag_normal", "drag_tangent",
+    /// "drag_linear_normal", "drag_linear_tangent", "drag_max_step".
     #[func]
     fn set_options(&mut self, options: VarDictionary) {
         for (key, value) in options.iter_shared() {
@@ -1065,6 +1073,37 @@ impl GooColony {
                 "break_rest" => o.ad.break_rest = (number as f32).max(0.0),
                 "ask" => o.ad.ask = value.try_to::<bool>().unwrap_or(number != 0.0),
                 "capture_paused" => o.ad.paused = value.try_to::<bool>().unwrap_or(number != 0.0),
+                "core_anchors" => o.ad.core_anchors = value.try_to::<bool>().unwrap_or(number != 0.0),
+                "exposure" => o.ex.enabled = value.try_to::<bool>().unwrap_or(number != 0.0),
+                "exposure_gap" => o.ex.gap = number as f32,
+                "core_gap" => o.ex.core_gap = (number as f32).max(0.0),
+                "exposure_every" => o.ex.every = (number as u32).max(1),
+                "exposure_hot" => o.ex.hot = number.max(0.0) as u32,
+                "skip_enclosed" => {
+                    o.ex.skip = match value.try_to::<bool>() {
+                        Ok(b) => b as u8,
+                        Err(_) => (number as u8).min(2),
+                    }
+                }
+                "auto_cores" => o.ex.auto_cores = value.try_to::<bool>().unwrap_or(number != 0.0),
+                "to_core_time" => o.ex.to_core_time = (number as f32).max(0.0),
+                "to_ring_time" => o.ex.to_ring_time = (number as f32).max(0.0),
+                "switch_rest" => o.ex.switch_rest = (number as f32).max(0.0),
+                "core_ease" => o.ex.core_ease = (number as f32).max(0.0),
+                "soft_cores" => o.cores.soft = value.try_to::<bool>().unwrap_or(number != 0.0),
+                "core_stiffness" => o.cores.stiffness = (number as f32).max(1e-4),
+                "core_damping" => o.cores.damping = (number as f32).max(0.0),
+                "core_min_radius" => o.cores.min_radius = (number as f32).clamp(0.1, 1.0),
+                "core_max_radius" => o.cores.max_radius = (number as f32).max(1.0),
+                "core_contact" => o.cores.contact = (number as f32).max(0.0),
+                "skip_speed" => o.ex.skip_speed = (number as f32).max(0.0),
+                "drag" => o.drag.enabled = value.try_to::<bool>().unwrap_or(number != 0.0),
+                "drag_density" => o.drag.density = (number as f32).max(0.0),
+                "drag_normal" => o.drag.normal = (number as f32).max(0.0),
+                "drag_tangent" => o.drag.tangent = (number as f32).max(0.0),
+                "drag_linear_normal" => o.drag.linear_normal = (number as f32).max(0.0),
+                "drag_linear_tangent" => o.drag.linear_tangent = (number as f32).max(0.0),
+                "drag_max_step" => o.drag.max_step = (number as f32).max(0.0),
                 other => godot_error!("GooColony.set_options(): unknown option '{}'", other),
             }
         }
@@ -1146,6 +1185,15 @@ impl GooColony {
         put(&mut d, "sticks", s.sticks as i64);
         put(&mut d, "made", s.made as i64);
         put(&mut d, "broken", s.broken as i64);
+        put(&mut d, "drag_cpu_us", s.drag_cpu_us as i64);
+        put(&mut d, "exposure_us", s.exposure_us as i64);
+        put(&mut d, "exposure_runs", s.exposure_runs as i64);
+        put(&mut d, "exposed", s.exposed as i64);
+        put(&mut d, "enclosed", s.enclosed as i64);
+        put(&mut d, "pockets", s.pockets as i64);
+        put(&mut d, "to_core", s.to_core as i64);
+        put(&mut d, "to_ring", s.to_ring as i64);
+        put(&mut d, "cross_skipped", s.cross_skipped as i64);
         let (mut beads, mut cores, mut rings, mut bonds) = (0usize, 0usize, 0usize, 0usize);
         for c in &self.c.creatures {
             beads += c.bead_count();
@@ -1167,7 +1215,7 @@ impl GooColony {
         let mut d = VarDictionary::new();
         let names = [
             "fastest", "area_min", "area_max", "inverted", "stretch", "overlap", "stick_stretch", "stick_squeeze", "stick_load", "sticks",
-            "not_finite",
+            "not_finite", "core_min", "core_max",
         ];
         for (k, name) in names.iter().enumerate() {
             put(&mut d, name, h[k] as f64);
@@ -1525,5 +1573,177 @@ impl GooColony {
             ]);
         }
         PackedFloat32Array::from(v)
+    }
+
+    // ---- Exposure, cores, drag (docs/colony-exposure.md) ----
+
+    /// The "skip_enclosed" modes: none; the particles of cells with no exposed bead
+    /// (the default); every enclosed bead.
+    #[constant]
+    const SKIP_NONE: i64 = 0;
+    #[constant]
+    const SKIP_CELLS: i64 = 1;
+    #[constant]
+    const SKIP_BEADS: i64 = 2;
+    /// Loop kinds in creature_loop_kinds().
+    #[constant]
+    const LOOP_OUTSIDE: i64 = 1;
+    #[constant]
+    const LOOP_POCKET: i64 = 2;
+
+    /// Every particle of creature `c` moves at `velocity` (beads and cores; cores stop
+    /// turning, soft radii stop changing).
+    #[func]
+    fn set_creature_velocity(&mut self, c: i64, velocity: Vector2) {
+        if let Some(cr) = self.c.creatures.get_mut(c as usize) {
+            cr.set_velocity(velocity);
+        }
+    }
+
+    /// Creature `c`'s velocities: every bead's (ring after ring), then every core's.
+    #[func]
+    fn creature_velocities(&self, c: i64) -> PackedVector2Array {
+        match self.c.creatures.get(c as usize) {
+            Some(cr) => {
+                let mut v = cr.vel.clone();
+                v.extend_from_slice(&cr.cvel);
+                PackedVector2Array::from(v)
+            }
+            None => PackedVector2Array::new(),
+        }
+    }
+
+    /// The water's velocity at creature `c` (px/s), used by the drag until changed.
+    #[func]
+    fn set_water(&mut self, c: i64, velocity: Vector2) {
+        if let Some(cr) = self.c.creatures.get_mut(c as usize) {
+            cr.water = velocity;
+        }
+    }
+
+    /// The water's velocity at each cell of creature `c` (one per cell, in cell order),
+    /// in place of set_water()'s; an empty array goes back to it.
+    #[func]
+    fn set_cell_water(&mut self, c: i64, velocities: PackedVector2Array) {
+        if let Some(cr) = self.c.creatures.get_mut(c as usize) {
+            let v = velocities.as_slice();
+            if !v.is_empty() && v.len() != cr.cells.len() {
+                godot_error!("GooColony.set_cell_water(): {} velocities for {} cells", v.len(), cr.cells.len());
+                return;
+            }
+            cr.cell_water.clear();
+            cr.cell_water.extend_from_slice(v);
+        }
+    }
+
+    /// Every cell's centre of creature `c`, in cell order (where to sample the water).
+    #[func]
+    fn creature_cell_centers(&self, c: i64) -> PackedVector2Array {
+        match self.c.creatures.get(c as usize) {
+            Some(cr) => PackedVector2Array::from((0..cr.cells.len()).map(|i| cr.cell_center(i)).collect::<Vec<_>>()),
+            None => PackedVector2Array::new(),
+        }
+    }
+
+    /// The last frame's drag force on each bead of creature `c` (zero where none).
+    #[func]
+    fn creature_drag_forces(&self, c: i64) -> PackedVector2Array {
+        match self.c.creatures.get(c as usize) {
+            Some(cr) => {
+                let mut v = cr.drag_f.clone();
+                v.resize(cr.pos.len(), Vector2::ZERO);
+                PackedVector2Array::from(v)
+            }
+            None => PackedVector2Array::new(),
+        }
+    }
+
+    /// Runs creature `c`'s exposure pass now (it otherwise runs in step() when needed).
+    #[func]
+    fn update_exposure(&mut self, c: i64) {
+        let opt = self.c.opt;
+        if let Some(cr) = self.c.creatures.get_mut(c as usize) {
+            let gap = if opt.ex.gap >= 0.0 { opt.ex.gap } else { opt.ad.capture };
+            cr.update_exposure_now(gap, gap * opt.ex.core_gap);
+        }
+    }
+
+    /// Creature `c`'s exposure per bead (ring after ring): 1 exposed, 0 enclosed.
+    #[func]
+    fn creature_exposure(&self, c: i64) -> PackedByteArray {
+        match self.c.creatures.get(c as usize) {
+            Some(cr) => PackedByteArray::from(cr.exposed.as_slice()),
+            None => PackedByteArray::new(),
+        }
+    }
+
+    /// Cell `cell`'s exposure: a ring's per bead (1 exposed), or [1] / [0] for a core
+    /// on the outside or not.
+    #[func]
+    fn cell_exposed(&self, c: i64, cell: i64) -> PackedByteArray {
+        match self.c.creatures.get(c as usize) {
+            Some(cr) if (cell as usize) < cr.cells.len() => PackedByteArray::from(cr.cell_exposed(cell as usize).as_slice()),
+            _ => PackedByteArray::new(),
+        }
+    }
+
+    /// How many of cell `cell`'s beads are exposed (a core: 1 if on the outside, else 0).
+    #[func]
+    fn cell_exposed_count(&self, c: i64, cell: i64) -> i64 {
+        self.cell_exposed(c, cell).as_slice().iter().map(|&e| e as i64).sum()
+    }
+
+    /// Cell `cell`'s outward direction: the mean direction of its exposed beads from its
+    /// centre (zero when none).
+    #[func]
+    fn cell_outward(&self, c: i64, cell: i64) -> Vector2 {
+        self.c.creatures.get(c as usize).and_then(|cr| cr.cells.get(cell as usize)).map(|x| x.outward).unwrap_or(Vector2::ZERO)
+    }
+
+    /// A core's turn (rad), or 0 for a ring.
+    #[func]
+    fn cell_rotation(&self, c: i64, cell: i64) -> f64 {
+        match self.c.creatures.get(c as usize).and_then(|cr| cr.cells.get(cell as usize).map(|x| (cr, x.kind))) {
+            Some((cr, colony::Kind::Core(k))) => cr.crot[k] as f64,
+            _ => 0.0,
+        }
+    }
+
+    /// Creature `c`'s outline loops from the last exposure pass, one kind each:
+    /// LOOP_OUTSIDE or LOOP_POCKET.
+    #[func]
+    fn creature_loop_kinds(&self, c: i64) -> PackedInt32Array {
+        match self.c.creatures.get(c as usize) {
+            Some(cr) => PackedInt32Array::from(
+                cr.loops.iter().map(|l| if l.kind == colony::LoopKind::Outside { 1 } else { 2 }).collect::<Vec<i32>>(),
+            ),
+            None => PackedInt32Array::new(),
+        }
+    }
+
+    /// Loop `k`'s points now (beads, and a core's virtual beads where the loop runs along
+    /// a core), in the rings' winding for an outside.
+    #[func]
+    fn creature_loop(&self, c: i64, k: i64) -> PackedVector2Array {
+        match self.c.creatures.get(c as usize).and_then(|cr| cr.loops.get(k as usize).map(|l| cr.loop_points(l))) {
+            Some(v) => PackedVector2Array::from(v),
+            None => PackedVector2Array::new(),
+        }
+    }
+
+    /// Creature `c`'s outline: its largest outside loop's points now (empty before the
+    /// first exposure pass).
+    #[func]
+    fn creature_outline(&self, c: i64) -> PackedVector2Array {
+        let Some(cr) = self.c.creatures.get(c as usize) else { return PackedVector2Array::new() };
+        let best = cr
+            .loops
+            .iter()
+            .filter(|l| l.kind == colony::LoopKind::Outside)
+            .max_by(|a, b| a.area.abs().partial_cmp(&b.area.abs()).unwrap_or(std::cmp::Ordering::Equal));
+        match best {
+            Some(l) => PackedVector2Array::from(cr.loop_points(l)),
+            None => PackedVector2Array::new(),
+        }
     }
 }
