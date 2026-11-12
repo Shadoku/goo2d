@@ -21,6 +21,12 @@ extends SceneTree
 ##   --threads=T --substeps=S --cell-scale=X --bond-scale=X
 ##   --intra=on|off|cores         contacts between a creature's own cells: all, none (the
 ##                                bonds alone), or only those of its cores
+##   --hold=bonds|adhesion        what holds a creature together: the spike's bonds, set
+##                                once at spawn (default), or adhesion (milestone 1,
+##                                docs/colony-adhesion.md: cells stick where they touch,
+##                                captured in the first frame)
+##   --capture=PX --break=F       adhesion's capture gap (CAPTURE) and break force (at
+##                                unit 1; scaled by UNIT); --sticky: sticky-only walls
 ##   --sleep=F                    the fraction of creatures asleep (colony mode)
 ##   --coarse=F                   the fraction stepped every other frame (colony mode)
 ##   --frames=F --warmup=W        measured frames after W warm-up frames (300, 60)
@@ -65,6 +71,10 @@ var _intra: bool = true
 # --intra=cores: only a creature's cores collide with its own beads and cores.
 var _core_contacts: bool = false
 var _bond_scale: float = 1.0
+var _hold: String = "bonds"
+var _capture: float = CAPTURE
+var _break: float = -1.0
+var _sticky: bool = false
 var _sleep: float = 0.0
 var _coarse: float = 0.0
 var _frames: int = 300
@@ -131,6 +141,10 @@ func _initialize() -> void:
 			_intra = value == "on"
 			_core_contacts = value == "cores"
 		elif arg.begins_with("--bond-scale="): _bond_scale = float(value)
+		elif arg.begins_with("--hold="): _hold = value
+		elif arg.begins_with("--capture="): _capture = float(value)
+		elif arg.begins_with("--break="): _break = float(value)
+		elif arg == "--sticky": _sticky = true
 		elif arg.begins_with("--sleep="): _sleep = float(value)
 		elif arg.begins_with("--coarse="): _coarse = float(value)
 		elif arg.begins_with("--frames="): _frames = int(value)
@@ -480,6 +494,11 @@ func _build_colony(design: Array[Vector3], kinds: PackedByteArray, starts: Array
 	_colony = GooColony.new()
 	_colony.set_options({ "threads": _threads, "substeps": _substeps, "cell_scale": _cell_scale,
 		"intra_contacts": _intra, "core_contacts": _core_contacts, "bond_scale": _bond_scale, "max_speed": GooTuning.MAX_BEAD_SPEED * UNIT })
+	if _hold == "adhesion":
+		_colony.set_options({ "adhesion": true, "capture": _capture,
+			"break_force": (_break if _break > 0.0 else 2000.0) * UNIT })
+		if _sticky:
+			_colony.set_join_mode(0, 0, GooColony.JOIN_STICKY)
 	for ci: int in _creatures:
 		var hue := fmod(0.13 + ci * 0.618, 1.0)
 		var floats := PackedFloat32Array()
@@ -489,7 +508,8 @@ func _build_colony(design: Array[Vector3], kinds: PackedByteArray, starts: Array
 			var color := Color.from_hsv(hue, 0.55 if core else 0.7, 0.75 if core else 0.9)
 			floats.append_array(_cell_floats(starts[ci] * Vector2(c.x, c.y), c.z, core, color))
 		_colony.add_creature(floats)
-		_colony.build_bonds(ci, CAPTURE)
+		if _hold == "bonds":
+			_colony.build_bonds(ci, CAPTURE)
 		if ci < roundi(_sleep * _creatures):
 			_colony.set_asleep(ci, true)
 		elif ci < roundi((_sleep + _coarse) * _creatures):
@@ -802,7 +822,11 @@ func _on_physics(first: bool, delta: float) -> void:
 		"colony":
 			var s := _colony.stats()
 			kernel_us = s["total_us"]
-			_sample("holds", s["bonds_cpu_us"])
+			_sample("holds", s["bonds_cpu_us"] + s["sticks_cpu_us"])
+			_sample("capture", s["capture_us"])
+			_sample("settle", s["settle_us"])
+			_sample("sticks", s["sticks"], false)
+			_sample("broken", s["broken"], false)
 			for key: String in ["forces_us", "pairs_us", "solve_us", "cross_us", "vel_us", "rings_cpu_us", "intra_cpu_us"]:
 				_sample(key.trim_suffix("_us"), s[key])
 			_sample("cross_hits", s["cross_hits"], false)
@@ -878,7 +902,7 @@ func _sample(key: String, value: float, usec: bool = true) -> void:
 
 func _report() -> void:
 	print("colony_bench: %d frames after %d warm-up (ms: min / median / p95)" % [_frames, _warmup])
-	var order := ["physics", "kernel", "holds", "script", "push", "draw", "draw_rust", "rs_setup", "rs_render",
+	var order := ["physics", "kernel", "holds", "capture", "settle", "sticks", "broken", "script", "push", "draw", "draw_rust", "rs_setup", "rs_render",
 		"forces", "pairs", "solve", "rings_cpu", "intra_cpu", "cross", "vel", "cross_hits", "intra_pairs", "cross_pairs",
 		"k_pairpass", "k_links", "k_solver", "k_rings", "k_skins"]
 	for key: String in order:
@@ -889,10 +913,23 @@ func _report() -> void:
 		var n := list.size()
 		print("  %-11s %8.2f %8.2f %8.2f" % [key, list[0], list[n / 2], list[mini(int(n * 0.95), n - 1)]])
 	if not _health.is_empty():
-		print("  health (worst over the measured frames, every 10th): fastest %.0f px/s, ring area %.2f..%.2f of target, %d inside out, bond stretch %.2f, overlap %.2f px" % [
-			_health["fastest"], _health["area_min"], _health["area_max"], int(_health["inverted"]), _health["stretch"], _health["overlap"]])
-	var line := "RESULT mode=%s n=%d m=%d shape=%s mix=%s beads=%d cores=%s intra=%s threads=%d substeps=%d draw=%s" % [
-		_mode, _creatures, _cells, _shape, _mix, _beads, _cores and _mode == "colony", "cores" if _core_contacts else ("on" if _intra else "off"), _threads, _substeps, _draw]
+		print("  health (worst over the measured frames, every 10th): fastest %.0f px/s, ring area %.2f..%.2f of target, %d inside out, bond stretch %.2f, overlap %.2f px, sticks stretched %.2f / squeezed %.2f px, load %.0f, %d not finite" % [
+			_health["fastest"], _health["area_min"], _health["area_max"], int(_health["inverted"]), _health["stretch"], _health["overlap"],
+			_health["stick_stretch"], _health["stick_squeeze"], _health["stick_load"], int(_health["not_finite"])])
+	if _mode == "colony" and _hold == "adhesion":
+		var loads := PackedFloat32Array()
+		for ci: int in _creatures:
+			var st := _colony.creature_sticks(ci)
+			for q: int in range(0, st.size(), GooColony.STICK_FLOATS):
+				loads.append(st[q + 8])
+		loads.sort()
+		var n := loads.size()
+		if n > 0:
+			print("  stick loads at the end: min %.0f, p1 %.0f, p50 %.0f, p99 %.0f, max %.0f (break %.0f)" % [loads[0], loads[n / 100],
+				loads[n / 2], loads[mini(n * 99 / 100, n - 1)], loads[n - 1], (_break if _break > 0.0 else 2000.0) * UNIT])
+	var line := "RESULT mode=%s n=%d m=%d shape=%s mix=%s beads=%d cores=%s intra=%s threads=%d substeps=%d draw=%s hold=%s" % [
+		_mode, _creatures, _cells, _shape, _mix, _beads, _cores and _mode == "colony", "cores" if _core_contacts else ("on" if _intra else "off"), _threads, _substeps, _draw,
+		_hold + ("/sticky" if _sticky else "")]
 	for key: String in ["physics", "kernel", "holds", "script", "draw", "rs_setup"]:
 		if _samples.has(key):
 			var list: PackedFloat64Array = _samples[key]

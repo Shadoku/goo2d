@@ -1010,12 +1010,33 @@ impl GooColony {
     /// Rim vertices of a core's disc in the mesh.
     #[constant]
     const CORE_SIDES: i64 = colony::CORE_SIDES as i64;
+    /// Cell types the join table covers (ids 0..MAX_TYPES).
+    #[constant]
+    const MAX_TYPES: i64 = colony::MAX_TYPES as i64;
+    /// Join modes (set_join_mode()).
+    #[constant]
+    const JOIN_NONE: i64 = colony::JOIN_NONE as i64;
+    #[constant]
+    const JOIN_ANCHORED: i64 = colony::JOIN_ANCHORED as i64;
+    #[constant]
+    const JOIN_STICKY: i64 = colony::JOIN_STICKY as i64;
+    /// Event kinds (take_events()).
+    #[constant]
+    const EVENT_JOINED: i64 = colony::EVENT_JOINED as i64;
+    #[constant]
+    const EVENT_PARTED: i64 = colony::EVENT_PARTED as i64;
+    /// Floats per stick in creature_sticks().
+    #[constant]
+    const STICK_FLOATS: i64 = 10;
 
     /// Any of: "threads", "substeps", "gravity" (Vector2), "max_speed", "cell_scale"
     /// (the bead grid's cell over the one its reach needs), "intra_contacts" (bool:
     /// contacts between different cells of one creature), "core_contacts" (bool: with
     /// intra_contacts off, a creature's cores still collide with its beads and cores),
-    /// "slop", "bond_scale".
+    /// "slop", "bond_scale"; adhesion's (docs/colony-adhesion.md): "adhesion" (bool),
+    /// "capture" (px), "join_reach" (px), "stick_scale", "anchor_scale", "creep" (/s),
+    /// "break_force", "load_time" (s), "ask" (bool: first touches wait for answer()), "capture_paused"
+    /// (bool, the whole colony).
     #[func]
     fn set_options(&mut self, options: VarDictionary) {
         for (key, value) in options.iter_shared() {
@@ -1032,6 +1053,16 @@ impl GooColony {
                 "core_contacts" => o.core_contacts = value.try_to::<bool>().unwrap_or(number != 0.0),
                 "slop" => o.slop = number as f32,
                 "bond_scale" => o.bond_scale = number as f32,
+                "adhesion" => o.ad.enabled = value.try_to::<bool>().unwrap_or(number != 0.0),
+                "capture" => o.ad.capture = (number as f32).max(0.0),
+                "join_reach" => o.ad.join_reach = (number as f32).max(0.0),
+                "stick_scale" => o.ad.stick_scale = (number as f32).max(1e-6),
+                "anchor_scale" => o.ad.anchor_scale = (number as f32).max(1e-6),
+                "creep" => o.ad.creep = (number as f32).max(0.0),
+                "break_force" => o.ad.break_force = number as f32,
+                "load_time" => o.ad.load_time = (number as f32).max(0.0),
+                "ask" => o.ad.ask = value.try_to::<bool>().unwrap_or(number != 0.0),
+                "capture_paused" => o.ad.paused = value.try_to::<bool>().unwrap_or(number != 0.0),
                 other => godot_error!("GooColony.set_options(): unknown option '{}'", other),
             }
         }
@@ -1107,6 +1138,12 @@ impl GooColony {
         put(&mut d, "cross_pairs", s.cross_pairs as i64);
         put(&mut d, "cross_hits", s.cross_hits as i64);
         put(&mut d, "draw_build_us", s.draw_build_us as i64);
+        put(&mut d, "sticks_cpu_us", s.sticks_cpu_us as i64);
+        put(&mut d, "capture_us", s.capture_us as i64);
+        put(&mut d, "settle_us", s.settle_us as i64);
+        put(&mut d, "sticks", s.sticks as i64);
+        put(&mut d, "made", s.made as i64);
+        put(&mut d, "broken", s.broken as i64);
         let (mut beads, mut cores, mut rings, mut bonds) = (0usize, 0usize, 0usize, 0usize);
         for c in &self.c.creatures {
             beads += c.bead_count();
@@ -1126,7 +1163,11 @@ impl GooColony {
     fn health(&self) -> VarDictionary {
         let h = self.c.health();
         let mut d = VarDictionary::new();
-        for (k, name) in ["fastest", "area_min", "area_max", "inverted", "stretch", "overlap"].iter().enumerate() {
+        let names = [
+            "fastest", "area_min", "area_max", "inverted", "stretch", "overlap", "stick_stretch", "stick_squeeze", "stick_load", "sticks",
+            "not_finite",
+        ];
+        for (k, name) in names.iter().enumerate() {
             put(&mut d, name, h[k] as f64);
         }
         d
@@ -1297,5 +1338,190 @@ impl GooColony {
     #[func]
     fn reset_draw_clock(&mut self) {
         self.c.stats.draw_build_us = 0;
+    }
+
+    // ---- Adhesion (docs/colony-adhesion.md) ----
+
+    /// May cells of types `a` and `b` join, and how: JOIN_NONE, JOIN_ANCHORED (the
+    /// default for every pair) or JOIN_STICKY. Symmetric.
+    #[func]
+    fn set_join_mode(&mut self, type_a: i64, type_b: i64, mode: i64) {
+        let n = colony::MAX_TYPES as i64;
+        if !(0..n).contains(&type_a) || !(0..n).contains(&type_b) || !(0..=2).contains(&mode) {
+            godot_error!("GooColony.set_join_mode(): types 0..{} and modes 0..2", n - 1);
+            return;
+        }
+        self.c.opt.ad.table[type_a as usize][type_b as usize] = mode as u8;
+        self.c.opt.ad.table[type_b as usize][type_a as usize] = mode as u8;
+    }
+
+    #[func]
+    fn join_mode(&self, type_a: i64, type_b: i64) -> i64 {
+        let n = colony::MAX_TYPES as i64;
+        if !(0..n).contains(&type_a) || !(0..n).contains(&type_b) {
+            return -1;
+        }
+        self.c.opt.ad.table[type_a as usize][type_b as usize] as i64
+    }
+
+    #[func]
+    fn cell_count(&self, c: i64) -> i64 {
+        self.c.creatures.get(c as usize).map(|cr| cr.cells.len() as i64).unwrap_or(0)
+    }
+
+    /// Cell `cell` of creature `c` is of type `type_id` (0..MAX_TYPES; 0 by default).
+    #[func]
+    fn set_cell_type(&mut self, c: i64, cell: i64, type_id: i64) {
+        if !(0..colony::MAX_TYPES as i64).contains(&type_id) {
+            godot_error!("GooColony.set_cell_type(): a type is 0..{}", colony::MAX_TYPES - 1);
+            return;
+        }
+        match self.c.creatures.get_mut(c as usize).and_then(|cr| cr.cells.get_mut(cell as usize)) {
+            Some(x) => x.ctype = type_id as u8,
+            None => godot_error!("GooColony.set_cell_type(): no cell {} in creature {}", cell, c),
+        }
+    }
+
+    #[func]
+    fn cell_type(&self, c: i64, cell: i64) -> i64 {
+        self.c.creatures.get(c as usize).and_then(|cr| cr.cells.get(cell as usize)).map(|x| x.ctype as i64).unwrap_or(-1)
+    }
+
+    /// An acceleration (px/s²) on cell `cell` alone, every step until changed.
+    #[func]
+    fn push_cell(&mut self, c: i64, cell: i64, acceleration: Vector2) {
+        if let Some(x) = self.c.creatures.get_mut(c as usize).and_then(|cr| cr.cells.get_mut(cell as usize)) {
+            x.push = acceleration;
+        }
+    }
+
+    /// Cell `cell` takes radius `radius` in place (colony.rs's resize_cell()).
+    #[func]
+    fn resize_cell(&mut self, c: i64, cell: i64, radius: f64) -> bool {
+        self.c.creatures.get_mut(c as usize).map(|cr| cr.resize_cell(cell as usize, radius as f32)).unwrap_or(false)
+    }
+
+    #[func]
+    fn cell_radius(&self, c: i64, cell: i64) -> f64 {
+        self.c.creatures.get(c as usize).and_then(|cr| cr.cells.get(cell as usize)).map(|x| x.t.radius as f64).unwrap_or(0.0)
+    }
+
+    /// A ring cell's beads now, or a core's centre.
+    #[func]
+    fn cell_points(&self, c: i64, cell: i64) -> PackedVector2Array {
+        let Some(cr) = self.c.creatures.get(c as usize) else { return PackedVector2Array::new() };
+        match cr.cells.get(cell as usize).map(|x| x.kind) {
+            Some(colony::Kind::Ring(r)) => {
+                let ring = &cr.rings[r];
+                PackedVector2Array::from(&cr.pos[ring.start..ring.start + ring.n])
+            }
+            Some(colony::Kind::Core(k)) => PackedVector2Array::from(&[cr.cpos[k]][..]),
+            None => PackedVector2Array::new(),
+        }
+    }
+
+    /// Pauses or resumes capture for creature `c`, or for the whole colony when `c` is
+    /// -1 (existing sticks hold and may still break).
+    #[func]
+    fn set_capture_paused(&mut self, c: i64, paused: bool) {
+        if c < 0 {
+            self.c.opt.ad.paused = paused;
+        } else if let Some(cr) = self.c.creatures.get_mut(c as usize) {
+            cr.capture_paused = paused;
+        }
+    }
+
+    #[func]
+    fn is_capture_paused(&self, c: i64) -> bool {
+        if c < 0 {
+            return self.c.opt.ad.paused;
+        }
+        self.c.creatures.get(c as usize).map(|cr| cr.capture_paused || self.c.opt.ad.paused).unwrap_or(false)
+    }
+
+    /// Joins cells `a` and `b` of creature `c` by hand (whatever the filters say): every
+    /// free bead within "join_reach" of the other's skin sticks now, and they stick again
+    /// whenever they touch while remembered. The sticks made; a joined event is queued.
+    #[func]
+    fn join_cells(&mut self, c: i64, a: i64, b: i64) -> i64 {
+        let ad = self.c.opt.ad;
+        let frame = self.c.frame();
+        match self.c.creatures.get_mut(c as usize) {
+            Some(cr) if a >= 0 && b >= 0 => cr.join_cells(a as usize, b as usize, &ad, frame) as i64,
+            _ => 0,
+        }
+    }
+
+    /// Parts cells `a` and `b` by hand: their sticks go, and they stay apart while they
+    /// touch. The sticks removed; a parted event is queued if they were joined.
+    #[func]
+    fn part_cells(&mut self, c: i64, a: i64, b: i64) -> i64 {
+        let frame = self.c.frame();
+        match self.c.creatures.get_mut(c as usize) {
+            Some(cr) if a >= 0 && b >= 0 => cr.part_cells(a as usize, b as usize, frame) as i64,
+            _ => 0,
+        }
+    }
+
+    /// Answers an ask (take_asks()): may cells `a` and `b` of creature `c` join. Read by
+    /// the next step's capture; remembered while they stay in touch.
+    #[func]
+    fn answer(&mut self, c: i64, a: i64, b: i64, allow: bool) {
+        let frame = self.c.frame();
+        if let Some(cr) = self.c.creatures.get_mut(c as usize) {
+            if a >= 0 && b >= 0 {
+                cr.answer(a as usize, b as usize, allow, frame);
+            }
+        }
+    }
+
+    /// The cells stuck to cell `cell` of creature `c` now, in order.
+    #[func]
+    fn cell_neighbours(&self, c: i64, cell: i64) -> PackedInt32Array {
+        match self.c.creatures.get(c as usize) {
+            Some(cr) => PackedInt32Array::from(cr.neighbours(cell as u32).iter().map(|&x| x as i32).collect::<Vec<i32>>()),
+            None => PackedInt32Array::new(),
+        }
+    }
+
+    /// The events since the last call, four ints each: kind (EVENT_JOINED or
+    /// EVENT_PARTED), creature, cell a, cell b (a < b); creature after creature, each in
+    /// the order they happened (a step's in cell-pair order).
+    #[func]
+    fn take_events(&mut self) -> PackedInt64Array {
+        let v: Vec<i64> = self.c.take_events().iter().flat_map(|&(k, c, a, b)| [k as i64, c as i64, a as i64, b as i64]).collect();
+        PackedInt64Array::from(v)
+    }
+
+    /// The cell pairs touching for the first time since the last call, while "ask" is on,
+    /// three ints each: creature, cell a, cell b. They join only once answer()ed yes.
+    #[func]
+    fn take_asks(&mut self) -> PackedInt64Array {
+        let v: Vec<i64> = self.c.take_asks().iter().flat_map(|&(c, a, b)| [c as i64, a as i64, b as i64]).collect();
+        PackedInt64Array::from(v)
+    }
+
+    /// Creature `c`'s sticks, STICK_FLOATS each: end a (bead or core index), a is a core
+    /// (0/1), end b (ring or core index), b is a core, s (the place along ring b), cell a,
+    /// cell b, mode, the last frame's mean load, the gap now (px; 0 is held).
+    #[func]
+    fn creature_sticks(&self, c: i64) -> PackedFloat32Array {
+        let Some(cr) = self.c.creatures.get(c as usize) else { return PackedFloat32Array::new() };
+        let mut v = Vec::with_capacity(cr.sticks.len() * 10);
+        for (k, st) in cr.sticks.iter().enumerate() {
+            v.extend_from_slice(&[
+                st.a as f32,
+                st.a_core as u8 as f32,
+                st.b as f32,
+                st.b_core as u8 as f32,
+                st.s,
+                st.cell_a as f32,
+                st.cell_b as f32,
+                st.mode as f32,
+                st.load,
+                cr.stick_gap(k),
+            ]);
+        }
+        PackedFloat32Array::from(v)
     }
 }

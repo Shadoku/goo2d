@@ -26,6 +26,21 @@
 //! The ring constraints are the kernel's (`kernel::distances`, the same shape matching,
 //! stretch limit, pressure and internal damping). What the spike leaves out: static
 //! shapes, restitution and friction (water, e = 0), settling, splits, skins.
+//!
+//! Milestone 1, adhesion (docs/colony-adhesion.md): with `Adhesion::enabled` a creature's
+//! cells hold together by sticking where they touch instead of by spawn-time bonds.
+//! Each frame, after the contact candidates are found, every free ring bead that comes
+//! within `capture` px of another cell's skin in the same creature sticks to it (a
+//! `Stick`: bead to the edge of a ring, at a place `s` along that ring, or bead to a
+//! core's rim; touching cores to each other), if the cells' types may join (`table`) and
+//! the pair is not refused or waiting for script's answer (`pairs`, `asks`). A stick is
+//! an XPBD constraint holding the gap at zero, pulling and pushing; an anchored one also
+//! holds the bead at its place along the edge with a softer spring, the place creeping
+//! toward where the bead is (`creep`); a sticky one slides freely. A stick whose mean pull
+//! over a frame passes `break_force` breaks. Cell pairs going from no stick to some, and
+//! back, are reported as events (`events`), per creature in cell-pair order after the
+//! step. All of it runs on the creature's own data, so the threaded step stays
+//! bit-identical to the serial one.
 
 use crate::consts::{MAX_PRESSURE_RATIO, MAX_STRETCH, MIN_AREA_RATIO};
 use crate::geom::*;
@@ -33,7 +48,128 @@ use crate::grid::Grid;
 use crate::kernel::distances;
 use godot::builtin::Vector2;
 use rayon::prelude::*;
+use std::collections::BTreeMap;
 use std::time::Instant;
+
+/// Cell types the join table covers (type ids 0..MAX_TYPES).
+pub const MAX_TYPES: usize = 16;
+/// Join modes of the type table.
+pub const JOIN_NONE: u8 = 0;
+pub const JOIN_ANCHORED: u8 = 1;
+pub const JOIN_STICKY: u8 = 2;
+/// Event kinds.
+pub const EVENT_JOINED: u8 = 1;
+pub const EVENT_PARTED: u8 = 2;
+/// `Creature::stuck` of a bead stuck to a core.
+const STUCK_CORE: u32 = u32::MAX;
+
+/// The adhesion's settings, colony-wide. Lengths in px and forces in the cells' mass
+/// units × px/s²: the defaults are for GooTuning.unit 1 (callers at another unit scale
+/// `capture`, `join_reach` and `break_force` by it).
+#[derive(Clone, Copy, Debug)]
+pub struct Adhesion {
+    /// Capture and the sticks' solve on. Off: the spike's bonds alone (if built).
+    pub enabled: bool,
+    /// Capture paused for the whole colony (existing sticks hold and may break).
+    pub paused: bool,
+    /// A cell pair seen for the first time is reported in `asks` and joins only once
+    /// answered (`answer()`); off: it joins at once if the type table allows.
+    pub ask: bool,
+    /// Gap between outlines within which a free bead sticks.
+    pub capture: f32,
+    /// Gap within which join_cells() sticks beads by hand.
+    pub join_reach: f32,
+    /// Normal stiffness: × the softer cell's skin stiffness (compliance its inverse).
+    pub stick_scale: f32,
+    /// The anchor's stiffness along the edge over the normal one.
+    pub anchor_scale: f32,
+    /// How fast an anchor creeps toward where its bead is: the fraction per second.
+    pub creep: f32,
+    /// A stick whose load (its pull, smoothed over `load_time`) passes this breaks.
+    pub break_force: f32,
+    /// The time over which a stick's load is smoothed (s): a pull must last to break it.
+    pub load_time: f32,
+    /// table[type a][type b]: JOIN_NONE, JOIN_ANCHORED or JOIN_STICKY.
+    pub table: [[u8; MAX_TYPES]; MAX_TYPES],
+}
+
+impl Default for Adhesion {
+    fn default() -> Self {
+        Adhesion {
+            enabled: false,
+            paused: false,
+            ask: false,
+            capture: 3.0,
+            join_reach: 8.0,
+            stick_scale: 1.0,
+            anchor_scale: 0.3,
+            creep: 1.0,
+            break_force: 16000.0,
+            load_time: 0.1,
+            table: [[JOIN_ANCHORED; MAX_TYPES]; MAX_TYPES],
+        }
+    }
+}
+
+/// One stick (indices local to the creature): end a is a bead (or a core, only for a
+/// core-to-core stick), end b the ring `b`'s skin at the place `s` (edge floor(s), the
+/// fraction frac(s) of the way along it) or the core `b`.
+#[derive(Clone, Copy, Debug)]
+pub struct Stick {
+    pub a: u32,
+    pub b: u32,
+    pub a_core: bool,
+    pub b_core: bool,
+    pub s: f32,
+    /// An anchored stick's anchor: a place along ring b, and the bead's offset along
+    /// that edge's tangent it is held at (the offset it had when it stuck: zero
+    /// tension then, wherever the bead sat). Each frame the anchor moves to `s` keeping
+    /// the tension, and the tension creeps toward zero.
+    pub anchor: f32,
+    pub offset: f32,
+    pub cell_a: u32,
+    pub cell_b: u32,
+    pub mode: u8,
+    pub alpha_n: f32,
+    pub alpha_t: f32,
+    /// Its pull (force; negative: pushing), each frame's mean smoothed over load_time.
+    pub load: f32,
+    pull: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PairState {
+    /// May stick (filters passed, or answered yes).
+    Allowed,
+    /// Joined by hand: sticks whatever the filters say.
+    Forced,
+    /// Answered no, or parted by hand: no stick while the cells stay in touch.
+    Refused,
+    /// Asked, not answered yet.
+    Pending,
+}
+
+/// What a creature knows about a pair of its cells (key: the smaller cell first).
+#[derive(Clone, Copy, Debug)]
+pub struct Pair {
+    pub sticks: u32,
+    /// Reported as joined (sticks > 0 at the last settle).
+    pub joined: bool,
+    pub state: PairState,
+    /// The last frame they were within capture of each other.
+    pub seen: u64,
+    /// A core-to-core stick between them exists.
+    pub cores: bool,
+}
+
+#[inline]
+fn pair_key(a: u32, b: u32) -> (u32, u32) {
+    if a < b {
+        (a, b)
+    } else {
+        (b, a)
+    }
+}
 
 /// Floats per cell in `Colony::add_creature()`'s input: x, y, radius, kind (0 ring,
 /// 1 core), beads, ring_radius, bead_radius, bead_mass, pressure_k, shape_k, skin_k,
@@ -102,6 +238,26 @@ pub enum Kind {
 pub struct Cell {
     pub kind: Kind,
     pub t: CellTuning,
+    /// Its type id (0..MAX_TYPES): what the join table is indexed by.
+    pub ctype: u8,
+    /// An acceleration on this cell alone (px/s²), on top of the creature's push.
+    pub push: Vector2,
+    // Room for later milestones (data only: nothing reads or writes them yet).
+    #[allow(dead_code)]
+    /// 1 exposed to the outside .. 0 enclosed (milestone 2).
+    pub exposure: f32,
+    #[allow(dead_code)]
+    /// Its outward direction (milestone 2: thrusters, spikes).
+    pub outward: Vector2,
+    #[allow(dead_code)]
+    /// Contacts with other creatures or walls in the last step (contact reports).
+    pub contacts: u32,
+}
+
+impl Cell {
+    fn new(t: CellTuning) -> Cell {
+        Cell { kind: Kind::Core(0), t, ctype: 0, push: Vector2::ZERO, exposure: 1.0, outward: Vector2::ZERO, contacts: 0 }
+    }
 }
 
 pub struct CRing {
@@ -189,14 +345,36 @@ pub struct Creature {
     pub phase: u32,
     /// Bumped whenever the mesh's topology changes (promote, demote).
     pub topology: u64,
+    // Adhesion.
+    pub sticks: Vec<Stick>,
+    /// Per bead: 0 while free; the ring it is stuck to + 1, or STUCK_CORE when stuck to
+    /// a core (it holds at most one stick, as its end a).
+    pub stuck: Vec<u32>,
+    pub pairs: BTreeMap<(u32, u32), Pair>,
+    /// Joined and parted events not yet taken: (kind, cell a, cell b), a < b.
+    pub events: Vec<(u8, u32, u32)>,
+    /// Cell pairs seen for the first time, waiting for an answer (a < b).
+    pub asks: Vec<(u32, u32)>,
+    pub capture_paused: bool,
+    // Capture's best target per bead this frame: (gap, b, s, kind 0 none / 1 edge /
+    // 2 core, mode).
+    cap: Vec<(f32, u32, f32, u8, u8)>,
+    // Whether this frame's own candidates are solved as contacts (else only capture
+    // reads them): bead pairs, and anything with a core.
+    solve_bb: bool,
+    solve_cores: bool,
     active: bool,
     h: f32,
     dt: f32,
-    // Nanoseconds spent this step (summed over substeps) in its rings, bonds and own
-    // contacts.
+    // Nanoseconds spent this step (summed over substeps) in its rings, bonds, own
+    // contacts, sticks, and (once a frame) its capture and break/creep pass.
     ns_rings: u64,
     ns_bonds: u64,
     ns_intra: u64,
+    ns_sticks: u64,
+    ns_capture: u64,
+    made: usize,
+    broken: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -213,6 +391,7 @@ pub struct Options {
     pub slop: f32,
     /// Bond stiffness as a multiple of the cells' skin stiffness.
     pub bond_scale: f32,
+    pub ad: Adhesion,
 }
 
 impl Default for Options {
@@ -227,6 +406,7 @@ impl Default for Options {
             core_contacts: false,
             slop: 0.5,
             bond_scale: 1.0,
+            ad: Adhesion::default(),
         }
     }
 }
@@ -250,6 +430,14 @@ pub struct Stats {
     /// Contacts between creatures that overlapped in the last substep.
     pub cross_hits: usize,
     pub draw_build_us: u64,
+    /// Adhesion: the sticks' solve (CPU, summed), the capture pass and the break/creep
+    /// pass (wall), sticks now, made and broken this step.
+    pub sticks_cpu_us: u64,
+    pub capture_us: u64,
+    pub settle_us: u64,
+    pub sticks: usize,
+    pub made: usize,
+    pub broken: usize,
 }
 
 pub struct Colony {
@@ -392,6 +580,7 @@ impl Creature {
         self.damp.extend(std::iter::repeat(t.linear_damp).take(n));
         self.bead_ring.extend(std::iter::repeat(idx as u32).take(n));
         self.bonded.extend(std::iter::repeat(0u8).take(n));
+        self.stuck.extend(std::iter::repeat(0u32).take(n));
         self.rings.push(CRing { cell, start, n, rest, rest_edges, rest_bend, w });
         self.cells[cell].kind = Kind::Ring(idx);
         idx
@@ -521,6 +710,13 @@ impl Creature {
     fn frame_forces(&mut self, gravity: Vector2) {
         let push = self.push;
         for ring in &self.rings {
+            let cell_push = self.cells[ring.cell].push;
+            if cell_push != Vector2::ZERO {
+                let m = self.cells[ring.cell].t.bead_mass;
+                for i in ring.start..ring.start + ring.n {
+                    self.force[i] += cell_push * m;
+                }
+            }
             let t = &self.cells[ring.cell].t;
             let (start, n) = (ring.start, ring.n);
             let pts = &self.pos[start..start + n];
@@ -548,6 +744,10 @@ impl Creature {
         for k in 0..self.cpos.len() {
             let m = if self.cw[k] > 0.0 { 1.0 / self.cw[k] } else { 0.0 };
             self.cforce[k] += (push + gravity) * m;
+            let cell_push = self.cells[self.ccell[k] as usize].push;
+            if cell_push != Vector2::ZERO {
+                self.cforce[k] += cell_push * m;
+            }
         }
     }
 
@@ -666,8 +866,14 @@ impl Creature {
     }
 
     fn solve_intra(&mut self) {
-        for k in 0..self.bb.len() {
+        let bb = if self.solve_bb { self.bb.len() } else { 0 };
+        for k in 0..bb {
             let (i, j) = (self.bb[k].0 as usize, self.bb[k].1 as usize);
+            // Joined cells do not collide where they are stuck: a stuck bead's gap to the
+            // ring it is stuck to is the stick's to hold.
+            if self.stuck[i] == self.bead_ring[j] + 1 || self.stuck[j] == self.bead_ring[i] + 1 {
+                continue;
+            }
             let reach = self.r[i] + self.r[j];
             let d = self.pos[i] - self.pos[j];
             let dsq = len_sq(d);
@@ -681,7 +887,8 @@ impl Creature {
             self.pos[i] += n * (s * wa);
             self.pos[j] -= n * (s * wb);
         }
-        for k in 0..self.bc.len() {
+        let (bc, cc) = if self.solve_cores { (self.bc.len(), self.cc.len()) } else { (0, 0) };
+        for k in 0..bc {
             let (i, c) = (self.bc[k].0 as usize, self.bc[k].1 as usize);
             let reach = self.r[i] + self.cr[c];
             let d = self.pos[i] - self.cpos[c];
@@ -696,7 +903,7 @@ impl Creature {
             self.pos[i] += n * (s * wa);
             self.cpos[c] -= n * (s * wb);
         }
-        for k in 0..self.cc.len() {
+        for k in 0..cc {
             let (a, b) = (self.cc[k].0 as usize, self.cc[k].1 as usize);
             let reach = self.cr[a] + self.cr[b];
             let d = self.cpos[a] - self.cpos[b];
@@ -724,6 +931,11 @@ impl Creature {
         let t = Instant::now();
         self.solve_bonds();
         self.ns_bonds += ns(t);
+        if !self.sticks.is_empty() {
+            let t = Instant::now();
+            self.solve_sticks();
+            self.ns_sticks += ns(t);
+        }
         let t = Instant::now();
         self.solve_intra();
         self.ns_intra += ns(t);
@@ -751,6 +963,653 @@ impl Creature {
             }
             self.cvel[k] = v;
         }
+    }
+
+    /// After a promotion or demotion: the spike's bonds rebuilt when the creature has
+    /// them; with adhesion the next frame's capture sticks the changed cell again.
+    fn rebuild_holds(&mut self, capture: f32, bond_scale: f32) {
+        if self.bonds.is_empty() && !self.sticks.is_empty() {
+            self.recount_bonded();
+        } else {
+            self.build_bonds(capture, bond_scale);
+        }
+    }
+
+    // ---- Adhesion ----
+
+    /// The place `s` on ring `rb`'s skin: (bead j, bead k, t, the edge's unit tangent,
+    /// its outward normal, its length).
+    #[inline]
+    fn edge_at(&self, rb: usize, s: f32) -> (usize, usize, f32, Vector2, Vector2, f32) {
+        let ring = &self.rings[rb];
+        let n = ring.n;
+        let e = (s.max(0.0) as usize).min(n - 1);
+        let t = (s - e as f32).clamp(0.0, 1.0);
+        let j = ring.start + e;
+        let k = ring.start + (e + 1) % n;
+        let edge = self.pos[k] - self.pos[j];
+        let l = len(edge);
+        let tan = if l > 1e-6 { edge / l } else { Vector2::new(1.0, 0.0) };
+        (j, k, t, tan, Vector2::new(-tan.y, tan.x), l)
+    }
+
+    /// `s` wrapped into [0, n) of ring `rb`.
+    #[inline]
+    fn wrap_s(&self, rb: usize, s: f32) -> f32 {
+        let n = self.rings[rb].n as f32;
+        let mut s = s % n;
+        if s < 0.0 {
+            s += n;
+        }
+        if s >= n {
+            s -= n;
+        }
+        s
+    }
+
+    /// The nearest place on ring `rb`'s skin to bead `i` among the two edges at its bead
+    /// `j` (or all edges when `j` is None), seen from outside: (gap between outlines, s).
+    fn nearest_edge(&self, i: usize, rb: usize, j: Option<usize>, within: f32) -> Option<(f32, f32)> {
+        let ring = &self.rings[rb];
+        let n = ring.n;
+        let p = self.pos[i];
+        let mut best: Option<(f32, f32)> = None;
+        let mut test = |e: usize| {
+            let a = self.pos[ring.start + e];
+            let b = self.pos[ring.start + (e + 1) % n];
+            let seg = b - a;
+            let l2 = len_sq(seg);
+            if l2 <= 1e-12 {
+                return;
+            }
+            let t = (dot(p - a, seg) / l2).clamp(0.0, 1.0);
+            let q = a + seg * t;
+            let nrm = Vector2::new(-seg.y, seg.x);
+            if dot(p - q, nrm) <= 0.0 {
+                return;
+            }
+            let gap = dist(p, q) - (self.r[i] + self.r[ring.start + e]);
+            if gap < within && best.is_none_or(|bb| gap < bb.0) {
+                best = Some((gap, e as f32 + t));
+            }
+        };
+        match j {
+            Some(j) => {
+                let le = j - ring.start;
+                test((le + n - 1) % n);
+                test(le);
+            }
+            None => (0..n).for_each(&mut test),
+        }
+        best.map(|(g, s)| (g, if s >= n as f32 { s - n as f32 } else { s }))
+    }
+
+    /// Whether ring `rx`'s beads stick onto ring `ry`'s skin (else `ry`'s onto `rx`'s):
+    /// a wall between two rings is held from one side only, the finer one's (smaller
+    /// beads; equal: the lower cell index). Held from both sides it is over-constrained:
+    /// each side's beads cannot all sit at zero gap from the other's polyline when the
+    /// two are curved, and the two sides fight with a standing load.
+    #[inline]
+    fn sticks_onto(&self, rx: usize, ry: usize) -> bool {
+        let (cx, cy) = (self.rings[rx].cell, self.rings[ry].cell);
+        let (bx, by) = (self.cells[cx].t.bead_radius, self.cells[cy].t.bead_radius);
+        if bx < by * 0.999 {
+            true
+        } else if by < bx * 0.999 {
+            false
+        } else {
+            cx < cy
+        }
+    }
+
+    fn cell_of_bead(&self, i: usize) -> u32 {
+        self.rings[self.bead_ring[i] as usize].cell as u32
+    }
+
+    /// A stick's compliances for cells `ca`, `cb`.
+    fn stick_alphas(&self, ca: usize, cb: usize, ad: &Adhesion) -> (f32, f32) {
+        let k = self.cells[ca].t.skin_k.min(self.cells[cb].t.skin_k) * ad.stick_scale;
+        let alpha_n = 1.0 / k.max(1e-6);
+        (alpha_n, alpha_n / ad.anchor_scale.max(1e-6))
+    }
+
+    /// The offset of a point `p` along the tangent of ring `rb`'s edge at `s`, from the
+    /// place `s` on it.
+    fn tangent_offset(&self, p: Vector2, rb: usize, s: f32) -> f32 {
+        let (j, kk, t, tan, _, _) = self.edge_at(rb, s);
+        dot(p - (self.pos[j] * (1.0 - t) + self.pos[kk] * t), tan)
+    }
+
+    fn add_stick(&mut self, a: u32, a_core: bool, b: u32, b_core: bool, s: f32, cell_a: u32, cell_b: u32, mode: u8, ad: &Adhesion) {
+        let (alpha_n, alpha_t) = self.stick_alphas(cell_a as usize, cell_b as usize, ad);
+        let offset = if a_core || b_core { 0.0 } else { self.tangent_offset(self.pos[a as usize], b as usize, s) };
+        self.sticks.push(Stick { a, b, a_core, b_core, s, anchor: s, offset, cell_a, cell_b, mode, alpha_n, alpha_t, load: 0.0, pull: 0.0 });
+        if !a_core {
+            self.stuck[a as usize] = if b_core { STUCK_CORE } else { b + 1 };
+        }
+        if let Some(p) = self.pairs.get_mut(&pair_key(cell_a, cell_b)) {
+            p.sticks += 1;
+            if a_core && b_core {
+                p.cores = true;
+            }
+        }
+    }
+
+    /// Removes every stick `drop` says (in place, keeping the others' order), freeing
+    /// their beads and counting them off their pairs. Returns how many.
+    fn drop_sticks<F: FnMut(&Stick) -> bool>(&mut self, mut drop: F) -> usize {
+        let mut removed = 0;
+        let mut k = 0;
+        while k < self.sticks.len() {
+            let st = self.sticks[k];
+            if drop(&st) {
+                if !st.a_core {
+                    self.stuck[st.a as usize] = 0;
+                }
+                if let Some(p) = self.pairs.get_mut(&pair_key(st.cell_a, st.cell_b)) {
+                    p.sticks = p.sticks.saturating_sub(1);
+                    if st.a_core && st.b_core {
+                        p.cores = false;
+                    }
+                }
+                removed += 1;
+                k += 1;
+                continue;
+            }
+            if removed > 0 {
+                self.sticks[k - removed] = st;
+            }
+            k += 1;
+        }
+        self.sticks.truncate(self.sticks.len() - removed);
+        removed
+    }
+
+    /// May cells `ca` and `cb` stick now, and how: the type table, then what is known of
+    /// the pair (an unknown pair is allowed at once, or asked about when `ad.ask`).
+    /// Marks the pair seen this frame.
+    fn pair_mode(&mut self, ca: u32, cb: u32, ad: &Adhesion, frame: u64) -> u8 {
+        let ta = self.cells[ca as usize].ctype as usize;
+        let tb = self.cells[cb as usize].ctype as usize;
+        let mode = ad.table[ta.min(MAX_TYPES - 1)][tb.min(MAX_TYPES - 1)];
+        let key = pair_key(ca, cb);
+        match self.pairs.get_mut(&key) {
+            Some(p) => {
+                p.seen = frame;
+                match p.state {
+                    PairState::Allowed => mode,
+                    PairState::Forced => mode.max(JOIN_ANCHORED),
+                    PairState::Refused | PairState::Pending => JOIN_NONE,
+                }
+            }
+            None => {
+                if mode == JOIN_NONE {
+                    return JOIN_NONE;
+                }
+                let state = if ad.ask { PairState::Pending } else { PairState::Allowed };
+                self.pairs.insert(key, Pair { sticks: 0, joined: false, state, seen: frame, cores: false });
+                if ad.ask {
+                    self.asks.push(key);
+                    JOIN_NONE
+                } else {
+                    mode
+                }
+            }
+        }
+    }
+
+    /// Capture, once a frame before the substeps, from this frame's own candidates: each
+    /// free bead sticks to the nearest skin of another cell within the capture gap that
+    /// its pair allows; touching cores stick to each other. Returns the sticks made.
+    fn capture(&mut self, ad: &Adhesion, frame: u64) -> usize {
+        if !self.active || !ad.enabled || ad.paused || self.capture_paused {
+            return 0;
+        }
+        let n = self.pos.len();
+        let mut cap = std::mem::take(&mut self.cap);
+        cap.clear();
+        cap.resize(n, (f32::INFINITY, 0, 0.0, 0, 0));
+        let bb = std::mem::take(&mut self.bb);
+        let bc = std::mem::take(&mut self.bc);
+        let cc = std::mem::take(&mut self.cc);
+        // The last pair looked up and its answer (candidates come in runs of one pair).
+        let mut memo: ((u32, u32), u8) = ((u32::MAX, u32::MAX), 0);
+        let capture = ad.capture;
+        for &(i, j) in &bb {
+            let (i, j) = (i as usize, j as usize);
+            let (ri, rj) = (self.bead_ring[i] as usize, self.bead_ring[j] as usize);
+            if ri == rj || (self.stuck[i] != 0 && self.stuck[j] != 0) {
+                continue;
+            }
+            for (x, rx, y, ry) in [(i, ri, j, rj), (j, rj, i, ri)] {
+                if self.stuck[x] != 0 || !self.sticks_onto(rx, ry) {
+                    continue;
+                }
+                let Some((gap, s)) = self.nearest_edge(x, ry, Some(y), capture) else { continue };
+                if gap >= cap[x].0 {
+                    continue;
+                }
+                let (ca, cb) = (self.rings[rx].cell as u32, self.rings[ry].cell as u32);
+                let key = pair_key(ca, cb);
+                let mode = if memo.0 == key { memo.1 } else { self.pair_mode(ca, cb, ad, frame) };
+                memo = (key, mode);
+                if mode != JOIN_NONE {
+                    cap[x] = (gap, ry as u32, s, 1, mode);
+                }
+            }
+        }
+        for &(i, k) in &bc {
+            let (i, k) = (i as usize, k as usize);
+            if self.stuck[i] != 0 {
+                continue;
+            }
+            let gap = dist(self.pos[i], self.cpos[k]) - self.r[i] - self.cr[k];
+            if gap >= capture || gap >= cap[i].0 {
+                continue;
+            }
+            let (ca, cb) = (self.cell_of_bead(i), self.ccell[k]);
+            let key = pair_key(ca, cb);
+            let mode = if memo.0 == key { memo.1 } else { self.pair_mode(ca, cb, ad, frame) };
+            memo = (key, mode);
+            if mode != JOIN_NONE {
+                cap[i] = (gap, k as u32, 0.0, 2, mode);
+            }
+        }
+        let before = self.sticks.len();
+        for &(a, b) in &cc {
+            let gap = dist(self.cpos[a as usize], self.cpos[b as usize]) - self.cr[a as usize] - self.cr[b as usize];
+            if gap >= capture {
+                continue;
+            }
+            let (ca, cb) = (self.ccell[a as usize], self.ccell[b as usize]);
+            let mode = self.pair_mode(ca, cb, ad, frame);
+            if mode != JOIN_NONE && !self.pairs.get(&pair_key(ca, cb)).is_some_and(|p| p.cores) {
+                self.add_stick(a, true, b, true, 0.0, ca, cb, JOIN_STICKY, ad);
+            }
+        }
+        for i in 0..n {
+            let (_, b, s, kind, mode) = cap[i];
+            match kind {
+                1 => {
+                    let cb = self.rings[b as usize].cell as u32;
+                    self.add_stick(i as u32, false, b, false, s, self.cell_of_bead(i), cb, mode, ad);
+                }
+                // A core has no orientation yet: a bead on its rim holds the gap only.
+                2 => self.add_stick(i as u32, false, b, true, 0.0, self.cell_of_bead(i), self.ccell[b as usize], JOIN_STICKY, ad),
+                _ => {}
+            }
+        }
+        self.bb = bb;
+        self.bc = bc;
+        self.cc = cc;
+        self.cap = cap;
+        self.sticks.len() - before
+    }
+
+    /// Every stick, once a substep (after the rings and bonds, before the own contacts):
+    /// the gap held at zero along the edge's normal, pulling and pushing; an anchored
+    /// stick's bead also held at its place along the edge, more softly; a sticky one's
+    /// place follows the bead (hopping to the next edge past an end).
+    fn solve_sticks(&mut self) {
+        let inv_h2 = 1.0 / (self.h * self.h);
+        for k in 0..self.sticks.len() {
+            let mut st = self.sticks[k];
+            let a = st.a as usize;
+            let (pa, wa, ra) = if st.a_core { (self.cpos[a], self.cw[a], self.cr[a]) } else { (self.pos[a], self.w[a], self.r[a]) };
+            if st.b_core {
+                let b = st.b as usize;
+                let (pb, wb) = (self.cpos[b], self.cw[b]);
+                let d = pa - pb;
+                let l = len(d);
+                let denom = wa + wb + st.alpha_n * inv_h2;
+                if l < 1e-6 || denom <= 0.0 {
+                    continue;
+                }
+                let n = d / l;
+                let dl = -(l - (ra + self.cr[b])) / denom;
+                if st.a_core {
+                    self.cpos[a] += n * (dl * wa);
+                } else {
+                    self.pos[a] += n * (dl * wa);
+                }
+                self.cpos[b] -= n * (dl * wb);
+                self.sticks[k].pull += -dl * inv_h2;
+                continue;
+            }
+            let rb = st.b as usize;
+            st.s = self.follow(rb, st.s, pa);
+            self.sticks[k].s = st.s;
+            let (j, kk, _, _, nchord, l) = self.edge_at(rb, st.s);
+            if l < 1e-6 {
+                continue;
+            }
+            let (wj, wk) = (self.w[j], self.w[kk]);
+            // The gap: the bead's distance to the nearest point of its edge (to the end bead
+            // past either end), signed by the side it is on: a conservative distance
+            // constraint, pulling and pushing.
+            let seg = self.pos[kk] - self.pos[j];
+            let tp = (dot(pa - self.pos[j], seg) / (l * l)).clamp(0.0, 1.0);
+            let q = self.pos[j] + seg * tp;
+            let d = pa - q;
+            let dist = len(d);
+            let side = dot(d, nchord);
+            let (nrm, c) = if side > 0.0 && dist > 1e-6 { (d / dist, dist - (ra + self.r[j])) } else { (nchord, side - (ra + self.r[j])) };
+            let wq = wj * (1.0 - tp) * (1.0 - tp) + wk * tp * tp;
+            let denom = wa + wq + st.alpha_n * inv_h2;
+            if denom <= 0.0 {
+                continue;
+            }
+            let dl = -c / denom;
+            self.pos[a] += nrm * (dl * wa);
+            self.pos[j] -= nrm * (dl * wj * (1.0 - tp));
+            self.pos[kk] -= nrm * (dl * wk * tp);
+            self.sticks[k].pull += -dl * inv_h2;
+            if st.mode == JOIN_ANCHORED {
+                // The anchor: the bead held, more softly, level with its place along the
+                // edge: C = (bead - anchor point) · the edge's tangent. Its gradient includes
+                // the edge turning (the normal part of bead - anchor over the edge's
+                // length): without that term a held shear is a net torque and spins the
+                // cells up; with it the constraint is rotation-invariant and conserves
+                // angular momentum.
+                let (j, kk, ta, _, _, _) = self.edge_at(rb, st.anchor);
+                let (wj, wk) = (self.w[j], self.w[kk]);
+                let seg = self.pos[kk] - self.pos[j];
+                let l = len(seg);
+                if l < 1e-6 {
+                    continue;
+                }
+                let tan = seg / l;
+                let nrm = Vector2::new(-tan.y, tan.x);
+                let u = self.pos[a] - (self.pos[j] * (1.0 - ta) + self.pos[kk] * ta);
+                let ct = dot(u, tan) - st.offset;
+                let un = nrm * (dot(u, nrm) / l);
+                let gj = tan * -(1.0 - ta) - un;
+                let gk = tan * -ta + un;
+                let denom = wa + wj * len_sq(gj) + wk * len_sq(gk) + st.alpha_t * inv_h2;
+                let dt = -ct / denom;
+                self.pos[a] += tan * (dt * wa);
+                self.pos[j] += gj * (dt * wj);
+                self.pos[kk] += gk * (dt * wk);
+            }
+        }
+    }
+
+    /// A sticky stick's place `s` on ring `rb` following the bead at `p`: its projection
+    /// on the edge, or on the next edge over past an end.
+    fn follow(&self, rb: usize, s: f32, p: Vector2) -> f32 {
+        let (j, kk, _, _, _, _) = self.edge_at(rb, s);
+        let seg = self.pos[kk] - self.pos[j];
+        let l2 = len_sq(seg);
+        if l2 <= 1e-12 {
+            return s;
+        }
+        let tp = dot(p - self.pos[j], seg) / l2;
+        let e = (s.max(0.0) as usize).min(self.rings[rb].n - 1) as f32;
+        if (0.0..=1.0).contains(&tp) {
+            return e + tp.min(0.999);
+        }
+        let s2 = self.wrap_s(rb, if tp < 0.0 { e - 1.0 } else { e + 1.0 });
+        let (j2, k2, _, _, _, _) = self.edge_at(rb, s2);
+        let seg2 = self.pos[k2] - self.pos[j2];
+        let t2 = (dot(p - self.pos[j2], seg2) / len_sq(seg2).max(1e-12)).clamp(0.0, 0.999);
+        s2.floor() + t2
+    }
+
+    /// Once a frame after the substeps: each stick's mean pull over the frame; those past
+    /// the break force break; anchors creep toward their beads; then the pairs are
+    /// settled (events) and the ones no longer touching forgotten. Returns how many broke.
+    fn after_step(&mut self, ad: &Adhesion, substeps: usize, frame: u64) -> usize {
+        if !self.active || (self.sticks.is_empty() && self.pairs.is_empty()) {
+            return 0;
+        }
+        let inv = 1.0 / substeps.max(1) as f32;
+        let smooth = if ad.load_time > 0.0 { (self.dt / ad.load_time).min(1.0) } else { 1.0 };
+        for st in self.sticks.iter_mut() {
+            st.load += (st.pull * inv - st.load) * smooth;
+            st.pull = 0.0;
+        }
+        let limit = ad.break_force;
+        let broken = self.drop_sticks(|st| st.load > limit);
+        // Anchors move to where their beads are, keeping their tension, which creeps
+        // toward zero.
+        let keep = 1.0 - (ad.creep * self.dt).min(1.0);
+        for k in 0..self.sticks.len() {
+            let st = self.sticks[k];
+            if st.b_core || st.mode != JOIN_ANCHORED {
+                continue;
+            }
+            let rb = st.b as usize;
+            let p = self.pos[st.a as usize];
+            let tension = self.tangent_offset(p, rb, st.anchor) - st.offset;
+            let st = &mut self.sticks[k];
+            st.anchor = st.s;
+            let here = st.s;
+            let off = self.tangent_offset(p, rb, here) - tension * keep;
+            self.sticks[k].offset = off;
+        }
+        self.settle(frame);
+        self.recount_bonded();
+        broken
+    }
+
+    /// Reports every pair whose joined state changed (in cell-pair order) and forgets the
+    /// ones without sticks no longer within capture of each other.
+    fn settle(&mut self, frame: u64) {
+        let events = &mut self.events;
+        self.pairs.retain(|&(a, b), p| {
+            let now = p.sticks > 0;
+            if now != p.joined {
+                p.joined = now;
+                events.push((if now { EVENT_JOINED } else { EVENT_PARTED }, a, b));
+            }
+            now || p.seen >= frame
+        });
+    }
+
+    fn settle_pair(&mut self, key: (u32, u32)) {
+        if let Some(p) = self.pairs.get_mut(&key) {
+            let now = p.sticks > 0;
+            if now != p.joined {
+                p.joined = now;
+                self.events.push((if now { EVENT_JOINED } else { EVENT_PARTED }, key.0, key.1));
+            }
+        }
+    }
+
+    /// `stuck` from the sticks (after their indices changed).
+    fn rebuild_stuck(&mut self) {
+        self.stuck.iter_mut().for_each(|x| *x = 0);
+        for st in &self.sticks {
+            if !st.a_core {
+                self.stuck[st.a as usize] = if st.b_core { STUCK_CORE } else { st.b + 1 };
+            }
+        }
+    }
+
+    /// `bonded` (the drawing's exposed weight): each bead's bonds and sticks.
+    fn recount_bonded(&mut self) {
+        self.bonded.iter_mut().for_each(|b| *b = 0);
+        let mark = |bonded: &mut Vec<u8>, i: u32| bonded[i as usize] = bonded[i as usize].saturating_add(1);
+        for b in &self.bonds {
+            for e in [b.a, b.b] {
+                match e {
+                    End::Bead(i) => mark(&mut self.bonded, i),
+                    End::Edge(j, k, _) => {
+                        mark(&mut self.bonded, j);
+                        mark(&mut self.bonded, k);
+                    }
+                    End::Core(_) => {}
+                }
+            }
+        }
+        for k in 0..self.sticks.len() {
+            let st = self.sticks[k];
+            if !st.a_core {
+                mark(&mut self.bonded, st.a);
+            }
+            if !st.b_core {
+                let (j, kk, _, _, _, _) = self.edge_at(st.b as usize, st.s);
+                mark(&mut self.bonded, j as u32);
+                mark(&mut self.bonded, kk as u32);
+            }
+        }
+    }
+
+    /// Joins cells `a` and `b` by hand: the pair is forced (it sticks whatever the
+    /// filters say, now and whenever they touch again while it is remembered), and every
+    /// free bead within `ad.join_reach` of the other's skin sticks now. Returns the sticks
+    /// made; the joined event, if any, is queued at once.
+    pub fn join_cells(&mut self, a: usize, b: usize, ad: &Adhesion, frame: u64) -> usize {
+        if a == b || a >= self.cells.len() || b >= self.cells.len() {
+            return 0;
+        }
+        let key = pair_key(a as u32, b as u32);
+        let p = self.pairs.entry(key).or_insert(Pair { sticks: 0, joined: false, state: PairState::Forced, seen: frame, cores: false });
+        p.state = PairState::Forced;
+        p.seen = p.seen.max(frame);
+        let ta = self.cells[a].ctype as usize;
+        let tb = self.cells[b].ctype as usize;
+        let mode = ad.table[ta.min(MAX_TYPES - 1)][tb.min(MAX_TYPES - 1)].max(JOIN_ANCHORED);
+        let before = self.sticks.len();
+        let reach = ad.join_reach;
+        for (x, y) in [(a, b), (b, a)] {
+            match (self.cells[x].kind, self.cells[y].kind) {
+                (Kind::Ring(rx), Kind::Ring(ry)) => {
+                    if !self.sticks_onto(rx, ry) {
+                        continue;
+                    }
+                    let (start, n) = (self.rings[rx].start, self.rings[rx].n);
+                    for i in start..start + n {
+                        if self.stuck[i] != 0 {
+                            continue;
+                        }
+                        if let Some((_, s)) = self.nearest_edge(i, ry, None, reach) {
+                            self.add_stick(i as u32, false, ry as u32, false, s, x as u32, y as u32, mode, ad);
+                        }
+                    }
+                }
+                (Kind::Ring(rx), Kind::Core(ky)) => {
+                    let (start, n) = (self.rings[rx].start, self.rings[rx].n);
+                    for i in start..start + n {
+                        if self.stuck[i] == 0 && dist(self.pos[i], self.cpos[ky]) - self.r[i] - self.cr[ky] < reach {
+                            self.add_stick(i as u32, false, ky as u32, true, 0.0, x as u32, y as u32, JOIN_STICKY, ad);
+                        }
+                    }
+                }
+                (Kind::Core(kx), Kind::Core(ky)) if x < y => {
+                    let cores = self.pairs.get(&key).is_some_and(|p| p.cores);
+                    if !cores && dist(self.cpos[kx], self.cpos[ky]) - self.cr[kx] - self.cr[ky] < reach {
+                        self.add_stick(kx as u32, true, ky as u32, true, 0.0, x as u32, y as u32, JOIN_STICKY, ad);
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.settle_pair(key);
+        self.recount_bonded();
+        self.sticks.len() - before
+    }
+
+    /// Parts cells `a` and `b` by hand: every stick between them goes and the pair is
+    /// refused while they stay within capture of each other. Returns the sticks removed;
+    /// the parted event, if they were joined, is queued at once.
+    pub fn part_cells(&mut self, a: usize, b: usize, frame: u64) -> usize {
+        if a == b || a >= self.cells.len() || b >= self.cells.len() {
+            return 0;
+        }
+        let key = pair_key(a as u32, b as u32);
+        let removed = self.drop_sticks(|st| pair_key(st.cell_a, st.cell_b) == key);
+        let p = self.pairs.entry(key).or_insert(Pair { sticks: 0, joined: false, state: PairState::Refused, seen: frame, cores: false });
+        p.state = PairState::Refused;
+        p.seen = p.seen.max(frame);
+        self.settle_pair(key);
+        self.recount_bonded();
+        removed
+    }
+
+    /// Script's answer to an ask (or a decision made before one): allowed or refused,
+    /// remembered while the cells stay within capture of each other.
+    pub fn answer(&mut self, a: usize, b: usize, allow: bool, frame: u64) {
+        if a == b || a >= self.cells.len() || b >= self.cells.len() {
+            return;
+        }
+        let state = if allow { PairState::Allowed } else { PairState::Refused };
+        let p = self.pairs.entry(pair_key(a as u32, b as u32)).or_insert(Pair { sticks: 0, joined: false, state, seen: frame, cores: false });
+        p.state = state;
+        p.seen = p.seen.max(frame);
+    }
+
+    /// The cells stuck to cell `cell` now, in order.
+    pub fn neighbours(&self, cell: u32) -> Vec<u32> {
+        let mut out: Vec<u32> = self
+            .pairs
+            .iter()
+            .filter(|(k, p)| p.sticks > 0 && (k.0 == cell || k.1 == cell))
+            .map(|(k, _)| if k.0 == cell { k.1 } else { k.0 })
+            .collect();
+        out.sort_unstable();
+        out
+    }
+
+    /// Cell `cell` takes radius `radius` at once, in place: its rest outline, bead
+    /// radius, target area (a ring) or its disc (a core) scaled; bead count, masses and
+    /// springs kept. The ring's pressure and shape matching move its beads there over the
+    /// next frames; the sticks' rest gaps follow the bead radius at once.
+    pub fn resize_cell(&mut self, cell: usize, radius: f32) -> bool {
+        if cell >= self.cells.len() || radius <= 0.0 {
+            return false;
+        }
+        let old = self.cells[cell].t.radius;
+        let f = radius / old.max(1e-6);
+        let t = &mut self.cells[cell].t;
+        t.radius = radius;
+        t.ring_radius *= f;
+        t.bead_radius *= f;
+        t.target_area = std::f32::consts::PI * radius * radius;
+        let br = t.bead_radius;
+        match self.cells[cell].kind {
+            Kind::Ring(r) => {
+                let ring = &mut self.rings[r];
+                ring.rest.iter_mut().for_each(|p| *p = *p * f);
+                ring.rest_edges.iter_mut().for_each(|e| *e *= f);
+                ring.rest_bend.iter_mut().for_each(|e| *e *= f);
+                for i in ring.start..ring.start + ring.n {
+                    self.r[i] = br;
+                }
+            }
+            Kind::Core(k) => self.cr[k] = radius,
+        }
+        true
+    }
+
+    /// Stick `k`'s gap now (px along its normal; 0 is what it holds).
+    pub fn stick_gap(&self, k: usize) -> f32 {
+        let st = self.sticks[k];
+        let a = st.a as usize;
+        let (pa, ra) = if st.a_core { (self.cpos[a], self.cr[a]) } else { (self.pos[a], self.r[a]) };
+        if st.b_core {
+            dist(pa, self.cpos[st.b as usize]) - ra - self.cr[st.b as usize]
+        } else {
+            let (j, kk, _, _, nchord, _) = self.edge_at(st.b as usize, st.s);
+            let seg = self.pos[kk] - self.pos[j];
+            let tp = (dot(pa - self.pos[j], seg) / len_sq(seg).max(1e-12)).clamp(0.0, 1.0);
+            let d = pa - (self.pos[j] + seg * tp);
+            let side = dot(d, nchord);
+            (if side > 0.0 { len(d) } else { side }) - ra - self.r[j]
+        }
+    }
+
+    /// The worst stick now: [largest gap beyond zero (px, stretched), deepest below it
+    /// (px, squeezed), largest load].
+    fn stick_health(&self) -> [f32; 3] {
+        let (mut stretch, mut squeeze, mut load) = (0.0f32, 0.0f32, 0.0f32);
+        for k in 0..self.sticks.len() {
+            let c = self.stick_gap(k);
+            stretch = stretch.max(c);
+            squeeze = squeeze.max(-c);
+            load = load.max(self.sticks[k].load);
+        }
+        [stretch, squeeze, load]
     }
 
     /// This step's candidates within the creature (see Colony::build_pairs()).
@@ -794,11 +1653,20 @@ impl Creature {
         self.aabb = bounds.unwrap_or_default();
         // Without contacts between its own cells (the bonds keep them apart) a creature
         // needs no grid of its own: a pressurised cell does not fold onto itself.
-        let cores_only = !opt.intra_contacts && opt.core_contacts && nc > 0;
-        if !active || !(opt.intra_contacts || cores_only) {
+        // Capture needs every candidate within the capture gap, whatever the contacts.
+        let capturing = opt.ad.enabled && !opt.ad.paused && !self.capture_paused;
+        let cores_only = !opt.intra_contacts && opt.core_contacts && nc > 0 && !capturing;
+        self.solve_bb = opt.intra_contacts;
+        self.solve_cores = opt.intra_contacts || opt.core_contacts;
+        if !active || !(opt.intra_contacts || cores_only || capturing) {
             return;
         }
-        let slop = opt.slop;
+        // How much further than touching a capture candidate may be: the gap, and the
+        // way an edge's middle sits closer than its beads (a bead within the gap of an
+        // edge is within about 0.15 of the radii more of the edge's nearer bead).
+        let rmax = self.r.iter().copied().fold(0.0f32, f32::max);
+        let extra = if capturing { opt.ad.capture + 0.3 * rmax } else { 0.0 };
+        let slop = opt.slop + extra;
         let intra = true;
         let qmax = self.reach.iter().copied().fold(0.0f32, f32::max);
         let cell = ((2.0 * qmax + slop) * opt.cell_scale).max(1.0);
@@ -897,6 +1765,17 @@ impl Creature {
 
     /// Removes core `k`, renumbering the later ones.
     fn remove_core(&mut self, k: usize) {
+        let k32 = k as u32;
+        self.drop_sticks(|st| (st.a_core && st.a == k32) || (st.b_core && st.b == k32));
+        for st in self.sticks.iter_mut() {
+            if st.a_core && st.a > k32 {
+                st.a -= 1;
+            }
+            if st.b_core && st.b > k32 {
+                st.b -= 1;
+            }
+        }
+        self.rebuild_stuck();
         self.cpos.remove(k);
         self.cprev.remove(k);
         self.cvel.remove(k);
@@ -916,6 +1795,21 @@ impl Creature {
 
     /// Removes ring `r` and its beads, renumbering the later ones.
     fn remove_ring(&mut self, r: usize) {
+        // Its sticks, and the ones on its skin, go (their pairs keep `joined`, so a
+        // promotion or demotion that sticks again in the next frame reports nothing).
+        {
+            let (start, end, r32) = (self.rings[r].start as u32, (self.rings[r].start + self.rings[r].n) as u32, r as u32);
+            self.drop_sticks(|st| (!st.a_core && st.a >= start && st.a < end) || (!st.b_core && st.b == r32));
+            let n = end - start;
+            for st in self.sticks.iter_mut() {
+                if !st.a_core && st.a >= end {
+                    st.a -= n;
+                }
+                if !st.b_core && st.b > r32 {
+                    st.b -= 1;
+                }
+            }
+        }
         let ring = self.rings.remove(r);
         let range = ring.start..ring.start + ring.n;
         self.pos.drain(range.clone());
@@ -926,6 +1820,8 @@ impl Creature {
         self.w.drain(range.clone());
         self.damp.drain(range.clone());
         self.bead_ring.drain(range.clone());
+        self.stuck.drain(range.clone());
+        self.rebuild_stuck();
         self.bonded.drain(range);
         for later in self.rings.iter_mut().skip(r) {
             later.start -= ring.n;
@@ -989,7 +1885,7 @@ impl Creature {
         }
         self.remove_core(k);
         let ring = self.push_ring(cell, &points, v);
-        self.build_bonds(capture, bond_scale);
+        self.rebuild_holds(capture, bond_scale);
         self.topology += 1;
         let start = self.rings[ring].start;
         let mut worst = 0.0f32;
@@ -1010,7 +1906,7 @@ impl Creature {
         let v = self.cell_velocity(cell);
         self.remove_ring(r);
         let k = self.push_core(cell, c, v);
-        self.build_bonds(capture, bond_scale);
+        self.rebuild_holds(capture, bond_scale);
         self.topology += 1;
         let rc = self.cr[k];
         let mut worst = 0.0f32;
@@ -1242,7 +2138,7 @@ impl Colony {
         let count = cells.len() / CELL_STRIDE;
         for i in 0..count {
             let f = &cells[i * CELL_STRIDE..(i + 1) * CELL_STRIDE];
-            c.cells.push(Cell { kind: Kind::Core(0), t: CellTuning::from_floats(f) });
+            c.cells.push(Cell::new(CellTuning::from_floats(f)));
         }
         for i in 0..count {
             let f = &cells[i * CELL_STRIDE..(i + 1) * CELL_STRIDE];
@@ -1281,6 +2177,10 @@ impl Colony {
             c.ns_rings = 0;
             c.ns_bonds = 0;
             c.ns_intra = 0;
+            c.ns_sticks = 0;
+            c.ns_capture = 0;
+            c.made = 0;
+            c.broken = 0;
         }
         let mut stats = Stats { draw_build_us: self.stats.draw_build_us, ..Default::default() };
         let t = Instant::now();
@@ -1293,6 +2193,12 @@ impl Colony {
         let t = Instant::now();
         self.build_pairs();
         stats.pairs_us = t.elapsed().as_micros() as u64;
+        let ad = opt.ad;
+        if ad.enabled {
+            let t = Instant::now();
+            self.for_each(|c| c.made = c.capture(&ad, frame));
+            stats.capture_us = t.elapsed().as_micros() as u64;
+        }
         let (mut solve, mut cross, mut vel) = (0u64, 0u64, 0u64);
         for _ in 0..n_sub {
             let t = Instant::now();
@@ -1305,7 +2211,14 @@ impl Colony {
             self.for_each(|c| c.velocities(opt.max_speed));
             vel += ns(t);
         }
+        let t = Instant::now();
+        self.for_each(|c| c.broken = c.after_step(&ad, n_sub, frame));
+        stats.settle_us = t.elapsed().as_micros() as u64;
         for c in self.creatures.iter_mut() {
+            stats.sticks_cpu_us += c.ns_sticks / 1000;
+            stats.sticks += c.sticks.len();
+            stats.made += c.made;
+            stats.broken += c.broken;
             c.force.iter_mut().for_each(|f| *f = Vector2::ZERO);
             c.cforce.iter_mut().for_each(|f| *f = Vector2::ZERO);
             stats.rings_cpu_us += c.ns_rings / 1000;
@@ -1390,8 +2303,13 @@ impl Colony {
     /// A few numbers that say whether the colony is sound: [fastest bead px/s, smallest
     /// and largest ring outline area over its target, rings inside out, the bonds'
     /// largest stretch over their rest length, the deepest overlap of a bead or core with
-    /// another particle of its creature (beyond 1 px), contacts between creatures].
-    pub fn health(&self) -> [f32; 6] {
+    /// another particle of its creature (beyond 1 px), the sticks' largest stretch and
+    /// squeeze (px beyond and below zero gap) and largest load, how many sticks, how
+    /// many particles are not finite].
+    pub fn health(&self) -> [f32; 11] {
+        let mut sticks = [0.0f32; 3];
+        let mut count = 0usize;
+        let mut nan = 0usize;
         let mut fastest = 0.0f32;
         let (mut amin, mut amax) = (f32::INFINITY, 0.0f32);
         let mut inverted = 0.0f32;
@@ -1401,6 +2319,12 @@ impl Colony {
             for &v in c.vel.iter().chain(c.cvel.iter()) {
                 fastest = fastest.max(len(v));
             }
+            nan += c.pos.iter().chain(c.cpos.iter()).filter(|p| !p.x.is_finite() || !p.y.is_finite()).count();
+            let sh = c.stick_health();
+            for k in 0..3 {
+                sticks[k] = sticks[k].max(sh[k]);
+            }
+            count += c.sticks.len();
             for ring in &c.rings {
                 let t = &c.cells[ring.cell].t;
                 let pts = &c.pos[ring.start..ring.start + ring.n];
@@ -1429,7 +2353,30 @@ impl Colony {
             amin = 1.0;
             amax = 1.0;
         }
-        [fastest, amin, amax, inverted, stretch, overlap]
+        [fastest, amin, amax, inverted, stretch, overlap, sticks[0], sticks[1], sticks[2], count as f32, nan as f32]
+    }
+
+    pub fn frame(&self) -> u64 {
+        self.frame
+    }
+
+    /// Every creature's untaken events, creature after creature, each in the order it
+    /// happened: (kind, creature, cell a, cell b).
+    pub fn take_events(&mut self) -> Vec<(u8, u32, u32, u32)> {
+        let mut out = Vec::new();
+        for (ci, c) in self.creatures.iter_mut().enumerate() {
+            out.extend(c.events.drain(..).map(|(k, a, b)| (k, ci as u32, a, b)));
+        }
+        out
+    }
+
+    /// Every creature's unanswered first touches: (creature, cell a, cell b).
+    pub fn take_asks(&mut self) -> Vec<(u32, u32, u32)> {
+        let mut out = Vec::new();
+        for (ci, c) in self.creatures.iter_mut().enumerate() {
+            out.extend(c.asks.drain(..).map(|(a, b)| (ci as u32, a, b)));
+        }
+        out
     }
 }
 
@@ -1501,5 +2448,155 @@ mod tests {
         assert!(c.demote(core_cell, 1.5, 1.0) >= 0.0);
         assert_eq!(c.core_count(), cores);
         assert_eq!(c.bead_count(), beads);
+    }
+
+    /// GooTuning.tuning(14) at unit 0.5 (tests/unit/test_goo_colony_adhesion.gd builds
+    /// cells from GooTuning itself), scaled to radius `r`.
+    fn real_cell(x: f32, y: f32, r: f32, damp: f32) -> Vec<f32> {
+        let f = r / 14.0;
+        vec![
+            x, y, r, 0.0, 12.0, 9.78979 * f, 4.39823 * f, 0.21667, 1737.97, 200.0, 8666.67, 4.33333, 2600.0, 1.3, 5.0, damp,
+            std::f32::consts::PI * r * r, 1.0, 0.5, 0.2,
+        ]
+    }
+
+    /// A hexagonal cluster of 19 touching 14 px cells about `at`.
+    fn hex(col: &mut Colony, at: Vector2, damp: f32) -> usize {
+        let r = 14.0;
+        let mut cells = Vec::new();
+        for q in -2i32..3 {
+            for p in -2i32..3 {
+                if (p + q).abs() > 2 {
+                    continue;
+                }
+                cells.extend(real_cell(at.x + p as f32 * 2.0 * r + q as f32 * r, at.y + q as f32 * 3f32.sqrt() * r, r, damp));
+            }
+        }
+        col.add_creature(&cells)
+    }
+
+    fn adhesive(threads: usize) -> Colony {
+        let mut col = Colony::default();
+        col.set_threads(threads);
+        col.opt.ad.enabled = true;
+        col.opt.ad.capture = 1.5;
+        col.opt.ad.break_force = 2500.0;
+        col
+    }
+
+    fn angular_momentum(c: &Creature) -> f32 {
+        let cc = c.center();
+        (0..c.pos.len()).map(|i| cross(c.pos[i] - cc, c.vel[i]) / c.w[i]).sum()
+    }
+
+    #[test]
+    fn a_resting_anchored_cluster_does_not_spin_up() {
+        // No damping at all: a stick that is not rotation-invariant (or a standing
+        // conflict between sticks) shows as angular momentum growing frame after frame.
+        for mode in [JOIN_ANCHORED, JOIN_STICKY] {
+            let mut col = adhesive(1);
+            col.opt.ad.break_force = 1e9;
+            col.opt.ad.table[0][0] = mode;
+            hex(&mut col, Vector2::ZERO, 0.0);
+            for _ in 0..30 {
+                col.step(1.0 / 60.0);
+            }
+            let l0 = angular_momentum(&col.creatures[0]);
+            for _ in 0..300 {
+                col.step(1.0 / 60.0);
+            }
+            let l1 = angular_momentum(&col.creatures[0]);
+            let c = &col.creatures[0];
+            let fastest = c.vel.iter().map(|v| len(*v)).fold(0.0f32, f32::max);
+            println!("mode {}: L {:.3} -> {:.3}, fastest {:.2} px/s, {} sticks", mode, l0, l1, fastest, c.sticks.len());
+            // (|L| = 250 is 0.003 rad/s for this cluster, about what capture leaves; 25 more
+            // over the 5 s is 0.0003 rad/s, the bonds' own drift. It must not grow beyond.)
+            assert!(l1.abs() <= l0.abs() + 25.0 && l1.abs() < 400.0, "angular momentum grows: {} -> {}", l0, l1);
+            assert!(fastest < 5.0, "a resting cluster stays at rest: {}", fastest);
+            assert!(c.sticks.len() > 30);
+        }
+    }
+
+    #[test]
+    fn threaded_adhesion_is_bit_identical_to_serial() {
+        // Clusters thrown at each other: sticks made at spawn, broken by the impacts and
+        // the pulls, captured again; events and all.
+        let run = |threads: usize| {
+            let mut col = adhesive(threads);
+            for c in 0..6 {
+                let k = hex(&mut col, Vector2::new(c as f32 * 160.0, (c % 2) as f32 * 30.0), 1.0);
+                col.creatures[k].push = Vector2::new(if c % 2 == 0 { 900.0 } else { -900.0 }, 0.0);
+                col.creatures[k].cells[3].push = Vector2::new(0.0, 6000.0);
+            }
+            let mut events = Vec::new();
+            let (mut made, mut broken) = (0, 0);
+            for f in 0..150 {
+                col.step(1.0 / 60.0);
+                made += col.stats.made;
+                broken += col.stats.broken;
+                if f == 70 {
+                    for c in col.creatures.iter_mut() {
+                        c.push = -c.push;
+                    }
+                }
+                events.extend(col.take_events());
+            }
+            (col, events, made, broken)
+        };
+        let (a, ea, made, broken) = run(1);
+        let (b, eb, _, _) = run(4);
+        println!("made {}, broken {}, events {}", made, broken, ea.len());
+        assert!(broken > 0 && made > 0, "sticks broke and were made");
+        assert_eq!(ea, eb, "the same events in the same order");
+        for (ca, cb) in a.creatures.iter().zip(&b.creatures) {
+            for (p, q) in ca.pos.iter().zip(&cb.pos) {
+                assert_eq!(p.x.to_bits(), q.x.to_bits());
+                assert_eq!(p.y.to_bits(), q.y.to_bits());
+            }
+            assert_eq!(ca.sticks.len(), cb.sticks.len());
+            for (s, t) in ca.sticks.iter().zip(&cb.sticks) {
+                assert_eq!(s.load.to_bits(), t.load.to_bits());
+                assert_eq!(s.anchor.to_bits(), t.anchor.to_bits());
+            }
+        }
+    }
+
+    #[test]
+    fn promote_and_demote_keep_the_other_sticks_and_report_nothing() {
+        let mut col = adhesive(1);
+        col.opt.ad.break_force = 1e9;
+        let r = 14.0;
+        let mut cells = Vec::new();
+        for i in 0..5 {
+            for j in 0..5 {
+                let mut c = real_cell(i as f32 * 2.0 * r, j as f32 * 2.0 * r, r, 1.0);
+                if (1..4).contains(&i) && (1..4).contains(&j) {
+                    c[3] = 1.0;
+                }
+                cells.extend(c);
+            }
+        }
+        col.add_creature(&cells);
+        for _ in 0..20 {
+            col.step(1.0 / 60.0);
+        }
+        col.take_events();
+        let c = &mut col.creatures[0];
+        let before = c.sticks.len();
+        let middle = 12;
+        assert!(c.promote(middle, 1.5, 1.0) >= 0.0);
+        assert!(c.sticks.len() < before, "the core's sticks went with it");
+        for _ in 0..3 {
+            col.step(1.0 / 60.0);
+        }
+        let c = &col.creatures[0];
+        assert!(c.neighbours(middle as u32).len() >= 4, "the new ring is stuck again: {:?}", c.neighbours(middle as u32));
+        let events = col.take_events();
+        assert!(events.is_empty(), "a promotion is not a parting: {:?}", events);
+        for st in &col.creatures[0].sticks {
+            if !st.a_core {
+                assert!((st.a as usize) < col.creatures[0].pos.len());
+            }
+        }
     }
 }
