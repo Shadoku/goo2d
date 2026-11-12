@@ -1045,7 +1045,10 @@ impl GooColony {
     /// "auto_cores" (bool), "to_core_time", "to_ring_time", "switch_rest", "core_ease"
     /// (s), "soft_cores" (bool), "core_stiffness", "core_damping", "core_min_radius",
     /// "core_max_radius", "core_contact" (× the core cell's skin stiffness; 0 rigid), "skip_speed" (px/s), "drag" (bool), "drag_density", "drag_normal", "drag_tangent",
-    /// "drag_linear_normal", "drag_linear_tangent", "drag_max_step".
+    /// "drag_linear_normal", "drag_linear_tangent", "drag_max_step"; milestone 3's
+    /// (docs/colony-tension.md): "tension" (the force each outline edge pulls with; 0
+    /// off), "tension_pockets" (× it on skin facing a pocket), "tension_min_edge" (px),
+    /// "tension_hop", "tension_hop_max" (× a hop's two bead radii: full, none).
     #[func]
     fn set_options(&mut self, options: VarDictionary) {
         for (key, value) in options.iter_shared() {
@@ -1107,6 +1110,11 @@ impl GooColony {
                 "drag_linear_normal" => o.drag.linear_normal = (number as f32).max(0.0),
                 "drag_linear_tangent" => o.drag.linear_tangent = (number as f32).max(0.0),
                 "drag_max_step" => o.drag.max_step = (number as f32).max(0.0),
+                "tension" => o.tension.strength = (number as f32).max(0.0),
+                "tension_pockets" => o.tension.pockets = (number as f32).max(0.0),
+                "tension_min_edge" => o.tension.min_edge = (number as f32).max(1e-3),
+                "tension_hop" => o.tension.hop = (number as f32).max(0.0),
+                "tension_hop_max" => o.tension.hop_max = (number as f32).max(0.0),
                 other => godot_error!("GooColony.set_options(): unknown option '{}'", other),
             }
         }
@@ -1196,10 +1204,12 @@ impl GooColony {
         put(&mut d, "enclosed", s.enclosed as i64);
         put(&mut d, "pockets", s.pockets as i64);
         put(&mut d, "broken_runs", s.broken_runs as i64);
+        put(&mut d, "patched_runs", s.patched_runs as i64);
         put(&mut d, "pair_builds", s.pair_builds as i64);
         put(&mut d, "to_core", s.to_core as i64);
         put(&mut d, "to_ring", s.to_ring as i64);
         put(&mut d, "cross_skipped", s.cross_skipped as i64);
+        put(&mut d, "tension_cpu_us", s.tension_cpu_us as i64);
         let (mut beads, mut cores, mut rings, mut bonds) = (0usize, 0usize, 0usize, 0usize);
         for c in &self.c.creatures {
             beads += c.bead_count();
@@ -1751,5 +1761,48 @@ impl GooColony {
             Some(l) => PackedVector2Array::from(cr.loop_points(l)),
             None => PackedVector2Array::new(),
         }
+    }
+    /// A cell type's factor on the surface tension (an edge takes the mean of its two
+    /// ends' cells'): 0 slack, 1 the default, above 1 taut.
+    #[func]
+    fn set_type_tension(&mut self, type_id: i64, factor: f64) {
+        if (0..colony::MAX_TYPES as i64).contains(&type_id) {
+            self.c.opt.tension.types[type_id as usize] = (factor as f32).max(0.0);
+        } else {
+            godot_error!("GooColony.set_type_tension(): type {} out of 0..{}", type_id, colony::MAX_TYPES);
+        }
+    }
+
+    #[func]
+    fn type_tension(&self, type_id: i64) -> f64 {
+        self.c.opt.tension.types.get(type_id.max(0) as usize).copied().unwrap_or(0.0) as f64
+    }
+
+    /// Creature `c`'s factor on the colony's surface tension (1 when added; 0 none).
+    #[func]
+    fn set_creature_tension(&mut self, c: i64, factor: f64) {
+        if let Some(cr) = self.c.creatures.get_mut(c as usize) {
+            cr.tension_scale = (factor as f32).max(0.0);
+        }
+    }
+
+    #[func]
+    fn creature_tension(&self, c: i64) -> f64 {
+        self.c.creatures.get(c as usize).map(|cr| cr.tension_scale as f64).unwrap_or(0.0)
+    }
+
+    /// The last substep's surface tension forces of creature `c`: two per edge it pulls
+    /// along (its first end's, then its second's: equal and opposite), at the points
+    /// creature_tension_points() gives (a core's virtual bead's force went to the core and
+    /// its moment to the core's turn).
+    #[func]
+    fn creature_tension_forces(&self, c: i64) -> PackedVector2Array {
+        self.c.creatures.get(c as usize).map(|cr| pv2(&cr.tension_f)).unwrap_or_default()
+    }
+
+    /// Where those points were when the forces were found.
+    #[func]
+    fn creature_tension_points(&self, c: i64) -> PackedVector2Array {
+        self.c.creatures.get(c as usize).map(|cr| pv2(&cr.tension_x)).unwrap_or_default()
     }
 }

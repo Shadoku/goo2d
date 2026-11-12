@@ -122,6 +122,8 @@ struct Chain {
     closed: bool,
     succ: u32,
     state: u8,
+    /// Its successor was a guess (an open path closed on itself).
+    patched: bool,
 }
 
 /// The pass's working arrays, kept between passes (no allocation once warm).
@@ -147,6 +149,9 @@ pub(super) struct Scratch {
     grid: Grid,
     path: Vec<u32>,
     poly: Vec<Vector2>,
+    /// The successors' offers: (tier, distance², run, its candidate successor).
+    offers: Vec<(u8, f32, u32, u32)>,
+    taken: Vec<bool>,
 }
 
 #[inline]
@@ -347,7 +352,7 @@ impl Creature {
             let open = (base..base + n).filter(|&p| s.contact[p as usize] == 1).count() as u32;
             if open == n {
                 let id = s.chains.len() as u32;
-                s.chains.push(Chain { start: base, end: base + n - 1, cell: cell as u32, closed: true, succ: id, state: 0 });
+                s.chains.push(Chain { start: base, end: base + n - 1, cell: cell as u32, closed: true, succ: id, state: 0, patched: false });
                 for p in base..base + n {
                     s.chain_of[p as usize] = id;
                 }
@@ -364,7 +369,7 @@ impl Creature {
                             }
                             e = nx;
                         }
-                        s.chains.push(Chain { start: p, end: e, cell: cell as u32, closed: false, succ: NONE, state: 0 });
+                        s.chains.push(Chain { start: p, end: e, cell: cell as u32, closed: false, succ: NONE, state: 0, patched: false });
                     }
                 }
             }
@@ -379,6 +384,15 @@ impl Creature {
         let rcell = self.cells.iter().map(|c| c.t.radius).fold(0.0f32, f32::max);
         let reach = 3.0 * rcell + cs;
         let span = (reach / cs).ceil() as i32;
+        // The successors are given out one to one, best offers (tier, then distance) first:
+        // a run another one already continues into is not offered again, so the successors
+        // form loops and no run is left on a tail behind two runs that chose the same
+        // successor (milestone 3: ragged creatures). Tier 0 offers come first whatever
+        // else is offered, so they are given out before the wider search, which is made
+        // only for the runs they leave without a successor.
+        s.offers.clear();
+        s.taken.clear();
+        s.taken.resize(s.chains.len(), false);
         for ch in 0..s.chains.len() {
             if s.chains[ch].closed {
                 continue;
@@ -387,59 +401,147 @@ impl Creature {
             let a_cell = s.chains[ch].cell;
             let x_cell = s.against[s.next(e) as usize];
             let pe = s.pos[e as usize];
-            // (tier, distance², chain)
-            let mut best: (u8, f32, u32) = (u8::MAX, f32::INFINITY, NONE);
-            let offer = |tier: u8, d: f32, c: u32, best: &mut (u8, f32, u32)| {
-                if c as usize != ch && d <= reach * reach && (tier < best.0 || (tier == best.0 && d < best.1)) {
-                    *best = (tier, d, c);
-                }
-            };
             if x_cell != NONE {
                 let (first, count) = s.cell_chains[x_cell as usize];
                 for c2 in first..first + count {
                     let c = s.chains[c2 as usize];
-                    if c.closed {
+                    if c.closed || c2 as usize == ch {
                         continue;
                     }
-                    let from_a = s.against[s.prev(c.start) as usize] == a_cell;
-                    offer(if from_a { 0 } else { 3 }, dist_sq(pe, s.pos[c.start as usize]), c2, &mut best);
-                }
-            }
-            if best.0 > 0 {
-                let (cx, cy) = s.grid.cell_of(pe);
-                for dy in -span..=span {
-                    for dx in -span..=span {
-                        let (tx, ty) = (cx + dx, cy + dy);
-                        let bkt = s.grid.bucket(tx, ty);
-                        for kk in s.grid.start[bkt] as usize..s.grid.start[bkt + 1] as usize {
-                            let q = s.grid.items[kk];
-                            if s.grid.cells[q as usize] != (tx, ty) {
-                                continue;
-                            }
-                            let c2 = s.chain_of[q as usize];
-                            if c2 == NONE || s.chains[c2 as usize].start != q || s.chains[c2 as usize].closed {
-                                continue;
-                            }
-                            let from = s.against[s.prev(q) as usize];
-                            let tier = if x_cell != NONE && from == x_cell && s.cell[q as usize] != x_cell {
-                                1
-                            } else if from == a_cell {
-                                2
-                            } else {
-                                4
-                            };
-                            offer(tier, dist_sq(pe, s.pos[q as usize]), c2, &mut best);
-                        }
+                    let d = dist_sq(pe, s.pos[c.start as usize]);
+                    if d <= reach * reach {
+                        let from_a = s.against[s.prev(c.start) as usize] == a_cell;
+                        s.offers.push((if from_a { 0 } else { 3 }, d, ch as u32, c2));
                     }
                 }
             }
-            s.chains[ch].succ = best.2;
         }
+        let order = |a: &(u8, f32, u32, u32), b: &(u8, f32, u32, u32)| {
+            a.0.cmp(&b.0).then(a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)).then(a.2.cmp(&b.2)).then(a.3.cmp(&b.3))
+        };
+        s.offers.sort_by(order);
+        for o in 0..s.offers.len() {
+            let (tier, _, ch, c2) = s.offers[o];
+            if tier != 0 {
+                break;
+            }
+            if s.chains[ch as usize].succ != NONE || s.taken[c2 as usize] {
+                continue;
+            }
+            s.chains[ch as usize].succ = c2;
+            s.taken[c2 as usize] = true;
+        }
+        s.offers.retain(|o| o.0 != 0);
+        for ch in 0..s.chains.len() {
+            if s.chains[ch].closed || s.chains[ch].succ != NONE {
+                continue;
+            }
+            let e = s.chains[ch].end;
+            let a_cell = s.chains[ch].cell;
+            let x_cell = s.against[s.next(e) as usize];
+            let pe = s.pos[e as usize];
+            let (cx, cy) = s.grid.cell_of(pe);
+            for dy in -span..=span {
+                for dx in -span..=span {
+                    let (tx, ty) = (cx + dx, cy + dy);
+                    let bkt = s.grid.bucket(tx, ty);
+                    for kk in s.grid.start[bkt] as usize..s.grid.start[bkt + 1] as usize {
+                        let q = s.grid.items[kk];
+                        if s.grid.cells[q as usize] != (tx, ty) {
+                            continue;
+                        }
+                        let c2 = s.chain_of[q as usize];
+                        if c2 == NONE || c2 as usize == ch || s.chains[c2 as usize].start != q || s.chains[c2 as usize].closed || s.taken[c2 as usize] {
+                            continue;
+                        }
+                        // X's own runs were offered above.
+                        if x_cell != NONE && s.cell[q as usize] == x_cell {
+                            continue;
+                        }
+                        let d = dist_sq(pe, s.pos[q as usize]);
+                        if d > reach * reach {
+                            continue;
+                        }
+                        let from = s.against[s.prev(q) as usize];
+                        let tier = if x_cell != NONE && from == x_cell {
+                            1
+                        } else if from == a_cell {
+                            2
+                        } else {
+                            4
+                        };
+                        s.offers.push((tier, d, ch as u32, c2));
+                    }
+                }
+            }
+        }
+        s.offers.sort_by(order);
+        for o in 0..s.offers.len() {
+            let (_, _, ch, c2) = s.offers[o];
+            if s.chains[ch as usize].succ != NONE || s.taken[c2 as usize] {
+                continue;
+            }
+            s.chains[ch as usize].succ = c2;
+            s.taken[c2 as usize] = true;
+        }
+        // What is left is open paths, each from a run nothing continues into to a run with
+        // no successor within reach (as many of one as of the other). Each path's end is
+        // joined to the nearest path start still free (its own included), in path order:
+        // the pieces of an outline that one missing link broke join up again, and one
+        // missing link does not leave a whole outline without a loop. Their beads are
+        // counted (`exp_patched`): the outline at those joins is a guess.
+        let mut patched = 0usize;
+        let mut paths: Vec<(u32, u32)> = Vec::new();
+        for ch in 0..s.chains.len() {
+            if s.chains[ch].closed || s.taken[ch] {
+                continue;
+            }
+            let mut cur = ch;
+            let mut steps = 0usize;
+            while s.chains[cur].succ != NONE && steps <= s.chains.len() {
+                cur = s.chains[cur].succ as usize;
+                steps += 1;
+            }
+            if s.chains[cur].succ == NONE {
+                paths.push((ch as u32, cur as u32));
+                let mut c = ch;
+                loop {
+                    let chain = s.chains[c];
+                    let n = s.range[chain.cell as usize].1.max(1);
+                    patched += ((chain.end + n - chain.start) % n) as usize + 1;
+                    if c == cur {
+                        break;
+                    }
+                    c = chain.succ as usize;
+                }
+            }
+        }
+        for pi in 0..paths.len() {
+            let end = paths[pi].1 as usize;
+            let pe = s.pos[s.chains[end].end as usize];
+            let mut best: (f32, usize) = (f32::INFINITY, usize::MAX);
+            for (qi, &(first, _)) in paths.iter().enumerate() {
+                if s.taken[first as usize] {
+                    continue;
+                }
+                let d = dist_sq(pe, s.pos[s.chains[first as usize].start as usize]);
+                if d < best.0 {
+                    best = (d, qi);
+                }
+            }
+            if best.1 != usize::MAX {
+                let first = paths[best.1].0 as usize;
+                s.chains[end].succ = first as u32;
+                s.chains[end].patched = true;
+                s.taken[first] = true;
+            }
+        }
+        self.exp_patched = patched;
         // The loops: follow the successors; a walk that closes on itself is a loop, the
         // runs before the closing one (and any walk ending nowhere) stay broken.
         s.mark.clear();
         s.mark.resize(np, 0);
-        let mut loops: Vec<(Vec<u32>, f64)> = Vec::new();
+        let mut loops: Vec<(Vec<u32>, f64, bool)> = Vec::new();
         for ch in 0..s.chains.len() {
             if s.chains[ch].state != 0 {
                 continue;
@@ -459,8 +561,10 @@ impl Creature {
                     1 => {
                         let from = s.path.iter().position(|&c| c == cur).unwrap_or(0);
                         let mut pts: Vec<u32> = Vec::new();
+                        let mut guessed = false;
                         for &c in &s.path[from..] {
                             let chain = s.chains[c as usize];
+                            guessed |= chain.patched;
                             let mut p = chain.start;
                             loop {
                                 pts.push(p);
@@ -473,7 +577,7 @@ impl Creature {
                         s.poly.clear();
                         s.poly.extend(pts.iter().map(|&p| s.pos[p as usize]));
                         let area = signed_area(&s.poly);
-                        loops.push((pts, area));
+                        loops.push((pts, area, guessed));
                         break;
                     }
                     _ => break,
@@ -485,8 +589,15 @@ impl Creature {
         }
         let largest = (0..loops.len()).max_by(|&a, &b| loops[a].1.abs().partial_cmp(&loops[b].1.abs()).unwrap_or(std::cmp::Ordering::Equal).then(b.cmp(&a)));
         self.loops.clear();
-        for (li, (pts, area)) in loops.iter().enumerate() {
-            let kind = if *area < 0.0 || Some(li) == largest { LoopKind::Outside } else { LoopKind::Pocket };
+        for (li, (pts, area, guessed)) in loops.iter().enumerate() {
+            // A loop of fewer than 3 points or about no area (a run that closed on itself, two
+            // runs each other's successor) is no outline: its beads stay exposed, on no loop.
+            if pts.len() < 3 || area.abs() < (rmax * rmax) as f64 {
+                continue;
+            }
+            // A loop closed by a guess is never a pocket: its beads stay exposed (the safe
+            // side: drag, never a missed contact).
+            let kind = if *area < 0.0 || Some(li) == largest || *guessed { LoopKind::Outside } else { LoopKind::Pocket };
             let m = if kind == LoopKind::Outside { 1 } else { 2 };
             for &p in pts {
                 s.mark[p as usize] = m;
@@ -504,8 +615,17 @@ impl Creature {
                 .collect();
             self.loops.push(OutlineLoop { kind, area: *area as f32, pts: lp });
         }
-        // The result: exposed = not enclosed by contact and not on a pocket.
+        // The result: exposed = not enclosed by contact and not on a pocket; the surface
+        // the tension acts on (1 facing the outside, 2 facing a pocket, 0 in contact).
         self.exp_broken = 0;
+        self.surface.clear();
+        self.surface.resize(nb, 0);
+        for i in 0..nb {
+            if s.contact[i] == 1 {
+                self.surface[i] = if s.mark[i] == 2 { 2 } else { 1 };
+            }
+        }
+        self.exp_version += 1;
         for i in 0..nb {
             self.exposed[i] = (s.contact[i] == 1 && s.mark[i] != 2) as u8;
             // Exposed for want of a loop (a broken run): counted, as a health figure.
@@ -541,6 +661,7 @@ impl Creature {
             c.outward = if open > 0 { norm(out) } else { Vector2::ZERO };
         }
         self.exp_valid = true;
+        self.loops_topology = self.topology;
         self.xs = s;
     }
 
@@ -583,7 +704,7 @@ impl Creature {
             self.exp_hot_until = frame + ex.hot as u64;
             self.exp_hot = false;
         }
-        if frame >= self.exp_next || frame < self.exp_hot_until {
+        if frame >= self.exp_next || frame < self.exp_hot_until || self.loops_topology != self.topology {
             self.exp_dirty = true;
         }
         if !self.exp_dirty {

@@ -60,8 +60,10 @@ use std::time::Instant;
 
 mod drag;
 mod exposure;
+mod tension;
 pub use drag::Drag;
 pub use exposure::{Exposure, LoopKind, OutlineLoop};
+pub use tension::Tension;
 
 /// Cell types the join table covers (type ids 0..MAX_TYPES).
 pub const MAX_TYPES: usize = 16;
@@ -498,6 +500,9 @@ pub struct Creature {
     exp_hot: bool,
     /// Beads left exposed by the last pass for want of a loop (broken runs).
     pub exp_broken: usize,
+    /// Beads on loops the last pass closed by a guess (an open path of runs closed on
+    /// itself: milestone 3).
+    pub exp_patched: usize,
     xs: exposure::Scratch,
     /// Per cell: the frame since which it has been a candidate to switch (0: none), and
     /// the frame before which it may not switch again.
@@ -516,6 +521,24 @@ pub struct Creature {
     exp_runs: usize,
     to_core: usize,
     to_ring: usize,
+    // Milestone 3 (docs/colony-tension.md).
+    /// A factor on Tension::strength for this creature (1 when added).
+    pub tension_scale: f32,
+    /// The topology the loops were found at: the tension waits for a new pass when it
+    /// changed (a manual promote or demote).
+    loops_topology: u64,
+    /// The last substep's tension force on each loop point (the loops' points in order,
+    /// outsides and pockets) and where the point was then; per point type factors.
+    pub tension_f: Vec<Vector2>,
+    pub tension_x: Vec<Vector2>,
+    /// Per bead, from the last exposure pass: 1 its skin faces the outside, 2 a pocket, 0
+    /// it is in contact (the surface the tension acts on).
+    pub surface: Vec<u8>,
+    /// Bumped by every exposure pass; the tension's edges were built at `tension_built`.
+    exp_version: u64,
+    tension_built: u64,
+    tension_edges: Vec<tension::TEdge>,
+    ns_tension: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -541,6 +564,7 @@ pub struct Options {
     pub ex: Exposure,
     pub cores: Cores,
     pub drag: Drag,
+    pub tension: Tension,
 }
 
 impl Default for Options {
@@ -561,6 +585,7 @@ impl Default for Options {
             ex: Exposure::default(),
             cores: Cores::default(),
             drag: Drag::default(),
+            tension: Tension::default(),
         }
     }
 }
@@ -607,11 +632,16 @@ pub struct Stats {
     pub pockets: usize,
     /// Beads exposed only because their run found no loop (should stay near 0).
     pub broken_runs: usize,
+    /// Beads on loops closed by a guess (a path of runs whose last found no successor,
+    /// closed onto its first; milestone 3).
+    pub patched_runs: usize,
     /// Creatures whose kept candidate list was built again this step (reuse_pairs).
     pub pair_builds: usize,
     pub to_core: usize,
     pub to_ring: usize,
     pub cross_skipped: usize,
+    /// Milestone 3: the surface tension (CPU, summed over creatures and substeps).
+    pub tension_cpu_us: u64,
 }
 
 pub struct Colony {
@@ -1188,11 +1218,16 @@ impl Creature {
         }
     }
 
-    fn substep_own(&mut self, cores: &Cores) {
+    fn substep_own(&mut self, opt: &Options) {
         if !self.active {
             return;
         }
-        self.predict(cores);
+        if opt.tension.on() {
+            let t = Instant::now();
+            self.apply_tension(&opt.tension);
+            self.ns_tension += ns(t);
+        }
+        self.predict(&opt.cores);
         let t = Instant::now();
         self.solve_rings();
         self.ns_rings += ns(t);
@@ -2910,7 +2945,7 @@ impl Colony {
 
     /// Adds a creature of the cells in `cells` (CELL_STRIDE floats each); returns its index.
     pub fn add_creature(&mut self, cells: &[f32]) -> usize {
-        let mut c = Creature { every: 1, index: self.creatures.len() as u32, ..Default::default() };
+        let mut c = Creature { every: 1, index: self.creatures.len() as u32, tension_scale: 1.0, ..Default::default() };
         let count = cells.len() / CELL_STRIDE;
         for i in 0..count {
             let f = &cells[i * CELL_STRIDE..(i + 1) * CELL_STRIDE];
@@ -2964,6 +2999,7 @@ impl Colony {
             c.core_ease = opt.ex.core_ease;
             c.ns_drag = 0;
             c.ns_exposure = 0;
+            c.ns_tension = 0;
             c.exp_runs = 0;
             c.to_core = 0;
             c.to_ring = 0;
@@ -2991,7 +3027,7 @@ impl Colony {
         let (mut solve, mut cross, mut vel) = (0u64, 0u64, 0u64);
         for _ in 0..n_sub {
             let t = Instant::now();
-            self.for_each(|c| c.substep_own(&opt.cores));
+            self.for_each(|c| c.substep_own(&opt));
             solve += ns(t);
             let t = Instant::now();
             stats.cross_hits = self.solve_cross();
@@ -3001,7 +3037,8 @@ impl Colony {
             vel += ns(t);
         }
         let t = Instant::now();
-        let ex_on = opt.ex.enabled;
+        // The tension runs along the exposure pass's outline: it runs the pass too.
+        let ex_on = opt.ex.enabled || opt.tension.on();
         self.for_each(|c| {
             let events = c.events.len();
             c.broken = c.after_step(&ad, n_sub, frame);
@@ -3034,6 +3071,7 @@ impl Colony {
             c.vbuilds = 0;
             stats.exposure_runs += c.exp_runs;
             stats.exposure_us += c.ns_exposure / 1000;
+            stats.tension_cpu_us += c.ns_tension / 1000;
             stats.to_core += c.to_core;
             stats.to_ring += c.to_ring;
             if c.exp_valid {
@@ -3042,6 +3080,7 @@ impl Colony {
                 stats.enclosed += c.exposed.len() - open;
                 stats.pockets += c.loops.iter().filter(|l| l.kind == LoopKind::Pocket).count();
                 stats.broken_runs += c.exp_broken;
+                stats.patched_runs += c.exp_patched;
             }
         }
         stats.cross_skipped = self.cross_skipped;
