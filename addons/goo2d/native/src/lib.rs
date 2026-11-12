@@ -1027,7 +1027,7 @@ impl GooColony {
     const EVENT_PARTED: i64 = colony::EVENT_PARTED as i64;
     /// Floats per stick in creature_sticks().
     #[constant]
-    const STICK_FLOATS: i64 = 10;
+    const STICK_FLOATS: i64 = 12;
 
     /// Any of: "threads", "substeps", "gravity" (Vector2), "max_speed", "cell_scale"
     /// (the bead grid's cell over the one its reach needs), "intra_contacts" (bool:
@@ -1035,7 +1035,7 @@ impl GooColony {
     /// intra_contacts off, a creature's cores still collide with its beads and cores),
     /// "slop", "bond_scale"; adhesion's (docs/colony-adhesion.md): "adhesion" (bool),
     /// "capture" (px), "join_reach" (px), "stick_scale", "anchor_scale", "creep" (/s),
-    /// "break_force", "load_time" (s), "ask" (bool: first touches wait for answer()), "capture_paused"
+    /// "break_force", "load_time" (s), "break_rest" (s), "ask" (bool: first touches wait for answer()), "capture_paused"
     /// (bool, the whole colony).
     #[func]
     fn set_options(&mut self, options: VarDictionary) {
@@ -1061,6 +1061,7 @@ impl GooColony {
                 "creep" => o.ad.creep = (number as f32).max(0.0),
                 "break_force" => o.ad.break_force = number as f32,
                 "load_time" => o.ad.load_time = (number as f32).max(0.0),
+                "break_rest" => o.ad.break_rest = (number as f32).max(0.0),
                 "ask" => o.ad.ask = value.try_to::<bool>().unwrap_or(number != 0.0),
                 "capture_paused" => o.ad.paused = value.try_to::<bool>().unwrap_or(number != 0.0),
                 other => godot_error!("GooColony.set_options(): unknown option '{}'", other),
@@ -1445,9 +1446,8 @@ impl GooColony {
     #[func]
     fn join_cells(&mut self, c: i64, a: i64, b: i64) -> i64 {
         let ad = self.c.opt.ad;
-        let frame = self.c.frame();
         match self.c.creatures.get_mut(c as usize) {
-            Some(cr) if a >= 0 && b >= 0 => cr.join_cells(a as usize, b as usize, &ad, frame) as i64,
+            Some(cr) if a >= 0 && b >= 0 => cr.join_cells(a as usize, b as usize, &ad) as i64,
             _ => 0,
         }
     }
@@ -1456,9 +1456,8 @@ impl GooColony {
     /// touch. The sticks removed; a parted event is queued if they were joined.
     #[func]
     fn part_cells(&mut self, c: i64, a: i64, b: i64) -> i64 {
-        let frame = self.c.frame();
         match self.c.creatures.get_mut(c as usize) {
-            Some(cr) if a >= 0 && b >= 0 => cr.part_cells(a as usize, b as usize, frame) as i64,
+            Some(cr) if a >= 0 && b >= 0 => cr.part_cells(a as usize, b as usize) as i64,
             _ => 0,
         }
     }
@@ -1467,10 +1466,9 @@ impl GooColony {
     /// the next step's capture; remembered while they stay in touch.
     #[func]
     fn answer(&mut self, c: i64, a: i64, b: i64, allow: bool) {
-        let frame = self.c.frame();
         if let Some(cr) = self.c.creatures.get_mut(c as usize) {
             if a >= 0 && b >= 0 {
-                cr.answer(a as usize, b as usize, allow, frame);
+                cr.answer(a as usize, b as usize, allow);
             }
         }
     }
@@ -1503,11 +1501,12 @@ impl GooColony {
 
     /// Creature `c`'s sticks, STICK_FLOATS each: end a (bead or core index), a is a core
     /// (0/1), end b (ring or core index), b is a core, s (the place along ring b), cell a,
-    /// cell b, mode, the last frame's mean load, the gap now (px; 0 is held).
+    /// cell b, mode, its load (smoothed), the gap now (px; 0 is held), the anchor (a place
+    /// along ring b), the anchor's tension now (px along the edge; 0 at rest).
     #[func]
     fn creature_sticks(&self, c: i64) -> PackedFloat32Array {
         let Some(cr) = self.c.creatures.get(c as usize) else { return PackedFloat32Array::new() };
-        let mut v = Vec::with_capacity(cr.sticks.len() * 10);
+        let mut v = Vec::with_capacity(cr.sticks.len() * 12);
         for (k, st) in cr.sticks.iter().enumerate() {
             v.extend_from_slice(&[
                 st.a as f32,
@@ -1520,6 +1519,8 @@ impl GooColony {
                 st.mode as f32,
                 st.load,
                 cr.stick_gap(k),
+                st.anchor,
+                cr.stick_tension(k),
             ]);
         }
         PackedFloat32Array::from(v)
