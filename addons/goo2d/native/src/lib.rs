@@ -1034,7 +1034,7 @@ impl GooColony {
     /// contacts between different cells of one creature), "core_contacts" (bool: with
     /// intra_contacts off, a creature's cores still collide with its beads and cores),
     /// "slop", "bond_scale"; adhesion's (docs/colony-adhesion.md): "adhesion" (bool),
-    /// "capture" (px), "join_reach" (px), "stick_scale", "anchor_scale", "creep" (/s),
+    /// "capture" (px), "capture_every" (frames), "join_reach" (px), "stick_scale", "anchor_scale", "creep" (/s),
     /// "break_force", "load_time" (s), "break_rest" (s), "ask" (bool: first touches wait for answer()), "capture_paused"
     /// (bool, the whole colony).
     #[func]
@@ -1055,6 +1055,7 @@ impl GooColony {
                 "bond_scale" => o.bond_scale = number as f32,
                 "adhesion" => o.ad.enabled = value.try_to::<bool>().unwrap_or(number != 0.0),
                 "capture" => o.ad.capture = (number as f32).max(0.0),
+                "capture_every" => o.ad.capture_every = (number as u32).max(1),
                 "join_reach" => o.ad.join_reach = (number as f32).max(0.0),
                 "stick_scale" => o.ad.stick_scale = (number as f32).max(1e-6),
                 "anchor_scale" => o.ad.anchor_scale = (number as f32).max(1e-6),

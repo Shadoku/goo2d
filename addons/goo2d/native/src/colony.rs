@@ -77,6 +77,10 @@ pub struct Adhesion {
     pub ask: bool,
     /// Gap between outlines within which a free bead sticks.
     pub capture: f32,
+    /// Capture runs every this many frames (each creature on its own frames: creature i
+    /// when (step - 1 + i) is a multiple, so the first step captures for creature 0), and
+    /// the wider candidate search only then.
+    pub capture_every: u32,
     /// Gap within which join_cells() sticks beads by hand.
     pub join_reach: f32,
     /// Normal stiffness: × the softer cell's skin stiffness (compliance its inverse).
@@ -103,6 +107,7 @@ impl Default for Adhesion {
             paused: false,
             ask: false,
             capture: 5.0,
+            capture_every: 2,
             join_reach: 8.0,
             stick_scale: 1.0,
             anchor_scale: 0.3,
@@ -334,6 +339,11 @@ pub struct Creature {
     // This frame's contact candidates within the creature (local indices), and with
     // later creatures (or with any other for a bead against a core).
     bb: Vec<(u32, u32)>,
+    // Candidates within the capture gap but beyond contact reach (capture reads them with
+    // bb, bc and cc; the contact solve does not iterate them every substep).
+    xbb: Vec<(u32, u32)>,
+    xbc: Vec<(u32, u32)>,
+    xcc: Vec<(u32, u32)>,
     bc: Vec<(u32, u32)>,
     cc: Vec<(u32, u32)>,
     // Each bead's and core's reach this step against the creature's mean motion, and in
@@ -363,6 +373,10 @@ pub struct Creature {
     /// Cell pairs seen for the first time, waiting for an answer (a < b).
     pub asks: Vec<(u32, u32)>,
     pub capture_paused: bool,
+    /// Whether this frame captures (Adhesion::capture_every, staggered by creature).
+    capturing: bool,
+    /// Its index in the colony (the stagger).
+    index: u32,
     // Capture's best target per bead this frame: (gap, b, s, kind 0 none / 1 edge /
     // 2 core, mode).
     cap: Vec<(f32, u32, f32, u8, u8)>,
@@ -1171,16 +1185,20 @@ impl Creature {
     /// free bead sticks to the nearest skin of another cell within the capture gap that
     /// its pair allows; touching cores stick to each other. Returns the sticks made.
     fn capture(&mut self, ad: &Adhesion, frame: u64) -> usize {
-        if !self.active || !ad.enabled || ad.paused || self.capture_paused {
+        if !self.active || !self.capturing {
             return 0;
         }
         let n = self.pos.len();
         let mut cap = std::mem::take(&mut self.cap);
         cap.clear();
         cap.resize(n, (f32::INFINITY, 0, 0.0, 0, 0));
-        let bb = std::mem::take(&mut self.bb);
-        let bc = std::mem::take(&mut self.bc);
-        let cc = std::mem::take(&mut self.cc);
+        let mut bb = std::mem::take(&mut self.bb);
+        let mut bc = std::mem::take(&mut self.bc);
+        let mut cc = std::mem::take(&mut self.cc);
+        let (nbb, nbc, ncc) = (bb.len(), bc.len(), cc.len());
+        bb.extend_from_slice(&self.xbb);
+        bc.extend_from_slice(&self.xbc);
+        cc.extend_from_slice(&self.xcc);
         // The last pair looked up and its answer (candidates come in runs of one pair).
         let mut memo: ((u32, u32), u8) = ((u32::MAX, u32::MAX), 0);
         let capture = ad.capture;
@@ -1248,6 +1266,9 @@ impl Creature {
                 _ => {}
             }
         }
+        bb.truncate(nbb);
+        bc.truncate(nbc);
+        cc.truncate(ncc);
         self.bb = bb;
         self.bc = bc;
         self.cc = cc;
@@ -1736,6 +1757,9 @@ impl Creature {
     /// This step's candidates within the creature (see Colony::build_pairs()).
     fn build_own_pairs(&mut self, opt: Options) {
         self.bb.clear();
+        self.xbb.clear();
+        self.xbc.clear();
+        self.xcc.clear();
         self.bc.clear();
         self.cc.clear();
         let (n, nc) = (self.pos.len(), self.cpos.len());
@@ -1775,7 +1799,7 @@ impl Creature {
         // Without contacts between its own cells (the bonds keep them apart) a creature
         // needs no grid of its own: a pressurised cell does not fold onto itself.
         // Capture needs every candidate within the capture gap, whatever the contacts.
-        let capturing = opt.ad.enabled && !opt.ad.paused && !self.capture_paused;
+        let capturing = self.capturing;
         let cores_only = !opt.intra_contacts && opt.core_contacts && nc > 0 && !capturing;
         self.solve_bb = opt.intra_contacts;
         self.solve_cores = opt.intra_contacts || opt.core_contacts;
@@ -1788,6 +1812,7 @@ impl Creature {
         let rmax = self.r.iter().copied().fold(0.0f32, f32::max);
         let extra = if capturing { opt.ad.capture + 0.3 * rmax } else { 0.0 };
         let slop = opt.slop + extra;
+        let contact_slop = opt.slop;
         let intra = true;
         let qmax = self.reach.iter().copied().fold(0.0f32, f32::max);
         let cell = ((2.0 * qmax + slop) * opt.cell_scale).max(1.0);
@@ -1827,8 +1852,14 @@ impl Creature {
                             continue;
                         }
                         let within = qi + self.reach[lj] + slop;
-                        if dist_sq(pi, self.pos[lj]) < within * within {
-                            self.bb.push((li as u32, lj as u32));
+                        let dsq = dist_sq(pi, self.pos[lj]);
+                        if dsq < within * within {
+                            let touch = qi + self.reach[lj] + contact_slop;
+                            if dsq < touch * touch {
+                                self.bb.push((li as u32, lj as u32));
+                            } else {
+                                self.xbb.push((li as u32, lj as u32));
+                            }
                         }
                     }
                 }
@@ -1848,8 +1879,14 @@ impl Creature {
                             continue;
                         }
                         let within = qi + self.creach[lk] + slop;
-                        if dist_sq(pi, self.cpos[lk]) < within * within {
-                            self.bc.push((li as u32, lk as u32));
+                        let dsq = dist_sq(pi, self.cpos[lk]);
+                        if dsq < within * within {
+                            let touch = qi + self.creach[lk] + contact_slop;
+                            if dsq < touch * touch {
+                                self.bc.push((li as u32, lk as u32));
+                            } else {
+                                self.xbc.push((li as u32, lk as u32));
+                            }
                         }
                     }
                 }
@@ -1873,8 +1910,14 @@ impl Creature {
                             continue;
                         }
                         let within = qk + self.creach[lj] + slop;
-                        if dist_sq(pk, self.cpos[lj]) < within * within {
-                            self.cc.push((lk as u32, lj as u32));
+                        let dsq = dist_sq(pk, self.cpos[lj]);
+                        if dsq < within * within {
+                            let touch = qk + self.creach[lj] + contact_slop;
+                            if dsq < touch * touch {
+                                self.cc.push((lk as u32, lj as u32));
+                            } else {
+                                self.xcc.push((lk as u32, lj as u32));
+                            }
                         }
                     }
                 }
@@ -2255,7 +2298,7 @@ impl Colony {
 
     /// Adds a creature of the cells in `cells` (CELL_STRIDE floats each); returns its index.
     pub fn add_creature(&mut self, cells: &[f32]) -> usize {
-        let mut c = Creature { every: 1, ..Default::default() };
+        let mut c = Creature { every: 1, index: self.creatures.len() as u32, ..Default::default() };
         let count = cells.len() / CELL_STRIDE;
         for i in 0..count {
             let f = &cells[i * CELL_STRIDE..(i + 1) * CELL_STRIDE];
@@ -2302,6 +2345,8 @@ impl Colony {
             c.ns_capture = 0;
             c.made = 0;
             c.broken = 0;
+            let ce = opt.ad.capture_every.max(1) as u64;
+            c.capturing = opt.ad.enabled && !opt.ad.paused && !c.capture_paused && (frame - 1 + c.index as u64) % ce == 0;
         }
         let mut stats = Stats { draw_build_us: self.stats.draw_build_us, ..Default::default() };
         let t = Instant::now();

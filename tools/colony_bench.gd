@@ -25,8 +25,9 @@ extends SceneTree
 ##                                once at spawn (default), or adhesion (milestone 1,
 ##                                docs/colony-adhesion.md: cells stick where they touch,
 ##                                captured in the first frame)
-##   --capture=PX --break=F       adhesion's capture gap (CAPTURE) and break force (at
-##                                unit 1; scaled by UNIT); --sticky: sticky-only walls
+##   --capture=PX --break=F       adhesion's capture gap and break force at unit 1 (scaled
+##                                by UNIT; GooColonySim's CAPTURE and BREAK_FORCE by
+##                                default); --sticky: sticky-only walls
 ##   --sleep=F                    the fraction of creatures asleep (colony mode)
 ##   --coarse=F                   the fraction stepped every other frame (colony mode)
 ##   --frames=F --warmup=W        measured frames after W warm-up frames (300, 60)
@@ -72,7 +73,7 @@ var _intra: bool = true
 var _core_contacts: bool = false
 var _bond_scale: float = 1.0
 var _hold: String = "bonds"
-var _capture: float = CAPTURE
+var _capture: float = -1.0
 var _break: float = -1.0
 var _sticky: bool = false
 var _sleep: float = 0.0
@@ -495,8 +496,10 @@ func _build_colony(design: Array[Vector3], kinds: PackedByteArray, starts: Array
 	_colony.set_options({ "threads": _threads, "substeps": _substeps, "cell_scale": _cell_scale,
 		"intra_contacts": _intra, "core_contacts": _core_contacts, "bond_scale": _bond_scale, "max_speed": GooTuning.MAX_BEAD_SPEED * UNIT })
 	if _hold == "adhesion":
-		_colony.set_options({ "adhesion": true, "capture": _capture,
-			"break_force": (_break if _break > 0.0 else 2000.0) * UNIT })
+		_colony.set_options({ "adhesion": true,
+			"capture": (_capture if _capture > 0.0 else GooColonySim.CAPTURE) * UNIT,
+			"join_reach": GooColonySim.JOIN_REACH * UNIT,
+			"break_force": (_break if _break > 0.0 else GooColonySim.BREAK_FORCE) * UNIT })
 		if _sticky:
 			_colony.set_join_mode(0, 0, GooColony.JOIN_STICKY)
 	for ci: int in _creatures:
@@ -926,7 +929,7 @@ func _report() -> void:
 		var n := loads.size()
 		if n > 0:
 			print("  stick loads at the end: min %.0f, p1 %.0f, p50 %.0f, p99 %.0f, max %.0f (break %.0f)" % [loads[0], loads[n / 100],
-				loads[n / 2], loads[mini(n * 99 / 100, n - 1)], loads[n - 1], (_break if _break > 0.0 else 2000.0) * UNIT])
+				loads[n / 2], loads[mini(n * 99 / 100, n - 1)], loads[n - 1], (_break if _break > 0.0 else GooColonySim.BREAK_FORCE) * UNIT])
 	var line := "RESULT mode=%s n=%d m=%d shape=%s mix=%s beads=%d cores=%s intra=%s threads=%d substeps=%d draw=%s hold=%s" % [
 		_mode, _creatures, _cells, _shape, _mix, _beads, _cores and _mode == "colony", "cores" if _core_contacts else ("on" if _intra else "off"), _threads, _substeps, _draw,
 		_hold + ("/sticky" if _sticky else "")]
