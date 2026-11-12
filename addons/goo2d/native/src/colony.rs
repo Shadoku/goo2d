@@ -41,6 +41,13 @@
 //! back, are reported as events (`events`), per creature in cell-pair order after the
 //! step. All of it runs on the creature's own data, so the threaded step stays
 //! bit-identical to the serial one.
+//!
+//! Milestone 2 (docs/colony-exposure.md; colony/exposure.rs, colony/drag.rs), each part off
+//! by default: every bead exposed or enclosed and the outline as loops (outside, pockets),
+//! rings wholly enclosed becoming cores and exposed cores rings again without a jump, cores
+//! that turn (beads anchored on their rims) and give (compliant contacts, or a soft
+//! radius), the fluid game's water drag on exposed edges, and a creature's own contact
+//! candidates kept across frames.
 
 use crate::consts::{MAX_PRESSURE_RATIO, MAX_STRETCH, MIN_AREA_RATIO};
 use crate::geom::*;
@@ -294,13 +301,13 @@ pub struct Cell {
     pub ctype: u8,
     /// An acceleration on this cell alone (px/s²), on top of the creature's push.
     pub push: Vector2,
-    // Room for later milestones (data only: nothing reads or writes them yet).
-    #[allow(dead_code)]
-    /// 1 exposed to the outside .. 0 enclosed (milestone 2).
+    /// The share of its beads exposed (a core: of its virtual beads), from the last
+    /// exposure pass (1 before one).
     pub exposure: f32,
-    #[allow(dead_code)]
-    /// Its outward direction (milestone 2: thrusters, spikes).
+    /// The mean direction of its exposed beads from its centre (thrusters, spikes; zero
+    /// when none).
     pub outward: Vector2,
+    // Room for later milestones (data only: nothing reads or writes it yet).
     #[allow(dead_code)]
     /// Contacts with other creatures or walls in the last step (contact reports).
     pub contacts: u32,

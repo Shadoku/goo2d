@@ -293,6 +293,8 @@ the gap, and the walls stayed zipped flat (polygonal cells, small triangular poc
 
 ## For milestone 2
 
+(Built: `docs/colony-exposure.md` says what came of each note.)
+
 - Adjacency is `Creature::pairs` (pairs with sticks); `cell_neighbours()` reads it. A
   bead's stuck state is `stuck` (0, the ring it is stuck to + 1, or `STUCK_CORE`), its
   stick count for the drawing `bonded`. One-sided walls mean the other side's beads are

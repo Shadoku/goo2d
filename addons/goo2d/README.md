@@ -425,7 +425,8 @@ blades, dropper or input.
 ## The colony (experimental)
 
 A second solver beside `GooKernel`, for creatures made of many cells (the colony plan;
-`docs/colony-spike.md`, `docs/colony-adhesion.md` in the addon's repository). It shares only
+`docs/colony-spike.md`, `docs/colony-adhesion.md`, `docs/colony-exposure.md` in the addon's
+repository). It shares only
 the ring math with the kernel and does not collide with `GooWorld2D` bodies. Its cells are
 not nodes: a `GooColony` (RefCounted, Rust, `native/src/colony.rs`) holds creatures, each a
 set of ring cells and core cells with its own storage, stepped on several threads with the
@@ -434,10 +435,16 @@ within the capture gap of another cell's skin in the same creature sticks to it,
 zero gap; anchored walls also hold it at its place along the other skin (creeping), sticky
 walls slide; a wall pulled past the break force parts. A type table and a script hook
 decide which pairs may join; joined and parted events come out after each step.
+Optionally (milestone 2, `docs/colony-exposure.md`): each bead is exposed or enclosed
+(stuck, within the gap of another cell's skin, or facing a pocket of the creature's outline
+loops), rings wholly enclosed become cores and exposed cores rings again with no jump, cores
+turn (walls onto them anchored) and give (compliant contacts), and the fluid game's water
+drag acts on exposed edges inside the step, with the water given per creature or per cell.
 `goo_colony_sim.gd` (`GooColonySim`, RefCounted) is the thin GDScript layer: it sets the
 colony up at `GooTuning.unit`, asks `may_adhere(creature, a, b)` about each first touch on
-the main thread, and emits `cells_joined` / `cells_parted`. Surface tension, exposure, walls,
-links, grabs and a look are later milestones; until then it is for tools and tests.
+the main thread, emits `cells_joined` / `cells_parted`, and has the presets
+`EXPOSURE_OPTIONS` and `DRAG_OPTIONS`. Surface tension, walls, links, grabs and a look are
+later milestones; until then it is for tools and tests.
 
 ## Tuning knobs, by what you want to change
 
