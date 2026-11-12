@@ -61,7 +61,7 @@ pub struct Tension {
 
 impl Default for Tension {
     fn default() -> Self {
-        Tension { strength: 0.0, pockets: 1.0, min_edge: 0.5, hop: 2.5, hop_max: 3.5, types: [1.0; MAX_TYPES] }
+        Tension { strength: 0.0, pockets: 0.0, min_edge: 0.5, hop: 2.5, hop_max: 3.5, types: [1.0; MAX_TYPES] }
     }
 }
 
