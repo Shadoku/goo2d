@@ -74,6 +74,17 @@ pub struct BeadPair {
     pub full: bool,
 }
 
+/// An outline cell near a ring's bead chain: the creature, the cell, the ring, the ring's
+/// edge nearest it (last found) and whether it started the frame inside the ring.
+#[derive(Clone, Copy, Debug)]
+pub struct CellPair {
+    pub body: u32,
+    pub cell: u32,
+    pub ring: u32,
+    pub e0: u32,
+    pub full: bool,
+}
+
 #[derive(Default)]
 pub struct Ghosts {
     /// A kernel's rings are coupled (else none of this runs).
@@ -93,7 +104,7 @@ pub struct Ghosts {
     pub prev: Vec<Vector2>,
     pub vel: Vec<Vector2>,
     /// Outline cells near a ring: (creature, cell, ring).
-    pub cell_pairs: Vec<[u32; 3]>,
+    pub cell_pairs: Vec<CellPair>,
     pub bead_pairs: Vec<BeadPair>,
     /// Per creature this frame: the sign of its outline's winding (0: not computed).
     orient: Vec<f32>,
@@ -276,9 +287,9 @@ impl Ghosts {
                     if p.x + reach < ring.lo.x || p.x - reach > ring.hi.x || p.y + reach < ring.lo.y || p.y - reach > ring.hi.y {
                         continue;
                     }
-                    let (_, _, _, d2, inside) = loop_nearest(&loop_pts, p);
+                    let (k, _, _, d2, inside) = loop_nearest(&loop_pts, p);
                     if inside || d2 < reach * reach {
-                        self.cell_pairs.push([bi as u32, c as u32, ri as u32]);
+                        self.cell_pairs.push(CellPair { body: bi as u32, cell: c as u32, ring: ri as u32, e0: k as u32, full: inside });
                         active = true;
                     }
                 }
@@ -355,9 +366,9 @@ impl Ghosts {
         self.broad_us = self.us;
     }
 
-    /// One of the cells' substeps (`s` of them so far, each `h` long): the ghosts moved,
-    /// the contacts solved both ways, the touched rings held to their shape.
-    pub fn substep(&mut self, bodies: &mut [Body], opt: &Opt, walls: &[StaticShape], h: f32, s: usize) {
+    /// One of the cells' substeps (`h` long): the ghosts moved, the contacts solved both
+    /// ways, the ghosts kept out of the walls, a touched ring's push spread over it.
+    pub fn substep(&mut self, bodies: &mut [Body], opt: &Opt, walls: &[StaticShape], h: f32) {
         if self.cell_pairs.is_empty() && self.bead_pairs.is_empty() {
             return;
         }
@@ -373,7 +384,8 @@ impl Ghosts {
         }
         // Cells against the rings' bead chains.
         for x in 0..self.cell_pairs.len() {
-            let [bi, c, ri] = self.cell_pairs[x];
+            let cp = self.cell_pairs[x];
+            let (bi, c, ri) = (cp.body, cp.cell, cp.ring);
             let ring = self.rings[ri as usize];
             let (g0, n) = (ring.g0 as usize, ring.n as usize);
             let loop_pts = &self.pos[g0..g0 + n];
@@ -381,7 +393,10 @@ impl Ghosts {
             let c = c as usize;
             let p = b.pos[c];
             let rc = contact_radius(b, c, opt);
+            // Every edge of the loop, and the side by its winding: a dented or folded loop
+            // misleads a local test (measured: a ring of free beads let a blob in).
             let (k, t, q, d2, inside) = loop_nearest(loop_pts, p);
+            self.cell_pairs[x].e0 = k as u32;
             let (ea, eb) = (loop_pts[k], loop_pts[(k + 1) % n]);
             let reach = rc + ring.br;
             if !inside && d2 >= reach * reach {
