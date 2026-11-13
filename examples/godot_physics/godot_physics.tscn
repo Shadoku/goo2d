@@ -1,0 +1,75 @@
+[gd_scene format=3]
+
+[ext_resource type="Script" path="res://examples/godot_physics/godot_physics.gd" id="1_scene"]
+[ext_resource type="Script" path="res://examples/godot_physics/godot_physics_world.gd" id="2_world"]
+[ext_resource type="Script" path="res://addons/goo2d/goo_cell_world_2d.gd" id="3_cells"]
+[ext_resource type="Shader" path="res://assets/shaders/backdrop.gdshader" id="4_backdrop"]
+
+[sub_resource type="ShaderMaterial" id="ShaderMaterial_backdrop"]
+shader = ExtResource("4_backdrop")
+
+[sub_resource type="PhysicsMaterial" id="PhysicsMaterial_walls"]
+friction = 0.6
+bounce = 0.2
+
+[sub_resource type="RectangleShape2D" id="RectangleShape2D_floor"]
+size = Vector2(1840, 100)
+
+[sub_resource type="RectangleShape2D" id="RectangleShape2D_side"]
+size = Vector2(80, 1000)
+
+[node name="GodotPhysics" type="Node2D"]
+script = ExtResource("1_scene")
+
+[node name="Backdrop" type="ColorRect" parent="."]
+top_level = true
+z_index = -1
+material = SubResource("ShaderMaterial_backdrop")
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+mouse_filter = 2
+color = Color(0.06, 0.06, 0.1, 1)
+
+[node name="Walls" type="StaticBody2D" parent="."]
+collision_mask = 0
+physics_material_override = SubResource("PhysicsMaterial_walls")
+
+[node name="Floor" type="CollisionShape2D" parent="Walls"]
+position = Vector2(960, 1030)
+shape = SubResource("RectangleShape2D_floor")
+
+[node name="Left" type="CollisionShape2D" parent="Walls"]
+position = Vector2(40, 500)
+shape = SubResource("RectangleShape2D_side")
+
+[node name="Right" type="CollisionShape2D" parent="Walls"]
+position = Vector2(1880, 500)
+shape = SubResource("RectangleShape2D_side")
+
+[node name="Visual" type="Polygon2D" parent="Walls"]
+color = Color(0.22, 0.24, 0.3, 1)
+polygon = PackedVector2Array(0, 0, 80, 0, 80, 980, 1840, 980, 1840, 0, 1920, 0, 1920, 1080, 0, 1080)
+
+[node name="World" type="Node2D" parent="."]
+script = ExtResource("2_world")
+physics_proxies = true
+push_bodies = true
+
+[node name="Cells" type="Node2D" parent="."]
+script = ExtResource("3_cells")
+drag_enabled = false
+physics_proxies = true
+push_bodies = true
+
+[node name="UI" type="CanvasLayer" parent="."]
+
+[node name="Label" type="Label" parent="UI"]
+offset_left = 100.0
+offset_top = 24.0
+offset_right = 1820.0
+offset_bottom = 80.0
+theme_override_font_sizes/font_size = 22
+text = "Godot physics"

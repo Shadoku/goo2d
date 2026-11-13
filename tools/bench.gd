@@ -2,7 +2,12 @@ extends SceneTree
 ## Benchmark: plays a fixed pile headless and prints frame-time statistics, so
 ## a performance change can be measured before and after.
 ##
-##   godot --headless --fixed-fps 60 --path . -s tools/bench.gd -- [scenario ...] [--frames=N] [--seed=S] [--unit=U]
+##   godot --headless --fixed-fps 60 --path . -s tools/bench.gd -- [scenario ...] [--frames=N] [--seed=S] [--unit=U] [--proxies=circles|hull]
+##
+## --proxies gives every body a proxy in Godot's physics (docs/godot-physics.md: a circle
+## per bead, or one hull) and prints the shapes moved per frame and what moving them took
+## in GDScript; the physics server's share is in the frame times (compare with a run
+## without).
 ##
 ## --unit=U plays the piles at GooTuning.unit U (1 by default): the arena scaled
 ## by U in the scene and every drop's radius and position with it, so at 0.5 each
@@ -45,6 +50,10 @@ var _settle_frames: int = 300
 var _seed: int = 20261014
 # The goo's length unit the piles play at (--unit=U).
 var _unit: float = 1.0
+# --proxies: "" (none), "circles" or "hull".
+var _proxies: String = ""
+var _moved: int = 0
+var _update_usec := PackedFloat64Array()
 
 var _main: Node
 var _world: GooWorld2D
@@ -80,6 +89,8 @@ func _initialize() -> void:
 			_seed = int(arg.trim_prefix("--seed="))
 		elif arg.begins_with("--unit="):
 			_unit = float(arg.trim_prefix("--unit="))
+		elif arg.begins_with("--proxies="):
+			_proxies = arg.trim_prefix("--proxies=")
 		elif not arg.begins_with("--"):
 			_scenarios.append(arg)
 	if _scenarios.is_empty():
@@ -103,6 +114,11 @@ func _start_next() -> void:
 	root.add_child(_main)
 	_world = _main.get_node("Game") as GooWorld2D
 	_space = _main.get_node("Arena") as Node2D
+	if _proxies != "":
+		_world.physics_proxies = true
+		_world.proxy_shape = GooProxies.Shape.HULL if _proxies == "hull" else GooProxies.Shape.CIRCLES
+	_moved = 0
+	_update_usec = PackedFloat64Array()
 	# Counted after the world's kernel step (connected after the world's own
 	# handler), so the count reads this frame's snapshot of the beads.
 	if physics_frame.is_connected(_after_step):
@@ -176,6 +192,9 @@ func _physics_process(_delta: float) -> bool:
 		_frame_ms.append((now - _last_tick_usec) / 1000.0)
 		_monitor_worst = maxf(_monitor_worst, Performance.get_monitor(Performance.TIME_PHYSICS_PROCESS) * 1000.0)
 		_bead_counts.append(_live_beads())
+		if _world.proxies() != null:
+			_moved += _world.proxies().shapes_moved
+			_update_usec.append(_world.proxies().update_usec / 1000.0)
 	_last_tick_usec = now
 	if _next_drop < _plan.size() and _frame % DROP_EVERY == 0:
 		var drop := _plan[_next_drop]
@@ -257,6 +276,8 @@ func _report() -> void:
 	if _frame_ms.size() > tail:
 		print("  frame, last %d  %s" % [tail, _stats(_frame_ms.slice(_frame_ms.size() - tail))])
 	print("  TIME_PHYSICS_PROCESS monitor, worst second: %.2f ms" % _monitor_worst)
+	if _proxies != "" and not _update_usec.is_empty():
+		print("  proxies %s: %d, %.0f shapes moved per frame; their update %s" % [_proxies, _world.proxies().count(), float(_moved) / _update_usec.size(), _stats(_update_usec)])
 	# Cost per bead-frame: compares runs that played out differently (other merges,
 	# other bead counts) better than the frame alone does.
 	var bead_frames := 0

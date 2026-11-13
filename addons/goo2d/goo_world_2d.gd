@@ -241,6 +241,58 @@ const SHAPE_REJUDGE_FRAMES := 4
 ## time.
 @export var two_tone_merges: bool = false
 
+@export_group("Godot physics")
+## Whether this world's bodies stand in Godot's physics (docs/godot-physics.md): each one a
+## kinematic proxy body in the world's space (GooProxies), moved to its outline after
+## every step, so Area2D signals, rays and shape queries, CharacterBody2D and
+## RigidBody2D meet the goo (each on whatever layers its own mask names; the proxies
+## are on proxy_layer). A hit's collider is the Goo2D itself (body_of()). Per body:
+## override wants_proxy(). Off (the default): no proxy is made.
+@export var physics_proxies: bool = false:
+	set(value):
+		physics_proxies = value
+		if not value and _proxies != null:
+			_proxies.clear()
+## The proxies' shapes: a circle per bead, or one convex hull (cheaper, solid,
+## concavities filled).
+@export var proxy_shape: GooProxies.Shape = GooProxies.Shape.CIRCLES:
+	set(value):
+		proxy_shape = value
+		if _proxies != null:
+			_proxies.shape = value
+## The physics layers the proxies are on (GooTuning.LAYER_PROXIES, layer 2, by
+## default: never GooTuning.LAYER_WALLS, or the goo would push itself).
+@export_flags_2d_physics var proxy_layer: int = GooTuning.LAYER_PROXIES:
+	set(value):
+		proxy_layer = value
+		if _proxies != null:
+			_proxies.set_layers(proxy_layer, proxy_mask)
+## The layers the proxies detect (0 by default: a body or area meets the goo when its
+## own mask has proxy_layer).
+@export_flags_2d_physics var proxy_mask: int = 0:
+	set(value):
+		proxy_mask = value
+		if _proxies != null:
+			_proxies.set_layers(proxy_layer, proxy_mask)
+## Whether Godot bodies that move push the goo (docs/godot-physics.md): every
+## AnimatableBody2D, CharacterBody2D and RigidBody2D on GooTuning.LAYER_WALLS is a
+## moving obstacle the solver eases over the step's substeps and pushes the goo out
+## ahead of at its velocity (GooStatics.push_bodies), and a RigidBody2D takes the
+## goo's reaction after the step (one frame late). Such a rigid body never collides
+## with the proxies in Godot: the goo alone solves the pair. Off (the default): an
+## AnimatableBody2D is a wall that jumps where it moved, as before, and character and
+## rigid bodies are not seen.
+@export var push_bodies: bool = false:
+	set(value):
+		push_bodies = value
+		if _statics != null:
+			_statics.push_bodies = value
+## The goo's mass per unit of RigidBody2D.mass: the reaction a rigid body takes is the
+## goo's impulse over this. A body's mass is Goo2D.body_mass() (a 24 px blob at unit 1
+## is about 1.4); 1 by default.
+@export var body_mass_scale: float = 1.0
+@export_group("")
+
 var _queue := MergeQueue.new()
 var _merge_scheduled: bool = false
 var _adopt_scheduled: bool = false
@@ -269,6 +321,8 @@ var _next_grab: int = 0
 var _links: Dictionary[int, GooLink] = {}
 var _next_link: int = 0
 var _bridges: Node2D = null
+# The bodies' proxies in Godot's physics (physics_proxies), made on first use.
+var _proxies: GooProxies = null
 
 # Registers the Goo2D children placed with the world (built in their own
 # _ready(), which runs before this one) and listens for bodies added later.
@@ -285,6 +339,9 @@ func _enter_tree() -> void:
 func _exit_tree() -> void:
 	if _statics != null:
 		_statics.detach()
+	if _proxies != null:
+		_proxies.clear()
+		_proxies = null
 
 ## The native kernel this world's bodies are rings of (Goo2D joins it when it is
 ## built under the world): it runs their per-frame work and the pair passes.
@@ -294,6 +351,7 @@ func kernel() -> GooKernel:
 		_kernel.set_solver({ "gravity": _scaled_gravity() })
 		_kernel.set_pair_passes(true)
 		_statics = GooStatics.new(_kernel)
+		_statics.push_bodies = push_bodies
 	return _kernel
 
 # The gravity this world's kernel steps with: GooTuning's times gravity_scale.
@@ -327,14 +385,63 @@ func _physics_process(delta: float) -> void:
 	_release_merge_locks()
 	_advance_transitions(delta)
 	_hold_grabs(delta)
+	_statics.mass_scale = body_mass_scale
 	_statics.sync()
 	if not _links.is_empty():
 		_attach_links()
 	goo.set_merge_partners(_partner_keys())
 	goo.step(delta)
+	if push_bodies:
+		_statics.push_back(goo.static_impulses(), body_mass_scale)
 	Goo2D.dispatch_events(goo.take_events(), self)
 	if not _links.is_empty():
 		_draw_bridges(delta)
+	if physics_proxies:
+		_update_proxies()
+
+# ---- Godot physics (docs/godot-physics.md) ----
+
+## Whether `body` has a proxy in Godot's physics: physics_proxies by default; a
+## subclass overrides it to choose per body (asked every frame).
+func wants_proxy(_body: Goo2D) -> bool:
+	return physics_proxies
+
+## The proxies (null until physics_proxies made one).
+func proxies() -> GooProxies:
+	return _proxies
+
+## The body of this world a physics query's collider names (a ray's or a shape
+## query's `collider`, Area2D.body_entered's body, a CharacterBody2D's get_collider()):
+## the collider itself when it is one of this world's live bodies, else null.
+func body_of(collider: Object) -> Goo2D:
+	var body := collider as Goo2D
+	if body != null and is_instance_valid(body) and _is_live(body):
+		return body
+	return null
+
+# Moves every proxy to its body's beads (made on first sight; a body no longer wanted
+# or gone loses its own); a settled body's is left where it is.
+func _update_proxies() -> void:
+	if not is_inside_tree():
+		return
+	if _proxies == null:
+		_proxies = GooProxies.new(get_world_2d().space)
+		_proxies.shape = proxy_shape
+		_proxies.set_layers(proxy_layer, proxy_mask)
+	if push_bodies:
+		_proxies.except(_statics.pushed_bodies())
+	_proxies.begin_frame()
+	for body: Goo2D in bodies():
+		if body.id < 0 or not wants_proxy(body):
+			continue
+		var key := body.get_instance_id()
+		var settled := body.settled and _proxies.has(key)
+		var radii := PackedFloat32Array([body.bead_radius()])
+		if settled:
+			_proxies.update(key, body, Vector2.ZERO, PackedVector2Array(), radii, false)
+		else:
+			_proxies.update(key, body, body.center(), body.bead_points(), radii)
+	_proxies.end_frame()
 
 ## Spawns a body of `radius` (px) centred on `global_pos`: round, or with a
 ## `shape` that body's outline at the equivalent radius `radius` (see
@@ -1004,6 +1111,8 @@ func _is_live(body: Goo2D) -> bool:
 # Emits nothing: the caller announces the new count once all its removals are
 # done (count_changed).
 func _remove(body: Goo2D) -> void:
+	if _proxies != null:
+		_proxies.remove(body.get_instance_id())
 	if not _links.is_empty():
 		_release_links(body)
 	_by_id.erase(body.id)

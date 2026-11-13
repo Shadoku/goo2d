@@ -174,6 +174,51 @@ const GRAB_REACH: float = 3.0
 ## take the push (a resting ring's beads jitter 5 times as much), 1 makes it buzz 3 times
 ## as much (docs/cells.md, "Rings and cells").
 @export_range(0.0, 1.0, 0.01) var ring_rigidity: float = 0.3
+
+@export_group("Godot physics")
+## Whether this world's creatures stand in Godot's physics (docs/godot-physics.md): each one a
+## kinematic proxy body in the world's space (GooProxies), moved to its outline after
+## every step, so Area2D signals, rays and shape queries, CharacterBody2D and
+## RigidBody2D meet it (on whatever layers their own masks name; the proxies are on
+## proxy_layer). A hit's collider is the creature's proxy node (creature_of(), and
+## GooCellCreature.proxy_node()). Per creature: override wants_proxy(). Off (the
+## default): no proxy is made.
+@export var physics_proxies: bool = false:
+	set(value):
+		physics_proxies = value
+		if not value and _proxies != null:
+			_proxies.clear()
+## The proxies' shapes: a circle per boundary cell, or one convex hull (cheaper,
+## solid, a bent worm's concavities filled).
+@export var proxy_shape: GooProxies.Shape = GooProxies.Shape.CIRCLES:
+	set(value):
+		proxy_shape = value
+		if _proxies != null:
+			_proxies.shape = value
+## The physics layers the proxies are on (GooTuning.LAYER_PROXIES by default).
+@export_flags_2d_physics var proxy_layer: int = GooTuning.LAYER_PROXIES:
+	set(value):
+		proxy_layer = value
+		if _proxies != null:
+			_proxies.set_layers(proxy_layer, proxy_mask)
+## The layers the proxies detect (0 by default).
+@export_flags_2d_physics var proxy_mask: int = 0:
+	set(value):
+		proxy_mask = value
+		if _proxies != null:
+			_proxies.set_layers(proxy_layer, proxy_mask)
+## Whether Godot bodies that move push the creatures (GooWorld2D.push_bodies'
+## contract: AnimatableBody2D, CharacterBody2D and RigidBody2D on
+## GooTuning.LAYER_WALLS as moving obstacles; a rigid body takes the reaction).
+@export var push_bodies: bool = false:
+	set(value):
+		push_bodies = value
+		if _statics != null:
+			_statics.push_bodies = value
+## The cells' mass per unit of RigidBody2D.mass (GooCellCreature.mass() is in the
+## cells' units).
+@export var body_mass_scale: float = 1.0
+@export_group("")
 ## Called with every live creature's cell centres (one PackedVector2Array, slot order) each
 ## frame before the step; returns the water's velocity there (empty: none, one value for
 ## all, or one per point), e.g. a flow field's velocities_at. Invalid: not called.
@@ -192,6 +237,7 @@ var _grabs: Dictionary[int, Dictionary] = {}
 var _next_grab: int = 1
 var _rings: GooWorld2D = null
 var _coupled: bool = false
+var _proxies: GooProxies = null
 ## The last frame's skin build (µs in the kernel, µs handing it to the RenderingServer).
 var draw_stats: Dictionary = {"mesh_us": 0, "submit_us": 0, "vertices": 0, "triangles": 0}
 
@@ -200,6 +246,7 @@ func cells() -> GooCells:
 	if _cells == null:
 		_cells = GooCells.new()
 		_statics = GooStatics.new(_cells)
+		_statics.push_bodies = push_bodies
 		if default_type == null:
 			default_type = GooCellType.new()
 		_slots = [default_type]
@@ -214,6 +261,9 @@ func _enter_tree() -> void:
 func _exit_tree() -> void:
 	if _statics != null:
 		_statics.detach()
+	if _proxies != null:
+		_proxies.clear()
+		_proxies = null
 
 func _ready() -> void:
 	_item = RenderingServer.canvas_item_create()
@@ -349,6 +399,9 @@ func despawn(creature: GooCellCreature) -> void:
 	if creature == null or not _handles.has(creature.id):
 		return
 	_release_grabs_of(creature)
+	if _proxies != null:
+		_proxies.remove(creature.id)
+	creature.free_proxy_node()
 	cells().remove_creature(creature.id)
 	_handles.erase(creature.id)
 	creature_despawned.emit(creature)
@@ -547,6 +600,7 @@ func _physics_process(delta: float) -> void:
 ## requested retopology, the skins.
 func step(delta: float) -> void:
 	var c := cells()
+	_statics.mass_scale = body_mass_scale
 	_statics.sync()
 	if not _grabs.is_empty():
 		_hold_grabs()
@@ -561,12 +615,80 @@ func step(delta: float) -> void:
 	c.step(delta)
 	if rings != null:
 		c.couple_apply(rings.kernel())
+	if push_bodies:
+		_statics.push_back(c.static_impulses(), body_mass_scale)
 	_dispatch_events()
+	if physics_proxies:
+		_update_proxies()
 	if _retopology:
 		_retopology = false
 		retopology(_retopology_capture, _retopology_same)
 	if draw_skins and _item.is_valid():
 		redraw()
+
+# --- Godot physics (docs/godot-physics.md) ------------------------------------------------
+
+## Whether `creature` has a proxy in Godot's physics: physics_proxies by default; a
+## subclass overrides it to choose per creature (asked every frame).
+func wants_proxy(_creature: GooCellCreature) -> bool:
+	return physics_proxies
+
+## The proxies (null until physics_proxies made one).
+func proxies() -> GooProxies:
+	return _proxies
+
+## The creature of this world a physics query's collider names (its proxy node: a ray's
+## or a shape query's `collider`, Area2D.body_entered's body, a CharacterBody2D's
+## get_collider()), or null.
+func creature_of(collider: Object) -> GooCellCreature:
+	var node := collider as Node
+	if node == null or not is_instance_valid(node) or not node.has_meta(GooCellCreature.PROXY_META):
+		return null
+	var handle := node.get_meta(GooCellCreature.PROXY_META) as GooCellCreature
+	if handle == null or handle.world != self or not handle.is_alive():
+		return null
+	return handle
+
+# Moves every creature's proxy to its boundary cells (made on first sight; one no
+# longer wanted or gone loses its own).
+func _update_proxies() -> void:
+	if not is_inside_tree():
+		return
+	if _proxies == null:
+		_proxies = GooProxies.new(get_world_2d().space)
+		_proxies.shape = proxy_shape
+		_proxies.set_layers(proxy_layer, proxy_mask)
+	if push_bodies:
+		_proxies.except(_statics.pushed_bodies())
+	_proxies.begin_frame()
+	var c := _cells
+	var centers := PackedVector2Array()
+	var radii := PackedFloat32Array()
+	for slot: int in _handles:
+		var handle: GooCellCreature = _handles[slot]
+		if not c.alive(slot):
+			handle.free_proxy_node()
+			continue
+		if not wants_proxy(handle):
+			continue
+		var all_centers: PackedVector2Array = c.centers(slot)
+		var all_radii: PackedFloat32Array = c.radii(slot)
+		var outline: PackedInt32Array = c.outline(slot)
+		if outline.is_empty():
+			outline.resize(all_centers.size())
+			for i: int in outline.size():
+				outline[i] = i
+		var n := outline.size()
+		centers.resize(n)
+		radii.resize(n)
+		for k: int in n:
+			centers[k] = all_centers[outline[k]]
+			radii[k] = all_radii[outline[k]]
+		var node := handle.proxy_node()
+		var center: Vector2 = c.creature_center(slot)
+		node.global_position = center
+		_proxies.update(slot, node, center, centers, radii)
+	_proxies.end_frame()
 
 func _dispatch_events() -> void:
 	var e := _cells.take_events()

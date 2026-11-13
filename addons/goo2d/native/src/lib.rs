@@ -24,6 +24,7 @@ mod geom;
 mod grid;
 mod kernel;
 mod links;
+mod obstacles;
 mod pinch;
 mod skin;
 mod statics;
