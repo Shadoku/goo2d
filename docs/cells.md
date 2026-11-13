@@ -600,6 +600,19 @@ each other more, which a game would pay for any interaction.
 7. **Ring-ring contacts are the kernel's, cell-cell the cells'**: a ring squeezed between two
    creatures gets both pushes from the cells in one frame, but a ring pressed between a creature
    and another ring meets the other ring only at the kernel's next step.
+8. **With Godot's physics as well** (`physics_proxies`, `push_bodies` on both worlds,
+   docs/godot-physics.md; `tests/integration/test_goo_coupled_godot_physics.gd`): a moving
+   obstacle (a crate, a paddle) is mirrored into both worlds, each pushing its own goo and
+   handing its own reaction to the body; the ghosts of the coupling ignore moving obstacles
+   (the ring world has already met them with their reaction). The two mass systems meet at
+   the crate: the ring world weighs a ring against it by its kernel's bead mass, the coupling
+   by `ring_density` × its area, so the momentum of a ring, a creature and a crate is kept
+   (0.3 % measured) only when the ring world's `body_mass_scale` is the ring's
+   `body_mass() / (target_area × ring_density)` × the cell world's `body_mass_scale`; that
+   ratio depends on the ring's size (0.0023-0.033 at unit 0.5 for radii 44-5 px), so one
+   scale fits one ring size. Left at 1, a crate barely notices a 24 px ring (109 % momentum
+   change measured, in the cells' units). The ring world's proxies are moved in its own step,
+   before the coupling's push of that frame reaches its beads (a frame's push behind).
 
 ## Limits
 

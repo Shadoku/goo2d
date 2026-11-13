@@ -176,8 +176,9 @@ moving body was not measured separately (the tests' scenes show no visible chang
   but convex).
 - **Rings and cells collide only when coupled**, not through this: a paddle in both worlds pushes
   both, and a blob and a creature pass through each other unless the cell world is coupled to the
-  ring world (`GooCellWorld2D.couple()`, docs/cells.md's "Rings and cells"). Their proxies never
-  meet in Godot's server (kinematic bodies on `proxy_layer` with `proxy_mask` 0).
+  ring world (`GooCellWorld2D.couple()`, docs/cells.md's "Rings and cells", its quirk 8 for
+  both together: the masses a crate meets in the two worlds). Their proxies never meet in
+  Godot's server (kinematic bodies on `proxy_layer` with `proxy_mask` 0).
 - **A body coming or going rebuilds the mirror** (`GooStatics`), its moving bodies included, which
   loses one frame of their motion.
 - Proxies are made lazily on the first update after `physics_proxies` is turned on; turning it

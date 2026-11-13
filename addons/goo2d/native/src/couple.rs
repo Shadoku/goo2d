@@ -528,7 +528,10 @@ impl Ghosts {
         }
         self.crad = crads;
         // The ghosts kept out of the walls (as the kernel keeps their beads): a bead pressed
-        // between a cell and a wall stays out of the wall here, not just next frame.
+        // between a cell and a wall stays out of the wall here, not just next frame. Moving
+        // obstacles (obstacles.rs) are left out: the ring's own kernel resolves its beads
+        // against them with their reaction, and a push here would give a ghost momentum no
+        // obstacle answers (4 % of a ring, a creature and a crate's momentum, measured).
         if !walls.is_empty() {
             for r in &self.rings {
                 if !r.active || r.settled {
@@ -537,7 +540,7 @@ impl Ghosts {
                 for k in r.g0 as usize..(r.g0 + r.n) as usize {
                     let mut at = self.pos[k];
                     for w in walls {
-                        if !w.aabb.grow(r.br).has_point(at) {
+                        if w.dynamic || !w.aabb.grow(r.br).has_point(at) {
                             continue;
                         }
                         if let Some((gap, dir)) = w.gap(at, r.br, 0.0) {
