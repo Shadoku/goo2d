@@ -427,6 +427,8 @@ pub struct Body {
     /// Something outside the creature pushed one of its cells this frame (a wall, another
     /// creature, a script force): its links' envelopes hold still.
     pub contact: bool,
+    /// The link graph's faces for the skin (cells_draw.rs), walked by after_topology().
+    pub faces: std::sync::Arc<crate::cells_draw::Faces>,
 }
 
 pub struct Cells {
@@ -681,6 +683,8 @@ impl Body {
         }
         self.near_start.push(self.near_list.len() as u32);
         self.trace_outline();
+        // The skin's faces change only with the link graph.
+        self.faces = std::sync::Arc::new(crate::cells_draw::walk_faces(self));
         self.topo_dirty = false;
         // Rebuild the creature's own candidates now; stagger later rebuilds by creature.
         self.self_stale = true;
@@ -2596,6 +2600,8 @@ impl Cells {
             None => (0..n).map(f).collect(),
         };
         let mut out = crate::cells_draw::Mesh::default();
+        out.reserve(parts.iter().map(|p| p.points.len()).sum(), parts.iter().map(|p| p.indices.len()).sum());
+        out.lines.reserve(parts.iter().map(|p| p.lines.len()).sum());
         for part in parts {
             out.append(part);
         }
@@ -2946,8 +2952,9 @@ mod tests {
         assert_eq!(faces.len(), 24);
         assert!(faces.iter().all(|f| f.len() == 3));
         let m = crate::cells_draw::creature_mesh(&cl.bodies[c], &cl.opt.types, true);
-        // 24 faces of 4 triangles and 6 per outline cell, no borders in one type.
-        assert_eq!(m.points.len(), 3 * (4 * 24 + 6 * 12));
+        // One triangle per face, the 12 faces on the rim split at their outline link
+        // (two triangles), and 6 per outline cell; no borders in one type.
+        assert_eq!(m.indices.len(), 3 * (12 + 2 * 12 + 6 * 12));
         assert!(m.lines.is_empty());
         // Mixed types: borders, and the area kept.
         let mut cl2 = Cells::default();
@@ -2956,7 +2963,49 @@ mod tests {
         let c2 = cl2.add_creature(&d, &vec![7.0; d.len()], &t);
         let m2 = crate::cells_draw::creature_mesh(&cl2.bodies[c2], &cl2.opt.types, true);
         assert!(!m2.lines.is_empty());
-        let area = |m: &crate::cells_draw::Mesh| m.points.chunks(3).map(|t| 0.5 * cross(t[1] - t[0], t[2] - t[0]).abs()).sum::<f32>();
+        let area = |m: &crate::cells_draw::Mesh| m.triangles().chunks(3).map(|t| 0.5 * cross(t[1] - t[0], t[2] - t[0]).abs()).sum::<f32>();
         assert!((area(&m) - area(&m2)).abs() < 1.0, "{} {}", area(&m), area(&m2));
+        // No T-junction: no vertex lies inside another triangle's edge (it would leave a
+        // pinhole once rasterised), with one type and with two.
+        for mesh in [&m, &m2] {
+            let p = mesh.triangles();
+            for t in p.chunks(3) {
+                for e in 0..3 {
+                    let (a, c) = (t[e], t[(e + 1) % 3]);
+                    let ac = c - a;
+                    let l2 = lsq(ac);
+                    for &v in p.iter() {
+                        let s = (v - a).dot(ac) / l2;
+                        if s > 1e-3 && s < 1.0 - 1e-3 {
+                            let off = cross(ac, v - a).abs() / l2.sqrt();
+                            assert!(off > 1e-3, "a vertex {:?} inside the edge {:?} {:?}", v, a, c);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod mesh_bench {
+    use super::*;
+    #[test]
+    #[ignore]
+    fn mesh_cost() {
+        let mut cl = Cells::default();
+        let d = hex_design(7, 7.0, Vector2::ZERO);
+        let n = d.len();
+        let c = cl.add_creature(&d, &vec![7.0; n], &vec![0; n]);
+        cl.step(1.0 / 60.0);
+        let b = &cl.bodies[c];
+        let t = std::time::Instant::now();
+        for _ in 0..1000 { std::hint::black_box(crate::cells_draw::walk_faces(b)); }
+        let w = t.elapsed().as_micros() as f64 / 1000.0;
+        let t = std::time::Instant::now();
+        let mut v = 0;
+        for _ in 0..1000 { v = std::hint::black_box(crate::cells_draw::creature_mesh(b, &cl.opt.types, true)).points.len(); }
+        let m = t.elapsed().as_micros() as f64 / 1000.0;
+        println!("cells {} walk {:.1} us, mesh {:.1} us, {} vertices", b.n, w, m, v);
     }
 }

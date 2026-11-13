@@ -2271,8 +2271,8 @@ impl GooCells {
         self.c.add_cell_ex(c as usize, at, radius as f32, typ as u8, group as u16, mass as f32) as i64
     }
 
-    /// Every live creature's skin mesh (cells_draw.rs): [points, colors, uvs (triangles,
-    /// three vertices each), border lines (pairs), build µs].
+    /// Every live creature's skin mesh (cells_draw.rs): [points, colors, uvs (vertices),
+    /// border lines (pairs), build µs, indices (triangles, three vertex indices each)].
     #[func]
     fn meshes_all(&self, borders: bool) -> VarArray {
         let t = std::time::Instant::now();
@@ -2284,6 +2284,7 @@ impl GooCells {
         a.push(&PackedVector2Array::from(m.uvs.as_slice()).to_variant());
         a.push(&PackedVector2Array::from(m.lines.as_slice()).to_variant());
         a.push(&us.to_variant());
+        a.push(&PackedInt32Array::from(m.indices.as_slice()).to_variant());
         a
     }
 

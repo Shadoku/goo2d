@@ -401,6 +401,7 @@ func test_the_skin_mesh() -> void:
 	var m: Array = w.cells().meshes_all(true)
 	var points: PackedVector2Array = m[0]
 	var lines: PackedVector2Array = m[3]
+	var indices: PackedInt32Array = m[5]
 	var p := cr.positions()
 	var r := cr.radii()
 	var worst := -INF
@@ -413,12 +414,17 @@ func test_the_skin_mesh() -> void:
 	for col: Color in (m[1] as PackedColorArray):
 		if col.is_equal_approx(Color.CORNFLOWER_BLUE):
 			blue += 1
-	print("    a 10 × 3 worm with a blue spine: %d triangles, %d border segments, every vertex within %.2f px of a cell's disc (the notches bridged), %d blue vertices" % [points.size() / 3, lines.size() / 2, maxf(worst, 0.0), blue])
-	assert_eq(points.size() % 3, 0)
-	assert_gt(points.size(), 3 * 30)
+	print("    a 10 × 3 worm with a blue spine: %d triangles over %d vertices, %d border segments, every vertex within %.2f px of a cell's disc (the notches bridged), %d blue vertices" % [indices.size() / 3, points.size(), lines.size() / 2, maxf(worst, 0.0), blue])
+	assert_eq(indices.size() % 3, 0)
+	assert_gt(indices.size(), 3 * 30)
+	for i: int in indices:
+		assert_true(i >= 0 and i < points.size(), "an index out of range")
+		if i < 0 or i >= points.size():
+			break
 	assert_gt(lines.size(), 0)
 	# The skin bridges the notch between two touching outline discs (√2 − 1 of a radius
 	# beyond them at a flat edge) and never reaches further.
 	assert_lt(worst, 0.43 * R)
 	assert_gt(blue, 0)
 	assert_eq(w.draw_stats["vertices"], points.size())
+	assert_eq(w.draw_stats["triangles"], indices.size() / 3)

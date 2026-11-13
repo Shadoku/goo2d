@@ -25,28 +25,47 @@ pub struct Mesh {
     pub points: Vec<Vector2>,
     pub colors: Vec<Color>,
     pub uvs: Vec<Vector2>,
+    /// Triangles: three vertex indices each.
+    pub indices: Vec<i32>,
     /// Borders between types: pairs of points.
     pub lines: Vec<Vector2>,
 }
 
 impl Mesh {
+    /// A vertex: its index.
     #[inline]
-    fn tri(&mut self, a: Vector2, b: Vector2, c: Vector2, ua: f32, ub: f32, uc: f32, col: Color, t: f32) {
-        self.points.push(a);
-        self.points.push(b);
-        self.points.push(c);
+    fn vert(&mut self, p: Vector2, u: f32, col: Color, t: f32) -> i32 {
+        self.points.push(p);
         self.colors.push(col);
-        self.colors.push(col);
-        self.colors.push(col);
-        self.uvs.push(Vector2::new(ua, t));
-        self.uvs.push(Vector2::new(ub, t));
-        self.uvs.push(Vector2::new(uc, t));
+        self.uvs.push(Vector2::new(u, t));
+        self.points.len() as i32 - 1
+    }
+
+    #[inline]
+    fn tri_i(&mut self, a: i32, b: i32, c: i32) {
+        self.indices.push(a);
+        self.indices.push(b);
+        self.indices.push(c);
+    }
+
+    /// The triangles' corners, three points each (for tests and measurements).
+    pub fn triangles(&self) -> Vec<Vector2> {
+        self.indices.iter().map(|&i| self.points[i as usize]).collect()
+    }
+
+    pub fn reserve(&mut self, vertices: usize, indices: usize) {
+        self.points.reserve(vertices);
+        self.colors.reserve(vertices);
+        self.uvs.reserve(vertices);
+        self.indices.reserve(indices);
     }
 
     pub fn append(&mut self, o: Mesh) {
+        let base = self.points.len() as i32;
         self.points.extend(o.points);
         self.colors.extend(o.colors);
         self.uvs.extend(o.uvs);
+        self.indices.extend(o.indices.iter().map(|&i| i + base));
         self.lines.extend(o.lines);
     }
 }
@@ -78,10 +97,34 @@ fn outward(b: &Body, k: usize) -> Vector2 {
 
 /// Faces of the planar link graph (lists of cells), the outer face left out.
 pub fn inner_faces(b: &Body) -> Vec<Vec<u32>> {
+    walk_faces(b).faces
+}
+
+/// Where a half-edge's face is: an inner face's index, the outer face, or none kept.
+const OUTER: i32 = -1;
+const NO_FACE: i32 = -2;
+
+/// The planar link graph's faces with their half-edges.
+#[derive(Default)]
+pub struct Faces {
+    /// Inner faces as lists of cells, wound opposite to the outer face.
+    pub faces: Vec<Vec<u32>>,
+    /// Per face, per cell k: the half-edge (an index into b.nb) from cell k to cell k + 1.
+    pub halves: Vec<Vec<u32>>,
+    /// Per half-edge: its face (an inner face's index, OUTER or NO_FACE).
+    pub face_of: Vec<i32>,
+    /// Per half-edge: the same link walked the other way.
+    pub twin: Vec<u32>,
+}
+
+/// Walks every face of the planar link graph once.
+pub fn walk_faces(b: &Body) -> Faces {
     let n = b.n;
     let half = b.nb.len();
     let mut seen = vec![false; half];
+    let mut twin = vec![u32::MAX; half];
     let mut faces: Vec<Vec<u32>> = Vec::new();
+    let mut halves: Vec<Vec<u32>> = Vec::new();
     let mut areas: Vec<f32> = Vec::new();
     // The half-edge i → j is entry q of i's list; arriving at j from i, the face goes on
     // along the neighbour of j before i in j's (angle sorted) list.
@@ -91,6 +134,7 @@ pub fn inner_faces(b: &Body) -> Vec<Vec<u32>> {
                 continue;
             }
             let mut face = Vec::new();
+            let mut hs = Vec::new();
             let (mut u, mut qq) = (i, q);
             let mut ok = true;
             for _ in 0..(half + 1) {
@@ -100,12 +144,14 @@ pub fn inner_faces(b: &Body) -> Vec<Vec<u32>> {
                 }
                 seen[qq] = true;
                 face.push(u as u32);
+                hs.push(qq as u32);
                 let v = b.nb[qq].0 as usize;
                 let (s, e) = (b.nb_start[v] as usize, b.nb_start[v + 1] as usize);
                 let Some(back) = (s..e).find(|&x| b.nb[x].0 as usize == u) else {
                     ok = false;
                     break;
                 };
+                twin[qq] = back as u32;
                 let nq = if back == s { e - 1 } else { back - 1 };
                 u = v;
                 qq = nq;
@@ -118,11 +164,13 @@ pub fn inner_faces(b: &Body) -> Vec<Vec<u32>> {
                 a += cross(b.pos[face[k] as usize], b.pos[face[(k + 1) % face.len()] as usize]);
             }
             faces.push(face);
+            halves.push(hs);
             areas.push(0.5 * a);
         }
     }
+    let mut out = Faces { faces: Vec::new(), halves: Vec::new(), face_of: vec![NO_FACE; half], twin };
     if faces.is_empty() {
-        return faces;
+        return out;
     }
     // The outer face: the largest; inner faces wind the other way.
     let mut outer = 0;
@@ -132,70 +180,134 @@ pub fn inner_faces(b: &Body) -> Vec<Vec<u32>> {
         }
     }
     let sign = areas[outer].signum();
-    let mut out = Vec::with_capacity(faces.len());
-    for (k, f) in faces.into_iter().enumerate() {
+    for &h in &halves[outer] {
+        out.face_of[h as usize] = OUTER;
+    }
+    for (k, (f, hs)) in faces.into_iter().zip(halves).enumerate() {
         if k != outer && areas[k].signum() != sign && areas[k] != 0.0 {
-            out.push(f);
+            for &h in &hs {
+                out.face_of[h as usize] = out.faces.len() as i32;
+            }
+            out.faces.push(f);
+            out.halves.push(hs);
         }
     }
     out
 }
 
 /// One creature's mesh.
+///
+/// A link is split at its midpoint where a triangle on either side ends there: on the rim
+/// (the outline cells' fans end at their links' midpoints) and at a face of mixed types
+/// (cut into one quad per cell). A face of one type splits only those of its links, so
+/// neighbouring triangles always share whole edges (no T-junction, no pinholes) and the
+/// inside of a one-type piece is one triangle per face.
 pub fn creature_mesh(b: &Body, types: &[TypeParams; TYPES], border: bool) -> Mesh {
     let mut m = Mesh::default();
     let n = b.n;
     if n == 0 {
         return m;
     }
+    let ol = b.outline.len();
+    m.reserve(n + 8 * ol, 3 * (2 * n + 6 * ol));
     let tv = |c: usize| b.typ[c] as f32 / 16.0;
-    // Inner faces.
-    for f in inner_faces(b) {
+    // Every triangle corner at a cell's centre is that cell's colour, inside (UV.x 1): one
+    // vertex per cell, shared.
+    for c in 0..n {
+        m.vert(b.pos[c], 1.0, color_of(types, b.typ[c]), tv(c));
+    }
+    let fw: &Faces = &b.faces;
+    let nf = fw.faces.len();
+    // Which faces are drawn (a gap the discs nearly cover is filled, a pocket left open),
+    // their centres, and which are of mixed types.
+    let mut drawn = vec![true; nf];
+    let mut mixed = vec![false; nf];
+    let mut centre = vec![Vector2::ZERO; nf];
+    for (fi, f) in fw.faces.iter().enumerate() {
         let k = f.len();
         let mut g = Vector2::ZERO;
         let mut rs = 0.0;
-        for &c in &f {
+        for &c in f {
             g += b.pos[c as usize];
             rs += b.r[c as usize];
         }
         g /= k as f32;
+        centre[fi] = g;
         if k > 3 {
-            // A gap the discs nearly cover is filled; a pocket is left open.
             let mut d = f32::INFINITY;
-            for &c in &f {
+            for &c in f {
                 d = d.min((b.pos[c as usize] - g).length() - b.r[c as usize]);
             }
             if d > 0.6 * rs / k as f32 {
-                continue;
+                drawn[fi] = false;
             }
         }
-        // Every link is split at its midpoint wherever it is drawn (faces of one type, of
-        // mixed types, the rim), so neighbouring triangles share whole edges: no T-junction,
-        // no pinholes along the links.
         let t0 = b.typ[f[0] as usize];
-        if f.iter().all(|&c| b.typ[c as usize] == t0) {
-            let col = color_of(types, t0);
+        mixed[fi] = f.iter().any(|&c| b.typ[c as usize] != t0);
+    }
+    let split = |h: u32| -> bool {
+        let g = fw.face_of[fw.twin[h as usize] as usize];
+        g == OUTER || (g >= 0 && drawn[g as usize] && mixed[g as usize])
+    };
+    let mut poly: Vec<i32> = Vec::with_capacity(16);
+    for (fi, f) in fw.faces.iter().enumerate() {
+        if !drawn[fi] {
+            continue;
+        }
+        let k = f.len();
+        let g = centre[fi];
+        if !mixed[fi] {
+            let col = color_of(types, b.typ[f[0] as usize]);
             let t = tv(f[0] as usize);
-            let mids: Vec<Vector2> = (0..k).map(|q| (b.pos[f[q] as usize] + b.pos[f[(q + 1) % k] as usize]) * 0.5).collect();
-            if k == 3 {
-                for q in 0..3 {
-                    m.tri(b.pos[f[q] as usize], mids[q], mids[(q + 2) % 3], 1.0, 1.0, 1.0, col, t);
+            let hs = &fw.halves[fi];
+            poly.clear();
+            let mut splits = 0;
+            let mut whole_corner = usize::MAX;
+            for q in 0..k {
+                poly.push(f[q] as i32);
+                if split(hs[q]) {
+                    let mid = (b.pos[f[q] as usize] + b.pos[f[(q + 1) % k] as usize]) * 0.5;
+                    poly.push(m.vert(mid, 1.0, col, t));
+                    splits += 1;
                 }
-                m.tri(mids[0], mids[1], mids[2], 1.0, 1.0, 1.0, col, t);
+            }
+            if splits == 0 && k == 3 {
+                m.tri_i(poly[0], poly[1], poly[2]);
+                continue;
+            }
+            if k == 3 {
+                // A corner whose two links are whole: a fan from it (its triangles never
+                // degenerate: the split points lie on the opposite link).
+                let mut at = 0;
+                for q in 0..3 {
+                    if !split(hs[q]) && !split(hs[(q + 2) % 3]) {
+                        whole_corner = at;
+                    }
+                    at += 1 + split(hs[q]) as usize;
+                }
+            }
+            let pl = poly.len();
+            if whole_corner != usize::MAX {
+                let v = poly[whole_corner];
+                for s in 1..pl - 1 {
+                    let (a, c) = (poly[(whole_corner + s) % pl], poly[(whole_corner + s + 1) % pl]);
+                    m.tri_i(v, a, c);
+                }
             } else {
-                for q in 0..k {
-                    m.tri(g, b.pos[f[q] as usize], mids[q], 1.0, 1.0, 1.0, col, t);
-                    m.tri(g, mids[q], b.pos[f[(q + 1) % k] as usize], 1.0, 1.0, 1.0, col, t);
+                let gi = m.vert(g, 1.0, col, t);
+                for s in 0..pl {
+                    m.tri_i(gi, poly[s], poly[(s + 1) % pl]);
                 }
             }
             continue;
         }
         for q in 0..k {
             let (cp, c, cn) = (f[(q + k - 1) % k] as usize, f[q] as usize, f[(q + 1) % k] as usize);
-            let (pc, mp, mn) = (b.pos[c], (b.pos[c] + b.pos[cp]) * 0.5, (b.pos[c] + b.pos[cn]) * 0.5);
+            let (mp, mn) = ((b.pos[c] + b.pos[cp]) * 0.5, (b.pos[c] + b.pos[cn]) * 0.5);
             let col = color_of(types, b.typ[c]);
-            m.tri(pc, mn, g, 1.0, 1.0, 1.0, col, tv(c));
-            m.tri(pc, g, mp, 1.0, 1.0, 1.0, col, tv(c));
+            let (gi, mpi, mni) = (m.vert(g, 1.0, col, tv(c)), m.vert(mp, 1.0, col, tv(c)), m.vert(mn, 1.0, col, tv(c)));
+            m.tri_i(c as i32, mni, gi);
+            m.tri_i(c as i32, gi, mpi);
             if border && b.typ[c] != b.typ[cn] {
                 m.lines.push(mn);
                 m.lines.push(g);
@@ -203,7 +315,6 @@ pub fn creature_mesh(b: &Body, types: &[TypeParams; TYPES], border: bool) -> Mes
         }
     }
     // The rim.
-    let ol = b.outline.len();
     if ol < 3 {
         // One or two cells: discs.
         for &c in &b.outline {
@@ -215,7 +326,8 @@ pub fn creature_mesh(b: &Body, types: &[TypeParams; TYPES], border: bool) -> Mes
                 let a1 = std::f32::consts::TAU * (s + 1) as f32 / SIDES as f32;
                 let p0 = b.pos[c] + Vector2::new(a0.cos(), a0.sin()) * b.r[c];
                 let p1 = b.pos[c] + Vector2::new(a1.cos(), a1.sin()) * b.r[c];
-                m.tri(b.pos[c], p0, p1, 1.0, 0.0, 0.0, col, tv(c));
+                let (i0, i1) = (m.vert(p0, 0.0, col, tv(c)), m.vert(p1, 0.0, col, tv(c)));
+                m.tri_i(c as i32, i0, i1);
             }
         }
         return m;
@@ -238,11 +350,15 @@ pub fn creature_mesh(b: &Body, types: &[TypeParams; TYPES], border: bool) -> Mes
         let ring = [mp, p0, bz(0.25), bz(0.5), bz(0.75), p2, mn];
         let uv = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0];
         let col = color_of(types, b.typ[c]);
+        let mut ri = [0i32; 7];
+        for q in 0..7 {
+            ri[q] = m.vert(ring[q], uv[q], col, tv(c));
+        }
         for q in 0..6 {
             if len_sq(ring[q + 1] - ring[q]) < 1e-12 {
                 continue;
             }
-            m.tri(pc, ring[q], ring[q + 1], 1.0, uv[q], uv[q + 1], col, tv(c));
+            m.tri_i(c as i32, ri[q], ri[q + 1]);
         }
         if border && b.typ[c] != b.typ[cnv] {
             m.lines.push(mn);

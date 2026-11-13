@@ -168,7 +168,7 @@ var _material: Material = null
 var _grabs: Dictionary[int, Dictionary] = {}
 var _next_grab: int = 1
 ## The last frame's skin build (µs in the kernel, µs handing it to the RenderingServer).
-var draw_stats: Dictionary = {"mesh_us": 0, "submit_us": 0, "vertices": 0}
+var draw_stats: Dictionary = {"mesh_us": 0, "submit_us": 0, "vertices": 0, "triangles": 0}
 
 ## The world's GooCells (made on first use).
 func cells() -> GooCells:
@@ -537,9 +537,10 @@ func redraw() -> void:
 	var t := Time.get_ticks_usec()
 	var points: PackedVector2Array = m[0]
 	RenderingServer.canvas_item_set_transform(_item, global_transform.affine_inverse())
-	if points.size() >= 3:
-		RenderingServer.canvas_item_add_triangle_array(_item, PackedInt32Array(), points, m[1], m[2])
+	var indices: PackedInt32Array = m[5]
+	if indices.size() >= 3:
+		RenderingServer.canvas_item_add_triangle_array(_item, indices, points, m[1], m[2])
 	var lines: PackedVector2Array = m[3]
 	if draw_borders and lines.size() >= 2:
 		RenderingServer.canvas_item_add_multiline(_item, lines, PackedColorArray([border_color]), border_width * GooTuning.unit)
-	draw_stats = {"mesh_us": m[4], "submit_us": Time.get_ticks_usec() - t, "vertices": points.size()}
+	draw_stats = {"mesh_us": m[4], "submit_us": Time.get_ticks_usec() - t, "vertices": points.size(), "triangles": indices.size() / 3}
