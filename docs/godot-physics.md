@@ -118,6 +118,22 @@ is `mass()`, its cells' areas at density 1 (a 37-cell blob of 14 px cells: 22 80
 impulses are in those units; `body_mass_scale` is the goo's mass per unit of `RigidBody2D.mass`
 (1 by default: give the crate a mass in goo units).
 
+A ring's `body_mass()` is GooTuning's, which grows more slowly than its area (at unit 0.5 the
+same 2.6 for radii 5-14 px, 7.9 at 24 px, 13.9 at 44 px), so one `body_mass_scale` is right for
+one ring size. `GooWorld2D.body_mass_density` (0, the default: as before) > 0 weighs every ring
+as its `target_area` × it against moving obstacles, in the kernel's obstacle contacts
+(`obstacles.rs`: each bead's share of that mass in the impulse split, in its velocity change and
+in the reaction summed for the body); the ring's own dynamics, gravity and its contacts with
+other rings are untouched. At the cells' density (1, a coupled cell world's `ring_density`) and
+with both worlds' `body_mass_scale` equal, a crate meets rings and creatures in one unit.
+Measured (`test_goo_godot_physics.gd`, unit 0.5, undamped rings in zero gravity, a crate of 2 at
+`body_mass_scale` 1000 thrown at 150 px/s at rings of 5, 8, 14, 24, 34 and 44 px): the momentum
+by area (the ring's target area × its mean velocity, the crate's mass × the scale × its
+velocity) is kept to 0.00-0.05 % at every size; at the bead masses (`body_mass_density` 0) it is
+off by 5 % (5 px) to 444 % (44 px), the crate barely slowed (150 to 148-150 px/s). With a ring, a
+creature and a crate thrown together (`test_goo_coupled_godot_physics.gd`) it is kept to 0.19 %
+(0.30 % with the old hand-matched scale, 109 % unmatched).
+
 ## Measured
 
 Tests in `tests/integration/test_goo_godot_physics.gd` (rings) and
@@ -171,7 +187,8 @@ moving body was not measured separately (the tests' scenes show no visible chang
   step and before Godot's; Godot's step then resolves its other contacts. A body pressed between
   goo and a wall is pushed by both in turn, not solved together; a heavy body falling fast on
   thin goo can still reach the floor through it.
-- **Masses are the goo's.** Set a pushed rigid body's mass in goo units, or `body_mass_scale`.
+- **Masses are the goo's.** Set a pushed rigid body's mass in goo units, or `body_mass_scale`;
+  for rings of several sizes, `body_mass_density` (above).
 - **Proxies report the centre's velocity only**, and circles leave a body hollow (`HULL` is solid
   but convex).
 - **Rings and cells collide only when coupled**, not through this: a paddle in both worlds pushes

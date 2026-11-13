@@ -21,7 +21,7 @@ numbers, the limits and the quirks a game should be designed around.
 | `addons/goo2d/native/src/couple.rs` | rings and cells colliding (below, "Rings and cells") |
 | `examples/rings_and_cells/` | ring bodies and creatures in one tank |
 | `tools/cell_world_bench.gd` | cost, draw and swimming through the world node |
-| tests | `tests/integration/test_goo_cell_world.gd`, `tests/unit/test_goo_cell_design.gd`, `tests/integration/examples/test_cells.gd`, `tests/unit/test_goo_cells.gd` (the exploration's), cargo tests in `cells.rs`; the coupling's `tests/integration/test_goo_ring_cells.gd`, `tests/integration/examples/test_rings_and_cells.gd`, cargo tests in `couple.rs` |
+| tests | `tests/integration/test_goo_cell_spin_servo.gd` (the spin servo and the contact query), `tests/integration/test_goo_cell_world.gd`, `tests/unit/test_goo_cell_design.gd`, `tests/integration/examples/test_cells.gd`, `tests/unit/test_goo_cells.gd` (the exploration's), cargo tests in `cells.rs`; the coupling's `tests/integration/test_goo_ring_cells.gd`, `tests/integration/examples/test_rings_and_cells.gd`, cargo tests in `couple.rs` |
 
 A `GooWorld2D`'s ring bodies and a `GooCellWorld2D`'s creatures collide once the two worlds
 are **coupled** (`couple()`, below "Rings and cells"); uncoupled, they pass through each other.
@@ -61,7 +61,8 @@ running head to tail; the swimmer's stroke; a curvature bias steers), **joint an
 drive** (`set_swim()`: every cell pushed along its own forward, below), **thrust** per cell
 along its heading (`set_cell_thrust()`), and whole-creature **push** and **twist** (kept, or
 for one step: `push_once()`, `twist_once()`, `add_cell_forces_once()`). A creature's mean
-motion and rigid spin relative to the water can be **damped** (`set_damping()`).
+motion and rigid spin relative to the water can be **damped** (`set_damping()`), and its spin
+held by the solver's **spin servo** (`set_spin_servo()`, below "Turning by the spin servo").
 
 **Contacts**: a creature's outline cells collide with other creatures' outline cells
 (rigid, one pass a substep, a broad phase over creatures' boxes); every cell collides with
@@ -135,11 +136,20 @@ serial, and a replay is identical (tested).
 `add_cell_forces_once(forces)`, `set_damping(linear, angular)`, `set_muscles(scales)`, `set_pose_wave(slope, wavelength,
 frequency, bias, envelope)`, `stop_wave()`, `set_joint_angle(type_a, group_a, type_b,
 group_b, angle)`, `set_water(velocities)`, `set_current(v)`, `translate()`,
-`set_velocity()`, `add_cell()`, `remove_cell(uid)`; `design`, `axis` (its forward at
+`set_velocity()`, `add_cell()`, `remove_cell(uid)`; the spin servo: `set_spin_servo(target_spin,
+max_angular_acceleration, max_tip_speed = INF, contact_yield = 1.0)`, `set_spin_target(target_spin)`
+(cheap, every frame), `stop_spin_servo()`, `spin_servo()` (its state: the spin measured, the
+target after the tip cap, the yield's scale and contact share), the static
+`spin_toward(angle_error, max_spin, max_angular_acceleration, delta = 0)` (a heading servo's
+target); contacts: `contacts()` (what its cells touched in the last step: cell, uid, `Touch`
+kind, id, the thing, normal), `contact_counts()`, `touching_walls()`, `touching(kind)`,
+`set_contact_tracking(on)`, `contact_tracking()`, enum `Touch { WALL, OBSTACLE, RING,
+CREATURE }`; `design`, `axis` (its forward at
 spawn), `data` (a dictionary for the game; copied to split parts). Forces set stay until
 set again, but the `_once` ones, which add to the next step's and clear themselves (calls
 before a step add up; `add_cell_forces_once()` counts as outside the creature for the break
-test, as `set_cell_force()` does). A split part keeps its parent's swim drive and damping.
+test, as `set_cell_force()` does). A split part keeps its parent's swim drive, damping, spin
+servo and contact tracking. `GooCellWorld2D.touched_thing(kind, id)` resolves a contact's id.
 Cell indices change at every topology change: keep uids.
 
 `GooCellDesign` (a Resource, `.tres`, editable in the inspector): `types`
@@ -195,6 +205,9 @@ at unit 1, scaled by it; designs' radii are canvas px as drawn (a game at unit 0
 | `CAPTURE` | 4 px at unit 1 | a retopology joins cells this close to touching |
 | `MARGIN` / `MAX_SPEED` | 6 px / 6000 px/s at unit 1 | the solver's contact margin and speed cap (3 px, 3000 px/s at the game's 0.5); the swept wall test covers the cap |
 | `GRAB_STIFFNESS` / `GRAB_DAMPING` / `GRAB_REACH` | 400 /s², 40 /s, 3 radii | critically damped; the cells within 3 radii of the grabbed one share the pull |
+| spin servo `max_angular_acceleration` | a game's (e.g. 16 rad/s² for a 690 px worm's 1 s half turn, 254 for an 84 px blob's 0.25 s) | the trapezoid `turn_profile()` of the tests: cruise at 1.5 π / T, accelerate at spin × (1 + 1/0.8) / (2 (T − π/spin)), brake at 0.8 of it |
+| spin servo `max_tip_speed` | INF (off) | a game's swat limit; a tip of 300-600 px/s tames a worm most (below), but caps its spin at tip / farthest radius |
+| spin servo `contact_yield` | 1 (off) | 0.1-0.3 tame (below); the release `SERVO_RELEASE` 0.1 s |
 
 
 ## Walls
@@ -339,6 +352,131 @@ damping:
 | 10 px/s | 133 px/s | 8.57 s, 325 px | 331 px |
 | 20 px/s | 96 px/s | 5.28 s, 157 px | 167 px |
 | 40 px/s | 58 px/s | 2.60 s, 55 px | 61 px |
+
+### Turning by the spin servo
+
+`set_spin_servo(target_spin, max_angular_acceleration, max_tip_speed = INF, contact_yield = 1)`
+runs in the solver, every substep, per creature (in its parallel part: threaded is still
+bit-identical to serial, and a replay identical; cargo-tested), until `stop_spin_servo()`:
+
+- **What it holds**: the creature's spin, its cells' angular momentum about the centre of mass
+  over their moment of inertia with the mean velocity taken out. That is the world's frame and
+  any frame moving with the water without turning alike (not relative to a vortex's rotation):
+  `spin()`, and what a heading changes by. Positive is clockwise on screen.
+- **How**: a rigid turn of every cell about the centre of mass, `vel += perp(p − c) × Δω` (and the
+  cells' own spin), Δω = the target less the spin, at most `max_angular_acceleration` × the
+  substep. No net force: Σ m (p − c) = 0, the centre refined by the residual of its f32 sum. It
+  stops on the target (a target of 0 stops the spin and holds it: a heading held straight
+  while nothing turns it). A velocity change, not a force, so it holds its target exactly
+  against drag at any acceleration, and no overshoot comes of the servo itself.
+- **Tip cap**: the target is clamped to `max_tip_speed` / the farthest cell centre's distance
+  from the centre of mass (measured each substep, so a creature bent shorter may spin faster).
+  A spin above the cap from outside is braked to it.
+- **Contact yield**: with the contacts its cells had in the previous substep (any kind: below,
+  "Contacts"), the share g = the largest cosine between the commanded turn's motion at a
+  touching cell (perp(p − c) × the sign of the target) and that contact's normal into the
+  other thing; it rises at once and fades over `SERVO_RELEASE` (0.1 s) once gone, and a turn
+  the other way starts afresh, so a contact found in one substep and lost the next never makes
+  it chatter. The scale 1 − (1 − `contact_yield`) × g multiplies both the target it holds and
+  its acceleration toward it; a spin above that share is braked at the full acceleration. A
+  cell sliding along a wall (g ≈ 0) or turned away from a contact (g = 0) does not yield, so a
+  turn begun with the tail on a wall goes at full power. The last substep's contacts, not a
+  prediction: the first substep of a contact is unyielded.
+- **Damping**: while the servo is on it owns the spin: `set_damping()`'s angular part is not
+  applied (its linear part is).
+- **Cost**: nothing while off (one flag); on, two passes over the cells a substep and the
+  contacts recorded. 30 worms of 150 cells all servoed: 2.96-2.98 ms a frame swimming against
+  2.85-2.93 without (4 threads; tools/cell_world_bench.gd --servo=1, below).
+
+`GooCellCreature.spin_toward(error, max_spin, a, delta)` is the target a heading servo gives
+it each frame: the braking curve sign × min(max_spin, √(2 a |error|)), and with `delta` at most
+|error| / delta so a target set once a frame never carries the turn past the heading within the
+frame. Brake at a little under the servo's acceleration (0.8 of it here).
+
+Measured (`tests/integration/test_goo_cell_spin_servo.gd`, unit 0.5, 14 px cells, the world's
+drag, real physics frames). **Half turns from rest in open water**, against the fluid game's
+times (0.25 s at 84 px to 1 s at 690 px, by the design's longest extent), with the trapezoid
+profile above (overshoot past the heading; the error 1 s after reaching it):
+
+| creature | size | the game's | servo: spin, acceleration | half turn | overshoot | tip speed | ×2 spin, ×3 acceleration |
+|---|---|---|---|---|---|---|---|
+| blob of 7 | 84 px | 0.25 s | 18.8 rad/s, 254 rad/s² | 0.217 s | 7.5° | 527 px/s | 0.200 s, 0.2° |
+| blob of 19 | 140 px | 0.32 s | 14.8, 156 | 0.283 s | 4.7° | 826 px/s | 0.150 s, 12.0° |
+| blob of 37 | 196 px | 0.39 s | 12.1, 105 | 0.350 s | 3.2° | 1018 px/s | 0.183 s, 8.9° |
+| worm 24 × 5 | 690 px | 1.00 s | 4.7, 16 | 0.967 s | 0.4° | 1539 px/s | 0.533 s, 1.2° |
+
+Every heading held to 0.00° a second later. The overshoot is the blobs' elasticity (the rim lags
+the turn and springs on), not the servo, which arrives on its target spin; the game's times are
+all met within the profile.
+
+**A worm spun into a floor** (its line 160 px above it, so its head swings in a third of the way
+round at the 1 s profile; the first cell to touch, its speed the frame before; the worm's centre
+flung off the floor within 1 s):
+
+| setting | first cell hits at | flung off at | half turn |
+|---|---|---|---|
+| yield 1, no tip cap (full power) | 857 px/s | 568 px/s | 1.23 s (it vaults over its head) |
+| yield 0.3 | 857 | 395 | 1.40 s |
+| yield 0.1 | 857 | 361 | 1.50 s |
+| yield 0.1, tip 600 px/s | 580 | 181 | 2.45 s |
+| yield 0.1, tip 300 px/s | 290 | 90 | not made in 2.5 s (59°) |
+
+A spinning worm's angular momentum is what flings it: when its head stops on the floor it keeps
+turning about the head and vaults (a rod hitting a floor end-first). The yield stops the servo
+adding to that (a third less fling), the tip cap stores less of it (a sixth of the fling at
+300 px/s). **Turns begun against a wall**: the tail end on a wall behind it, the half turn takes
+0.97-0.98 s at yields 1, 0.3 and 0.1 (open water 0.97 s: the tail slides along the wall and
+nothing yields); lying along a floor, turning its near half into it, 1.32 s at yield 1, 1.92 s at
+0.3, 2.52 s at 0.1 (it levers itself off the floor, at the yield's share).
+
+**A worm turning into a crate** (the game's: 60 px, mass 10 at `body_mass_scale` 1000, damped
+1.5 / 3 per second; `push_bodies`; 250 px from the worm's centre, 50° into its turn) **and into a
+coupled 28 px ring** (`ring_density` 1), the thing's fastest speed and its speed 1 s after the
+first contact:
+
+| setting | crate | ring |
+|---|---|---|
+| yield 1, no tip cap (full power) | 953 px/s, 306 later | 1342 px/s, 936 later |
+| yield 0.3 | 691, 204 | 580, 400 |
+| yield 0.1 | 672, 218 | 573, 384 |
+| yield 0.1, tip 600 px/s | 348, 181 | 248, 224 |
+| yield 0.1, tip 300 px/s | 142, 93 | 99, 75 |
+
+The yield alone takes off 30 % (the crate) to 57 % (the ring); what remains is the hit itself, the
+turning worm's momentum meeting the thing in the first substeps of the contact. Only the tip cap
+lowers that, and it lengthens every turn (a 690 px worm at 600 px/s cannot spin faster than
+1.8 rad/s, a half turn about 2 s). A game wanting both a 1 s turn and no swat cannot have them
+from the servo alone: it could cap the tip only near things (lowering `max_tip_speed` when a
+crate is within reach), or accept the yield's 30-60 %. Before this the game's GDScript servo
+(`twist_once()` every frame) swatted the crate at up to 890 px/s and bounced the head off a wall at
+up to 507 px/s.
+
+**Recommended for the fluid game**: full power `set_spin_servo(target, a, INF, 1.0)`; tame
+`set_spin_servo(target, a, INF, 0.3)`, which keeps every game turn time (contacts aside) and takes
+30-57 % off a swat; tamer still a tip cap, which costs turn time wherever the creature's tip
+would pass it (at the game's times the 7-cell blob's tip reaches 527 px/s, the 19-cell blob's
+826, the 37-cell blob's 1018, the worm's 1539: a cap of 600 px/s slows all but the smallest);
+`a` from the turn time as above; the target each frame `spin_toward(heading_error, max_spin,
+0.8 × a, delta)`.
+
+### Contacts
+
+Each creature can record what its cells touched in the last step (`set_contact_tracking(true)`;
+the spin servo records them while it is on, whatever this says; off, nothing is recorded and it
+costs nothing). Every contact the solver resolves is noted where it is resolved, in fixed order
+(walls and moving obstacles in the creature's parallel part, other creatures and rings in the
+serial passes), so threaded == serial (cargo-tested): the cell, what it touched (`Touch.WALL`: a
+static shape, its id GooStatics' kernel id; `OBSTACLE`: a moving obstacle, the same; `RING`: the
+ring's kernel key, its Goo2D's instance id; `CREATURE`: the other creature's slot) and the unit
+normal pushing the cell out (for an edge contact between creatures, the edge's nearer cell).
+At the step's end they are sorted by cell, kind and id, one per cell and thing (the last
+substep's normal). `contacts()` returns them with the thing resolved (`touched_thing()`: the
+`PhysicsBody2D` or `TileMapLayer` through `GooStatics.node_of()`, the `Goo2D`, the
+`GooCellCreature`; a first call turns tracking on and returns what the last step recorded);
+`contact_counts()` (`[walls, obstacles, rings, creatures]`), `touching_walls()` and
+`touching(kind)` build no dictionaries. A topology change finds the step's contacts again by
+uid. Rings (`GooWorld2D`) have no such query: their contacts are the kernel's own
+(`touched` events, `Goo2D.touching()`), not recorded this way.
 
 ### Two kernel bugs
 
@@ -605,14 +743,16 @@ each other more, which a game would pay for any interaction.
    obstacle (a crate, a paddle) is mirrored into both worlds, each pushing its own goo and
    handing its own reaction to the body; the ghosts of the coupling ignore moving obstacles
    (the ring world has already met them with their reaction). The two mass systems meet at
-   the crate: the ring world weighs a ring against it by its kernel's bead mass, the coupling
-   by `ring_density` × its area, so the momentum of a ring, a creature and a crate is kept
-   (0.3 % measured) only when the ring world's `body_mass_scale` is the ring's
-   `body_mass() / (target_area × ring_density)` × the cell world's `body_mass_scale`; that
-   ratio depends on the ring's size (0.0023-0.033 at unit 0.5 for radii 44-5 px), so one
-   scale fits one ring size. Left at 1, a crate barely notices a 24 px ring (109 % momentum
-   change measured, in the cells' units). The ring world's proxies are moved in its own step,
-   before the coupling's push of that frame reaches its beads (a frame's push behind).
+   the crate: the coupling weighs a ring by `ring_density` × its area; the ring world, by
+   default, by its kernel's bead masses. Set the ring world's `body_mass_density` to the cell
+   world's `ring_density` and its `body_mass_scale` to the cell world's: it then weighs every
+   ring as its area × that against moving obstacles, and the momentum of a ring, a creature and
+   a crate is kept (0.19 % measured) for rings of any size. (Before, a `body_mass_scale` matched
+   by hand to one ring, `body_mass() / (target_area × ring_density)` × the cells', kept it to
+   0.30 % for that size only: 0.0023-0.033 at unit 0.5 for radii 44-5 px. At its bead masses
+   and scale 1 a crate barely notices a 24 px ring: 109 % momentum change.) The ring world's
+   proxies are moved in its own step, before the coupling's push of that frame reaches its
+   beads (a frame's push behind).
 
 ## Limits
 
@@ -629,6 +769,11 @@ each other more, which a game would pay for any interaction.
   shows about ±0.15 ms of noise between runs).
 - Damping is an exponential decay: one rate cannot stop a creature both short and soon (see
   "Braking"); a game shapes the stop by changing the rate over time.
+- The spin servo turns the creature as a rigid body: a bent worm turns about its centre of mass,
+  not along its curve; it holds the world-frame spin, not the spin relative to a vortex.
+- The yield reads the last substep's contacts: the first substep of a contact is at full power,
+  and what a turning creature already carries (its angular momentum) hits at full power
+  whatever the yield (only `max_tip_speed` limits that).
 
 
 ## Quirks to design around
@@ -659,3 +804,9 @@ each other more, which a game would pay for any interaction.
 11. **A type edited after first use** needs `update_type()`; the 17th type is refused.
 12. **Shape-matched regions bend only at joints**: a long region is stiff; give a part
     several groups to make it bendable, or use LINKS.
+13. **The spin servo owns the spin**: while it is on, `set_damping()`'s angular part is ignored and
+    `twist()` / `twist_once()` add to what it holds against (it takes them back within its
+    acceleration). Stop it (`stop_spin_servo()`) to let a creature spin freely.
+14. **Contact ids follow the mirror**: a wall's or an obstacle's id is GooStatics' kernel id,
+    renumbered when a body comes or goes (the mirror is rebuilt); resolve it in the frame it is
+    read (`contacts()` does).
