@@ -1,7 +1,7 @@
 extends TestCase
 ## The cells example (examples/cells/): a top-down tank (a GooCellWorld2D inside walls with
-## a concave rock) of four creatures made of cells: a worm swimming by its pose wave and
-## steered toward waypoints, a blob turned by a twist and pushed by its thruster cells, a
+## a concave rock) of four creatures made of cells: a worm swimming by its swim drive under
+## a gentle pose wave and steered toward waypoints by the wave's bias, a blob turned by a twist and pushed by its thruster cells, a
 ## mixed-size creature from mixed.tres, a crawler of three shape-matched segments whose
 ## joints swing; the water swirls (per cell). They swim where they are sent, stay in one
 ## piece and out of the walls, their skins are drawn, the mouse drags one and R rebuilds.

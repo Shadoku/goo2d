@@ -57,8 +57,11 @@ type different `groups` to joint them; cells of two types meeting are a joint to
 
 **Muscles**: the **pose wave** (`set_pose_wave()`: the design bent along a curvature wave
 running head to tail; the swimmer's stroke; a curvature bias steers), **joint angles**,
-**radius muscles** (`set_muscles()`: a size scale per cell, the links following), **thrust**
-per cell along its heading (`set_cell_thrust()`), and whole-creature **push** and **twist**.
+**radius muscles** (`set_muscles()`: a size scale per cell, the links following), the **swim
+drive** (`set_swim()`: every cell pushed along its own forward, below), **thrust** per cell
+along its heading (`set_cell_thrust()`), and whole-creature **push** and **twist** (kept, or
+for one step: `push_once()`, `twist_once()`, `add_cell_forces_once()`). A creature's mean
+motion and rigid spin relative to the water can be **damped** (`set_damping()`).
 
 **Contacts**: a creature's outline cells collide with other creatures' outline cells
 (rigid, one pass a substep, a broad phase over creatures' boxes); every cell collides with
@@ -86,7 +89,8 @@ not sharing a neighbour, when asked), whose types' join layers match and that `m
 allows, are linked; joined creatures merge into one. Cells are added (`add_cell()`, eased in
 from 0.3 of their size over 0.5 s) and removed (`remove_cell()`) at any time.
 
-**Stepping**: per frame, in parallel per creature (`threads`, 4): forces, drag, rest values
+**Stepping**: per frame, in parallel per creature (`threads`; 0, the default, picks 1, 2 or 4
+by the live cells: "Threads" below): forces, drag, rest values
 (pose, joints, muscles), then 6 substeps of links, shape matching, wall and own contacts;
 contacts between creatures serially; velocities; breaks. Threaded is bit-identical to
 serial, and a replay is identical (tested).
@@ -113,9 +117,11 @@ serial, and a replay is identical (tested).
   `cells_parted(creature, uid_a, uid_b)`, `cells_joined(creature, uid_a, uid_b)`,
   `creature_split(parent, child)` (then `creature_spawned(child)`),
   `creatures_merged(into, from)`.
-- Exports: `threads`, `substeps`, `stretch_hz`, `bend_hz`, `body_mode`, `shape_stiffness`,
+- Exports: `threads` (0: by size; `threads_in_use()` says what the last step ran on),
+  `substeps`, `stretch_hz`, `bend_hz`, `body_mode`, `shape_stiffness`,
   `self_collision`, `gravity_scale` (1: GooTuning's gravity; 0 top-down), `drag_enabled`,
-  `drag_normal`, `drag_linear_normal`, `drag_ratio`, `drag_density`, `current`,
+  `drag_normal`, `drag_linear_normal`, `drag_ratio`, `drag_linear_tangent` (below 0:
+  `drag_linear_normal / drag_ratio`), `drag_density`, `current`,
   `break_force`, `break_leaves_out_own_share`, `draw_skins`, `skin_material`,
   `draw_borders`, `border_color`, `border_width`, `default_type`.
 
@@ -124,12 +130,17 @@ serial, and a replay is identical (tested).
 `velocities()`, `radii()`, `uids()`, `type_slots()`, `outline()`, `cell_index(uid)`,
 `cell_position(i)`, `cell_angle(i)`, `cell_type(i)`, `is_boundary(i)`, `cell_at(point)`;
 `push(acceleration)`, `twist(angular_acceleration)`, `set_cell_thrust(i, force)`,
-`set_cell_force(i, force)`, `set_muscles(scales)`, `set_pose_wave(slope, wavelength,
+`set_cell_force(i, force)`, `set_swim(acceleration, pulse = 0.3)`, `stop_swim()`,
+`push_once(acceleration)`, `twist_once(angular_acceleration)`,
+`add_cell_forces_once(forces)`, `set_damping(linear, angular)`, `set_muscles(scales)`, `set_pose_wave(slope, wavelength,
 frequency, bias, envelope)`, `stop_wave()`, `set_joint_angle(type_a, group_a, type_b,
 group_b, angle)`, `set_water(velocities)`, `set_current(v)`, `translate()`,
 `set_velocity()`, `add_cell()`, `remove_cell(uid)`; `design`, `axis` (its forward at
 spawn), `data` (a dictionary for the game; copied to split parts). Forces set stay until
-set again. Cell indices change at every topology change: keep uids.
+set again, but the `_once` ones, which add to the next step's and clear themselves (calls
+before a step add up; `add_cell_forces_once()` counts as outside the creature for the break
+test, as `set_cell_force()` does). A split part keeps its parent's swim drive and damping.
+Cell indices change at every topology change: keep uids.
 
 `GooCellDesign` (a Resource, `.tres`, editable in the inspector): `types`
 (`Array[GooCellType]`), parallel arrays `positions`, `radii`, `cell_types`, `groups`,
@@ -140,7 +151,8 @@ overlaps, unlinked cells), the builders `hex_worm(long, wide, radius)` and
 
 `GooCellType` (a Resource): `name`, `color`, `mass_factor`, `radius_factor`, `stretch`,
 `bend`, `break_factor`, `body`, `collides`, `collides_walls`, `self_collides`,
-`contact_pad`, `join_layer`, `join_mask`, `behaviours` (a free dictionary for a game's
+`contact_pad`, `join_layer`, `join_mask`, `swim_weight` (its cells' share of the swim drive,
+1), `behaviours` (a free dictionary for a game's
 thrusters, spikes, sensors...). The kernel has 16 type slots; a world gives each distinct
 type one the first time it is used (a 17th is an error and gets the default's).
 
@@ -151,7 +163,9 @@ var world := GooCellWorld2D.new()
 world.gravity_scale = 0.0
 add_child(world)
 var worm := world.spawn(GooCellDesign.hex_worm(24, 5, 14.0), Transform2D(0.0, Vector2(600, 400)))
-worm.set_pose_wave(1.0, worm.design.length(), 1.0)   # swims along +x
+worm.set_pose_wave(0.3, worm.design.length(), 1.0)   # a gentle stroke, to show it swims
+worm.set_swim(55.0, 0.3)                              # the drive: about 160 px/s along +x
+# let go: worm.stop_swim(); worm.stop_wave(); worm.set_damping(1.5, 1.5)
 world.water_source = my_flow_field.velocities_at        # water per cell, one call a frame
 ```
 
@@ -172,6 +186,10 @@ at unit 1, scaled by it; designs' radii are canvas px as drawn (a game at unit 0
 | `self_collision` | FAR | a bent worm never folds through itself, +0.2 ms at 30 × 150 on 4 threads |
 | `drag_normal`, `drag_linear_normal` | 0.1, 60 px/s | the fluid game's numbers (src/game_settings.gd) |
 | **`drag_ratio`** | **20** | the tangential drag is the normal ÷ this. A 24 × 5 worm swims 0.168 / 0.188 / 0.222 / 0.241 body lengths a cycle at ratios 7.5 / 10 / 20 / 40 (shape matching; oriented links 0.178 / 0.197 / 0.228 / 0.245). The fluid game's rings use 7.5-10; 20 gives undulation a fifth more and is still a modest anisotropy (real slender swimmers have about 2, but their bodies are continuous; here the outline is a polygon of cells and the along-edge drag sees its bumps). Above 20 the gain flattens and a creature slides sideways more freely. A knob: a game wanting the rings' feel sets 10 |
+| `drag_linear_tangent` | −1 (= `drag_linear_normal / drag_ratio`, 3 px/s) | a brake against the glide of its own; it brakes swimming by the drive as much (below), so `set_damping()` is the better brake |
+| swim `pulse` | 0.3 | the drive's ripple with the stroke: organic, never a jerk; 0 steady |
+| `swim_weight` | 1 | a type's share; the creature's whole push stays what `set_swim()` asks |
+| `threads` | 0 | by size; 4 explicitly was the old default (below) |
 | `break_force` | INF | games set it; with the own share left out, one value separates crashes from swimming (below) |
 | `break_leaves_out_own_share` | on | without it, swimming loads links more than a 600 px/s crash (the exploration's quirk 6) |
 | `CAPTURE` | 4 px at unit 1 | a retopology joins cells this close to touching |
@@ -207,7 +225,7 @@ threads: 3.18 ms against 2.88 without water); the uniform per-creature current
 (`set_current()`) costs nothing extra.
 
 
-## Regions, joints and swimming
+## Swimming, regions and joints
 
 `tools/cell_world_bench.gd -- --swim-test` (a 24 × 5 worm alone, 14 px cells, slope 1, a body
 length's wave, 1 Hz, drag ratio 20, 8 s after 2 s):
@@ -223,11 +241,134 @@ by side (a spine row of another type between two strips) swims like one region. 
 of three segments with its joints set to ±0.5 rad turns its segments −0.23, 0.27, −0.23 rad
 (relative 0.50 and −0.50).
 
+### The swim drive
+
+`set_swim(acceleration, pulse)` pushes every cell along its **own** forward: the creature's
+forward (its `axis`) turned by the cell's angle now, which for shape-matched cells is their
+neighbourhood's fit plus the bent pose's own turn at the cell. So the push follows the
+body's curve: a body bent by the pose wave's curvature bias steers itself with no twist.
+Each cell's force is acceleration × M / Σ(mᵢ wᵢ pᵢ) × mᵢ wᵢ pᵢ, with wᵢ its type's
+`swim_weight` and pᵢ = 1 + pulse × sin(the pose wave's phase at the cell), so the forces'
+magnitudes always sum to the commanded acceleration × the creature's mass M (a spine of
+weight 4 and flanks of weight 0 push exactly as hard as an even body, from fewer cells), and
+the pulse only moves the push along the body, head to tail, in step with the stroke (it
+eases in with the wave; without a pose wave the drive is steady). Negative swims backward.
+The drive is not contact for the break test (its loads join the creature's own envelope).
+Cargo tests check the sum, the weights, a cell's angle, and threaded == serial.
+
+The purpose: the undulation becomes mostly a visual indicator with some organic variation,
+the drive doing the work. `tests/integration/test_goo_cell_swim.gd`, the 24 × 5 worm (14 px
+cells, drag ratio 20, a body length's wave at 1 Hz, 8 s after 2 s):
+
+| | px/s |
+|---|---|
+| the full stroke alone (slope 1, as before) | 152.6 |
+| the toned-down stroke alone (slope 0.3) | 27.7 |
+| the drive alone (55 px/s², pulse 0.3) | 154.1 |
+| **both** (slope 0.3 + 55 px/s²) | **162.5** |
+| the drive alone at −55 px/s² | −154.0 (backward) |
+
+The drive's share of "both" depends on how it is counted, since the drag is not linear: 95 %
+by the drive alone's speed, 83 % by what the stroke adds on top of it, **86 % by thrust** (the
+slope-0.3 stroke alone swims as fast as a drive of 9.1 px/s² would: 55 / (55 + 9.1)). The
+worm is far more efficient driven than undulating: 55 px/s² does what the full stroke did.
+(At higher drives the stroke costs speed: 200 px/s² alone 458 px/s, with slope 0.3 445.)
+
+Turning by the curvature bias alone (both as above, no twist; turn rate over the path):
+
+| bias (1/px) | rad/s | px/s along the path | the drive alone, bent: rad/s at px/s |
+|---|---|---|---|
+| 0.0005 | 0.072 | 161 | 0.065 at 153 |
+| 0.001 | 0.141 | 158 | 0.130 at 150 |
+| 0.002 | 0.274 | 145 | 0.253 at 137 |
+| 0.004 | 0.531 | 109 | 0.473 at 101 |
+| −0.002 | −0.268 | | |
+
+It turns at about its speed × the bias (the path follows the body's curvature), slowing as
+it bends harder (the bent body's drag). The pose wave's curvature clamp (quirk 9) caps the
+bias at about 1 / (2 × the half width): a 5-wide worm of 14 px cells near 0.008 /px.
+
+### Braking
+
+A worm let go at full speed glides far: the along-edge drag is a twentieth of the across-edge
+drag, and the drive is nearly all along. Driven at 162 px/s (172 px/s at the moment it is let
+go), drive and stroke stopped: 590 px before it is under a tenth of its speed, still 14 px/s
+after 10 s (602 px).
+
+`set_damping(linear, angular)` damps the creature's mean velocity and its rigid spin about its
+centre, both relative to the water at its cells (the mass-weighted mean of v − water, and the
+spin of that about the centre of mass), by exp(−rate × h) every substep: an exact exponential
+decay, stable at any rate, with no force that could overshoot. The cells' motion relative to
+that rigid motion (the stroke, a wobble) is untouched: a cargo test runs a pose wave under
+damping 10 and its bend is within 10 % of the undamped one, and a creature moving with the
+water feels nothing. It damps the creature's own swimming too while it is set, so a game sets
+it when it lets go and clears it when it swims again. The worm above, let go with damping
+set (linear and angular alike):
+
+| damping (1/s) | under a tenth of its speed | under 5 px/s | after 10 s |
+|---|---|---|---|
+| 0 | 9.25 s, 590 px | never | 602 px, 14.2 px/s |
+| 0.5 | 3.03 s, 198 px | 4.70 s, 214 px | 221 px |
+| 1.0 | 1.82 s, 119 px | 2.82 s, 129 px | 133 px |
+| 1.5 | 1.30 s, 86 px | 2.02 s, 92 px | 95 px |
+| 2.0 | 1.02 s, 67 px | 1.57 s, 72 px | 74 px |
+| 3.0 | 0.70 s, 46 px | 1.08 s, 50 px | 51 px |
+| 4.0 | 0.55 s, 36 px | 0.83 s, 38 px | 39 px |
+
+An exponential decay stops in about v / k px and takes ln(v / v_stop) / k s, so "about 150 px
+**and** 1.5 s" from 170 px/s cannot both be met by one rate: about 1 /s gives the distance
+(119 px to a tenth, 133 px in all) but takes 1.8-2.8 s; about 2 /s gives the time (1.57 s to
+5 px/s) but stops in 72 px. A game wanting both can raise the rate as the creature slows (a
+decay with a constant-deceleration part), e.g. 1 /s for the first half second and 3 /s after;
+that is the game's to set, not built here.
+
+`drag_linear_tangent` (the along-edge linear drag on its own, px/s; −1, the default, keeps
+`drag_linear_normal / drag_ratio` = 3 px/s, so nothing changes) is the other brake, and a
+poorer one: it is always on, so it brakes the drive as much. The same drive (55 px/s²), no
+damping:
+
+| along-edge linear drag | swims | let go: under 5 px/s | after 10 s |
+|---|---|---|---|
+| 3 px/s (the default) | 172 px/s | never | 602 px, 14.2 px/s |
+| 10 px/s | 133 px/s | 8.57 s, 325 px | 331 px |
+| 20 px/s | 96 px/s | 5.28 s, 157 px | 167 px |
+| 40 px/s | 58 px/s | 2.60 s, 55 px | 61 px |
+
+### Two kernel bugs
+
 Two kernel bugs were found and fixed here (both cargo-tested): a shape-matched cell with
 fewer than two neighbours of its region kept its angle forever and pinned the creature's
 turn through its joint links (a blob with a rim of thruster cells could not be turned); and
 under the pose wave a shape-matched cell's angle left out the bent pose's own turn, so joint
 links fought the stroke (that three-region worm crabbed sideways, 1000 px/s along a wall).
+
+
+## Threads
+
+`threads = 0` (the world's default since this stage; it was 4) picks the thread pool every step
+from the live cells: 1 below 800, 2 below 1600, else 4 (`cells.rs`' `AUTO_THREADS`), at most one
+per live creature (creatures are what run in parallel) and the machine's cores. Pools made for
+other counts are kept, so switching costs nothing; an explicit count works as before. Threaded
+is bit-identical to serial, so the choice never changes what happens. Measured with
+`tools/cell_world_bench.gd` (medians, ms a frame, 4 cores, one run each; a second run of 7 × 150
+gave collide 0.80 / 0.74 / 0.70, swim 1.36 / 1.15 / 1.02: noise is about ±0.15 ms):
+
+| creatures × cells | live cells | collide 1 / 2 / 4 threads | swim 1 / 2 / 4 threads | auto |
+|---|---|---|---|---|
+| 2 × 100 | 200 | **0.11** / 0.28 / 0.50 | **0.20** / 0.38 / 0.52 | 1 |
+| 4 × 125 | 500 | **0.33** / 0.53 / 0.96 | **0.60** / 0.63 / 1.05 | 1 |
+| 7 × 150 | 1050 | 0.70 / 0.73 / 0.86 | 1.33 / **1.16** / 1.27 | 2 |
+| 10 × 150 | 1500 | 1.03 / 1.04 / **0.88** | 1.95 / 1.41 / **1.27** | 2 |
+| 13 × 150 | 1950 | 1.34 / **1.15** / **1.15** | 2.61 / **1.85** / 1.92 | 4 |
+| 20 × 150 | 3000 | 2.27 / 1.69 / **1.48** | 4.61 / 2.86 / **2.38** | 4 |
+| 30 × 150 | 4500 | 3.73 / 2.46 / **1.85** | 7.12 / 4.29 / **3.04** | 4 |
+
+Below about 800 cells a pool costs more than it saves (two blobs of 100 cells: 0.11 ms on one
+thread, 0.50 on four); from about 1500 four threads win and keep winning. Between, two and four
+are within the noise. The default became 0 because a game with a few small creatures (the
+example's 287 cells) was paying 0.3-0.5 ms a frame for threads, and at the sizes where threads
+pay the choice is what 4 was. One machine: a game targeting other hardware can measure and set
+an explicit count.
 
 
 ## Breaking
@@ -465,7 +606,10 @@ each other more, which a game would pay for any interaction.
 - The skin is not clipped to the walls (bounded above) and has no per-cell detail (a cell
   never squashes; only the aggregate bends).
 - Water is sampled at cell centres once a frame; drag acts on the outline only.
-- One machine (4 cores); timings are wall clock, one run each, not averaged.
+- One machine (4 cores); timings are wall clock, one run each, not averaged (the threads table
+  shows about ±0.15 ms of noise between runs).
+- Damping is an exponential decay: one rate cannot stop a creature both short and soon (see
+  "Braking"); a game shapes the stop by changing the rate over time.
 
 
 ## Quirks to design around
@@ -489,7 +633,8 @@ each other more, which a game would pay for any interaction.
 8. **Swimming has a sweet spot**: speed per cycle falls with frequency (a 30 × 5 worm in the
    exploration: 0.270 at 0.5 Hz, 0.126 at 1 Hz, 0.077 at 2 Hz),
    falls for two-row bodies and is poor for irregular mixed-size bodies (0.016 bl/cycle in the
-   exploration); blobs swim by thrust, not undulation.
+   exploration); blobs swim by thrust, not undulation. The swim drive (`set_swim()`) sidesteps
+   all of this: it is as fast at any stroke, and the stroke can stay a gentle show of it.
 9. **Commanded curls are clamped**: the pose wave never squeezes a side below half its length.
 10. **The skin may cover a wall by up to about 0.43 radius** at a concave corner.
 11. **A type edited after first use** needs `update_type()`; the 17th type is refused.

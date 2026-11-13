@@ -119,6 +119,42 @@ func push(acceleration: Vector2) -> void:
 func twist(angular_acceleration: float) -> void:
 	_c().twist(id, angular_acceleration)
 
+## The swim drive, kept until set again (or stop_swim()): every cell pushed along its own
+## forward (the creature's forward turned by the cell's angle now), so the push follows the
+## body's curve and a bent body steers itself. The forces' magnitudes sum to
+## `acceleration` (px/s²; negative swims backward) × mass(), shared by each cell's mass ×
+## its type's swim_weight, and ripple head to tail by ± `pulse` (0..1) in step with the
+## pose wave's phase at each cell (steady without a pose wave). docs/cells.md, "Swimming".
+func set_swim(acceleration: float, pulse: float = 0.3) -> void:
+	_c().set_swim(id, acceleration, pulse, axis)
+
+## Stops the swim drive.
+func stop_swim() -> void:
+	_c().set_swim(id, 0.0, 0.0, axis)
+
+## push() for the next step only, on top of the kept push (calls before a step add up).
+func push_once(acceleration: Vector2) -> void:
+	_c().push_once(id, acceleration)
+
+## twist() for the next step only, on top of the kept twist (calls before a step add up).
+func twist_once(angular_acceleration: float) -> void:
+	_c().twist_once(id, angular_acceleration)
+
+## A force on each cell (by index; fewer: the rest none) for the next step only, on top of
+## set_cell_force()'s (calls before a step add up). Counts as outside the creature for the
+## break test.
+func add_cell_forces_once(forces: PackedVector2Array) -> void:
+	_c().add_cell_forces_once(id, forces)
+
+## Damping of its mean velocity (`linear`) and of its rigid spin about its centre
+## (`angular`), both 1/s and relative to the water at its cells, kept until set again:
+## each decays by exp(−rate × time), exactly (no overshoot at any rate); its cells' motion
+## relative to that (the stroke) is left alone. A brake against the glide when a swimmer
+## lets go (2-3 /s stops a fast worm within about 1.5 s); 0, the default, none. It damps
+## its own swimming too while set.
+func set_damping(linear: float, angular: float) -> void:
+	_c().set_damping(id, linear, angular)
+
 ## Cell `index` pushes `force` along its heading (cell_angle()), kept until set again.
 func set_cell_thrust(index: int, force: float) -> void:
 	_c().set_thrust_one(id, index, force)

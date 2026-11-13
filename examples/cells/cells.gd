@@ -2,8 +2,9 @@ class_name CellsExample
 extends Node2D
 ## The cells example's scene: a top-down tank (a GooCellWorld2D with gravity_scale 0 inside
 ## walls, a concave rock in the middle) of creatures made of cells, one disc particle each
-## (docs/cells.md): a worm 24 × 5 swimming by its pose wave alone, steered toward points
-## round the tank (WORM), a blob pushed by a ring of thruster cells at its back and turned
+## (docs/cells.md): a worm 24 × 5 driven by its swim drive (its spine row pushing hardest)
+## with a gentle pose wave as its visible stroke, steered toward points round the tank by
+## the wave's curvature bias alone (WORM), a blob pushed by a ring of thruster cells at its back and turned
 ## by a twist (BLOB), a mixed-size creature from a saved design (mixed.tres) drifting, and
 ## a crawler of three shape-matched segments whose two joints swing (CRAWLER). The water
 ## turns slowly round the tank's middle (the world's water_source, per cell). Drag a
@@ -19,9 +20,14 @@ const BLOB_AT := Vector2(1380.0, 820.0)
 const MIXED_AT := Vector2(1480.0, 300.0)
 const CRAWLER_AT := Vector2(560.0, 840.0)
 ## The worm's stroke: slope, frequency (Hz), and how hard it steers (curvature per rad).
-const WORM_SLOPE: float = 1.0
+## A toned-down stroke: the swim drive does most of the work, the wave shows it.
+const WORM_SLOPE: float = 0.3
 const WORM_HZ: float = 0.8
 const WORM_STEER: float = 0.0025
+## The worm's swim drive (px/s²), its ripple with the stroke, and its spine row's share.
+const WORM_SWIM: float = 55.0
+const WORM_PULSE: float = 0.3
+const SPINE_SWIM: float = 2.0
 ## The blob's thrusters (force per cell, × its mass) and turning (rad/s² per rad of error).
 const THRUST: float = 600.0
 const TURN_GAIN: float = 2.5
@@ -72,6 +78,7 @@ func _exit_tree() -> void:
 func _ready() -> void:
 	body_type = _type(&"body", Color(0.36, 0.78, 0.5))
 	spine_type = _type(&"spine", Color(0.35, 0.6, 0.95))
+	spine_type.swim_weight = SPINE_SWIM
 	thruster_type = _type(&"thruster", Color(0.98, 0.55, 0.25))
 	thruster_type.behaviours = {"thrust": THRUST}
 	segment_type = _type(&"segment", Color(0.75, 0.55, 0.95))
@@ -146,6 +153,7 @@ func build() -> void:
 		if blob.cell_type(i) == thruster_type:
 			_thrusters.append(i)
 	worm.set_pose_wave(WORM_SLOPE, worm.design.length(), WORM_HZ)
+	worm.set_swim(WORM_SWIM, WORM_PULSE)
 	_update_label()
 
 ## The waypoint a swimmer heads for now.
@@ -203,4 +211,4 @@ func _update_label() -> void:
 	for c: GooCellCreature in _world.creatures():
 		cells += c.cell_count()
 	_label.text = "Cells: creatures of one disc particle per cell (GooCellWorld2D)    Creatures: %d    Cells: %d\n" % [_world.creatures().size(), cells] \
-		+ "Worm: pose wave    Blob: thrusters    Mixed sizes: mixed.tres    Crawler: three jointed segments    The water swirls    Drag a creature    R: rebuild"
+		+ "Worm: swim drive, a gentle pose wave    Blob: thrusters    Mixed sizes: mixed.tres    Crawler: three jointed segments    The water swirls    Drag a creature    R: rebuild"

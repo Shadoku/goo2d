@@ -61,6 +61,10 @@ pub const EVENT_SPLIT: i32 = 2;
 
 pub const TYPES: usize = 16;
 
+/// threads = 0: (live cells from, threads), measured with tools/cell_world_bench.gd
+/// (docs/cells.md, "Threads").
+pub const AUTO_THREADS: [(usize, usize); 3] = [(0, 1), (800, 2), (1600, 4)];
+
 /// A type's body mode: the options' bend_mode (TypeParams.body's default).
 pub const BODY_DEFAULT: u8 = 255;
 
@@ -135,11 +139,13 @@ pub struct TypeParams {
     pub walls: bool,
     /// The skin's colour of this type's cells (r, g, b, a).
     pub color: [f32; 4],
+    /// Its cells' share of the swim drive (× their mass; 1 a plain cell, 0 none).
+    pub swim: f32,
 }
 
 impl Default for TypeParams {
     fn default() -> Self {
-        TypeParams { stretch: 1.0, bend: 1.0, brk: 1.0, self_collide: false, join_mask: 0xffff, pad: 0.0, body: BODY_DEFAULT, collide: true, walls: true, color: [0.35, 0.75, 0.45, 1.0] }
+        TypeParams { stretch: 1.0, bend: 1.0, brk: 1.0, self_collide: false, join_mask: 0xffff, pad: 0.0, body: BODY_DEFAULT, collide: true, walls: true, color: [0.35, 0.75, 0.45, 1.0], swim: 1.0 }
     }
 }
 
@@ -332,6 +338,19 @@ pub struct Wave {
 }
 
 
+/// The swim drive: every cell pushed along its own forward (`axis`, the creature's forward
+/// in its design frame, turned by the cell's angle), so the thrust follows the body's curve.
+/// Each cell's force is acc × M / Σ(m w p) × m w p, with w its type's swim weight and
+/// p = 1 + pulse × sin(the pose wave's phase at the cell): the forces' magnitudes always
+/// sum to acc × the creature's mass, and the pulse only moves the push along the body in
+/// step with the stroke.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Swim {
+    pub acc: f32,
+    pub pulse: f32,
+    pub axis: Vector2,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Cross {
     pub a: u32,
@@ -390,6 +409,19 @@ pub struct Body {
     pub colliders: Vec<u32>,
     pub push: Vector2,
     pub twist: f32,
+    /// One-step forces: added to the next step's, then cleared (push_once, twist_once,
+    /// per-cell forces; the last count as outside the creature, as user_force does).
+    pub push_once: Vector2,
+    pub twist_once: f32,
+    pub force_once: Vec<Vector2>,
+    /// push + push_once for this frame's substeps.
+    pub push_frame: Vector2,
+    pub swim: Swim,
+    /// Damping of the creature's mean velocity and rigid spin relative to the water (1/s),
+    /// an exact exponential decay per substep; the cells' motion relative to that rigid
+    /// motion (the stroke, a wobble) is left alone.
+    pub damp_lin: f32,
+    pub damp_ang: f32,
     pub wave: Wave,
     pub time: f32,
     pub lo: Vector2,
@@ -442,6 +474,8 @@ pub struct Cells {
     next_wall_id: i64,
     pool: Option<rayon::ThreadPool>,
     pool_threads: usize,
+    /// Pools made for other thread counts, kept for the automatic choice to switch back to.
+    spare_pools: Vec<rayon::ThreadPool>,
     pub grid_cell: f32,
     pub stats: Stats,
     pub cross: Vec<Cross>,
@@ -471,7 +505,7 @@ pub struct Stats {
 
 impl Default for Cells {
     fn default() -> Self {
-        Cells { opt: Opt::default(), bodies: Vec::new(), statics: Vec::new(), next_wall_id: -1, pool: None, pool_threads: 1, grid_cell: 64.0, stats: Stats::default(), cross: Vec::new(), events: Vec::new(), next_uid: 0, frame: 0, ghosts: Default::default() }
+        Cells { opt: Opt::default(), bodies: Vec::new(), statics: Vec::new(), next_wall_id: -1, pool: None, pool_threads: 1, spare_pools: Vec::new(), grid_cell: 64.0, stats: Stats::default(), cross: Vec::new(), events: Vec::new(), next_uid: 0, frame: 0, ghosts: Default::default() }
     }
 }
 
@@ -1161,9 +1195,13 @@ impl Body {
         self.lo = lo;
         self.hi = hi;
         self.vmax = vmax.sqrt();
-        // Frame forces.
+        // Frame forces (and the one-step ones, used up here).
+        let once = self.force_once.len() == n;
         for i in 0..n {
             let mut f = self.user_force[i];
+            if once {
+                f += self.force_once[i];
+            }
             if f != Vector2::ZERO {
                 self.contact = true;
             }
@@ -1173,10 +1211,18 @@ impl Body {
             }
             self.force[i] = f;
         }
-        if self.twist != 0.0 {
+        self.force_once.clear();
+        if self.swim.acc != 0.0 {
+            self.swim_forces(opt);
+        }
+        self.push_frame = self.push + self.push_once;
+        self.push_once = Vector2::ZERO;
+        let twist = self.twist + self.twist_once;
+        self.twist_once = 0.0;
+        if twist != 0.0 {
             let c = self.center();
             for i in 0..n {
-                self.force[i] += perp(self.pos[i] - c) * (self.mass[i] * self.twist);
+                self.force[i] += perp(self.pos[i] - c) * (self.mass[i] * twist);
             }
         }
         if opt.tension != 0.0 {
@@ -1295,6 +1341,73 @@ impl Body {
         for l in self.links.iter_mut() {
             l.f_frame = 0.0;
             l.t_frame = 0.0;
+        }
+    }
+
+    /// The swim drive's forces (see `Swim`), added to `force`.
+    fn swim_forces(&mut self, opt: &Opt) {
+        let n = self.n;
+        let sw = self.swim;
+        let wv = self.wave;
+        let pulse = if wv.mode == WAVE_POSE && wv.omega != 0.0 && self.rest_local.len() == n { sw.pulse.clamp(0.0, 1.0) * (wv.age / 0.5).min(1.0) } else { 0.0 };
+        if self.cs.len() < n {
+            self.cs.resize(n, (0.0, 0.0));
+        }
+        // Each cell's weight × its pulse in cs.0 (cs is scratch until the substeps).
+        let (mut mass, mut sum) = (0.0f32, 0.0f32);
+        for i in 0..n {
+            let w = opt.types[self.typ[i] as usize].swim.max(0.0);
+            let p = if pulse != 0.0 { 1.0 + pulse * (wv.k * dot(self.rest_local[i], wv.axis) + wv.phase).sin() } else { 1.0 };
+            let x = self.mass[i] * w * p;
+            self.cs[i].0 = x;
+            mass += self.mass[i];
+            sum += x;
+        }
+        if sum <= 0.0 {
+            return;
+        }
+        let scale = sw.acc * mass / sum;
+        let base = sw.axis.y.atan2(sw.axis.x);
+        for i in 0..n {
+            let x = self.cs[i].0;
+            if x == 0.0 {
+                continue;
+            }
+            let a = base + self.th[i];
+            self.force[i] += Vector2::new(a.cos(), a.sin()) * (scale * x);
+        }
+    }
+
+    /// Damps the mean velocity and the rigid spin about the centre of mass relative to the
+    /// water by exp(−rate × h) (damp_lin, damp_ang); the rest of each cell's motion is kept.
+    fn damp_rigid(&mut self, current: Vector2, h: f32) {
+        let n = self.n;
+        if n == 0 {
+            return;
+        }
+        let c = self.center();
+        let (mut m, mut v) = (0.0f32, Vector2::ZERO);
+        for i in 0..n {
+            m += self.mass[i];
+            v += (self.vel[i] - self.water_at(i, current)) * self.mass[i];
+        }
+        if m <= 0.0 {
+            return;
+        }
+        let v = v / m;
+        let (mut l, mut inertia) = (0.0f32, 0.0f32);
+        for i in 0..n {
+            let p = self.pos[i] - c;
+            l += self.mass[i] * cross(p, self.vel[i] - self.water_at(i, current) - v);
+            inertia += self.mass[i] * lsq(p);
+        }
+        let spin = if inertia > 0.0 { l / inertia } else { 0.0 };
+        let el = 1.0 - (-self.damp_lin.max(0.0) * h).exp();
+        let ea = 1.0 - (-self.damp_ang.max(0.0) * h).exp();
+        let (dv, dw) = (v * el, spin * ea);
+        for i in 0..n {
+            self.vel[i] -= dv + perp(self.pos[i] - c) * dw;
+            self.om[i] -= dw;
         }
     }
 
@@ -1504,7 +1617,10 @@ impl Body {
         if opt.drag.enabled && opt.drag_substep {
             self.apply_drag(&opt.drag, opt.current, h);
         }
-        let g = opt.gravity + self.push;
+        if self.damp_lin > 0.0 || self.damp_ang > 0.0 {
+            self.damp_rigid(opt.current, h);
+        }
+        let g = opt.gravity + self.push_frame;
         for i in 0..self.n {
             let v = self.vel[i] + (g + (self.force[i] + self.drag_f[i]) * self.w[i]) * h;
             self.vel[i] = v;
@@ -1805,7 +1921,7 @@ impl Body {
         for (k, &c) in cells.iter().enumerate() {
             map[c] = k as u32;
         }
-        let mut b = Body { alive: true, n: cells.len(), wave: self.wave, time: self.time, ..Default::default() };
+        let mut b = Body { alive: true, n: cells.len(), wave: self.wave, time: self.time, swim: self.swim, damp_lin: self.damp_lin, damp_ang: self.damp_ang, ..Default::default() };
         macro_rules! take {
             ($f:ident) => {
                 b.$f = cells.iter().map(|&c| self.$f[c]).collect();
@@ -1925,14 +2041,50 @@ impl Body {
 }
 
 impl Cells {
+    /// The threads the step uses; 0: chosen every step from the live cells and creatures
+    /// (auto_threads()).
     pub fn set_threads(&mut self, threads: usize) {
-        let threads = threads.max(1);
         self.opt.threads = threads;
+        if threads > 0 {
+            self.use_threads(threads);
+        }
+    }
+
+    /// The threads the step runs on now.
+    pub fn threads_in_use(&self) -> usize {
+        self.pool_threads
+    }
+
+    fn use_threads(&mut self, threads: usize) {
+        let threads = threads.max(1);
         if threads == self.pool_threads {
             return;
         }
+        if let Some(p) = self.pool.take() {
+            self.spare_pools.push(p);
+        }
         self.pool_threads = threads;
-        self.pool = if threads > 1 { rayon::ThreadPoolBuilder::new().num_threads(threads).build().ok() } else { None };
+        self.pool = if threads > 1 {
+            match self.spare_pools.iter().position(|p| p.current_num_threads() == threads) {
+                Some(k) => Some(self.spare_pools.swap_remove(k)),
+                None => rayon::ThreadPoolBuilder::new().num_threads(threads).build().ok(),
+            }
+        } else {
+            None
+        };
+    }
+
+    /// threads = 0's choice: by the live cells (AUTO_THREADS, measured: docs/cells.md,
+    /// "Threads"), at most one per live creature (creatures are what run in parallel) and
+    /// the machine's cores.
+    pub fn auto_threads(cells: usize, creatures: usize, cores: usize) -> usize {
+        let mut t = 1;
+        for &(at, threads) in AUTO_THREADS.iter() {
+            if cells >= at {
+                t = threads;
+            }
+        }
+        t.min(creatures.max(1)).min(cores.max(1))
     }
 
     fn for_each<F: Fn(&mut Body) + Sync + Send>(&mut self, f: F) {
@@ -2007,6 +2159,12 @@ impl Cells {
 
     pub fn step(&mut self, dt: f32) {
         let t0 = Instant::now();
+        if self.opt.threads == 0 {
+            let live = self.bodies.iter().filter(|b| b.alive);
+            let (cells, creatures) = live.fold((0, 0), |(c, k), b| (c + b.n, k + 1));
+            let cores = std::thread::available_parallelism().map(|x| x.get()).unwrap_or(1);
+            self.use_threads(Cells::auto_threads(cells, creatures, cores));
+        }
         let opt = self.opt.clone();
         let cell = self.grid_cell;
         {
@@ -3040,6 +3198,217 @@ mod tests {
         };
         assert_eq!(run(true), 0);
         assert!(run(false) > 0);
+    }
+
+    /// A 12 × 3 worm along +x in still water, drag and gravity off, at GooCellWorld2D's
+    /// stiffnesses.
+    fn open_worm(cl: &mut Cells, types: &[u8]) -> usize {
+        cl.opt.drag.enabled = false;
+        cl.opt.bend_mode = BEND_SHAPE;
+        cl.opt.stretch_hz = 60.0;
+        cl.opt.bend_hz = 40.0;
+        let d = worm_design(12, 3, 7.0, Vector2::ZERO);
+        let t: Vec<u8> = (0..d.len()).map(|i| types.get(i % types.len().max(1)).copied().unwrap_or(0)).collect();
+        cl.add_creature(&d, &vec![7.0; d.len()], &t)
+    }
+
+    #[test]
+    fn the_swim_drive_sums_to_the_commanded_acceleration() {
+        // Straight, steady: every cell pushed along +x, a × its mass; one step's momentum.
+        let mut cl = Cells::default();
+        let c = open_worm(&mut cl, &[0]);
+        cl.bodies[c].swim = Swim { acc: 300.0, pulse: 0.3, axis: Vector2::new(1.0, 0.0) };
+        cl.step(1.0 / 60.0);
+        let v = cl.bodies[c].velocity();
+        assert!((v.x - 5.0).abs() < 0.01 && v.y.abs() < 0.01, "a step at 300 px/s²: {:?}", v);
+        // Under a pose wave with a pulse: the forces' magnitudes still sum to a × M, and
+        // the pulse moves the push along the body (cells differ by more than 1.3:1).
+        cl.bodies[c].wave = Wave { mode: WAVE_POSE, amp: 0.3, k: std::f32::consts::TAU / 168.0, omega: std::f32::consts::TAU, axis: Vector2::new(1.0, 0.0), half_width: 10.0, bias: 0.0, envelope: 0.6, phase: 0.0, age: 1.0 };
+        for f in 0..40 {
+            cl.step(1.0 / 60.0);
+            let b = &cl.bodies[c];
+            let total: f32 = b.force.iter().map(|f| f.length()).sum();
+            let want = 300.0 * b.total_mass();
+            assert!((total - want).abs() < 1e-3 * want, "frame {}: Σ|f| {} against {}", f, total, want);
+            let per: Vec<f32> = (0..b.n).map(|i| b.force[i].length() / b.mass[i]).collect();
+            let (lo, hi) = per.iter().fold((f32::INFINITY, 0.0f32), |(a, z), &x| (a.min(x), z.max(x)));
+            assert!(hi > 1.3 * lo, "the pulse ripples: {} .. {}", lo, hi);
+        }
+        // Backward.
+        let mut cl = Cells::default();
+        let c = open_worm(&mut cl, &[0]);
+        cl.bodies[c].swim = Swim { acc: -120.0, pulse: 0.0, axis: Vector2::new(1.0, 0.0) };
+        cl.step(1.0 / 60.0);
+        assert!((cl.bodies[c].velocity().x + 2.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn swim_weights_share_the_drive_and_a_turned_cell_pushes_its_own_way() {
+        let mut cl = Cells::default();
+        cl.opt.types[1].swim = 3.0;
+        cl.opt.types[2].swim = 0.0;
+        let c = open_worm(&mut cl, &[0, 1, 2]);
+        cl.bodies[c].swim = Swim { acc: 100.0, pulse: 0.0, axis: Vector2::new(1.0, 0.0) };
+        cl.step(1.0 / 60.0);
+        let b = &cl.bodies[c];
+        let per = |t: u8| -> f32 { (0..b.n).filter(|&i| b.typ[i] == t).map(|i| b.force[i].x / b.mass[i]).sum::<f32>() / (0..b.n).filter(|&i| b.typ[i] == t).count() as f32 };
+        assert!((per(1) / per(0) - 3.0).abs() < 1e-4, "weights {} {}", per(0), per(1));
+        assert_eq!(per(2), 0.0);
+        // The mean is still the commanded acceleration.
+        assert!((b.velocity().x - 100.0 / 60.0).abs() < 0.01, "{:?}", b.velocity());
+        // A cell's push follows its angle.
+        let mut cl = Cells::default();
+        let c = open_worm(&mut cl, &[0]);
+        cl.bodies[c].swim = Swim { acc: 100.0, pulse: 0.0, axis: Vector2::new(1.0, 0.0) };
+        cl.bodies[c].th[0] = 0.5;
+        cl.bodies[c].prepare(&cl.opt.clone(), 1.0 / 60.0, &[], 64.0);
+        let f = cl.bodies[c].force[0];
+        assert!((f.y.atan2(f.x) - 0.5).abs() < 1e-4, "{:?}", f);
+    }
+
+    #[test]
+    fn one_step_forces_clear_themselves() {
+        let mut cl = Cells::default();
+        let c = open_worm(&mut cl, &[0]);
+        cl.bodies[c].push_once = Vector2::new(600.0, 0.0);
+        cl.step(1.0 / 60.0);
+        let v1 = cl.bodies[c].velocity();
+        assert!((v1.x - 10.0).abs() < 0.01, "{:?}", v1);
+        cl.step(1.0 / 60.0);
+        let v2 = cl.bodies[c].velocity();
+        assert!((v2.x - v1.x).abs() < 1e-3, "gone after one step: {:?} {:?}", v1, v2);
+        assert_eq!(cl.bodies[c].push_once, Vector2::ZERO);
+        // A twist for one step: spin, then no more angular acceleration.
+        cl.bodies[c].twist_once = 3.0;
+        cl.step(1.0 / 60.0);
+        let s1 = cl.bodies[c].spin();
+        assert!(s1 > 0.03, "spin {}", s1);
+        cl.step(1.0 / 60.0);
+        let s2 = cl.bodies[c].spin();
+        assert!(s2 <= s1 * 1.01, "no more twist {} -> {}", s1, s2);
+        // Per-cell forces: added to the kept ones, one step, counted as contact.
+        let n = cl.bodies[c].n;
+        let m = cl.bodies[c].total_mass();
+        cl.bodies[c].force_once = vec![Vector2::new(0.0, 60.0 * m / n as f32); n];
+        let vy = cl.bodies[c].velocity().y;
+        cl.step(1.0 / 60.0);
+        assert!((cl.bodies[c].velocity().y - vy - 1.0).abs() < 0.01);
+        assert!(cl.bodies[c].contact);
+        assert!(cl.bodies[c].force_once.is_empty());
+        cl.step(1.0 / 60.0);
+        assert!(!cl.bodies[c].contact);
+    }
+
+    #[test]
+    fn damping_decays_the_rigid_motion_exactly_and_leaves_the_stroke() {
+        let dt = 1.0 / 60.0;
+        let mut cl = Cells::default();
+        let c = open_worm(&mut cl, &[0]);
+        for i in 0..cl.bodies[c].n {
+            cl.bodies[c].vel[i] = Vector2::new(300.0, 0.0);
+        }
+        cl.bodies[c].damp_lin = 2.0;
+        for _ in 0..60 {
+            cl.step(dt);
+        }
+        let v = cl.bodies[c].velocity().x;
+        let want = 300.0 * (-2.0f32).exp();
+        assert!((v - want).abs() < 0.01 * want, "linear: {} against {}", v, want);
+        // Spin.
+        let mut cl = Cells::default();
+        let c = open_worm(&mut cl, &[0]);
+        let ctr = cl.bodies[c].center();
+        for i in 0..cl.bodies[c].n {
+            let p = cl.bodies[c].pos[i] - ctr;
+            cl.bodies[c].vel[i] = perp(p) * 1.5;
+            cl.bodies[c].om[i] = 1.5;
+        }
+        cl.bodies[c].damp_ang = 1.0;
+        for _ in 0..60 {
+            cl.step(dt);
+        }
+        let s = cl.bodies[c].spin();
+        let want = 1.5 * (-1.0f32).exp();
+        assert!((s - want).abs() < 0.03 * want, "angular: {} against {}", s, want);
+        // Moving with the water: nothing to damp.
+        let mut cl = Cells::default();
+        let c = open_worm(&mut cl, &[0]);
+        cl.bodies[c].current = Vector2::new(80.0, 0.0);
+        cl.bodies[c].has_current = true;
+        for i in 0..cl.bodies[c].n {
+            cl.bodies[c].vel[i] = Vector2::new(80.0, 0.0);
+        }
+        cl.bodies[c].damp_lin = 5.0;
+        cl.bodies[c].damp_ang = 5.0;
+        for _ in 0..60 {
+            cl.step(dt);
+        }
+        assert!((cl.bodies[c].velocity().x - 80.0).abs() < 0.01);
+        // The stroke: a pose wave's shape change is the same with heavy damping (no water,
+        // so the wave alone moves nothing; only its rigid wobble is damped).
+        let shape = |damp: f32| -> f32 {
+            let mut cl = Cells::default();
+            let c = open_worm(&mut cl, &[0]);
+            cl.bodies[c].wave = Wave { mode: WAVE_POSE, amp: 0.8, k: std::f32::consts::TAU / 168.0, omega: std::f32::consts::TAU, axis: Vector2::new(1.0, 0.0), half_width: 10.0, bias: 0.0, envelope: 0.6, phase: 0.0, age: 1.0 };
+            cl.bodies[c].damp_lin = damp;
+            cl.bodies[c].damp_ang = damp;
+            let mut e = 0.0;
+            for _ in 0..120 {
+                cl.step(dt);
+                e += cl.bodies[c].shape_error();
+            }
+            e
+        };
+        let (free, damped) = (shape(0.0), shape(10.0));
+        assert!((damped - free).abs() < 0.1 * free, "the stroke's bend: free {} damped {}", free, damped);
+    }
+
+    #[test]
+    fn automatic_threads_by_size() {
+        assert_eq!(Cells::auto_threads(150, 1, 4), 1);
+        assert_eq!(Cells::auto_threads(4500, 30, 4), 4);
+        assert_eq!(Cells::auto_threads(4500, 2, 4), 2, "no more than the creatures");
+        assert_eq!(Cells::auto_threads(4500, 30, 1), 1, "no more than the cores");
+        let mut cl = crash_world(0);
+        cl.step(1.0 / 60.0);
+        let n: usize = cl.bodies.iter().map(|b| b.n).sum();
+        let cores = std::thread::available_parallelism().map(|x| x.get()).unwrap_or(1);
+        assert_eq!(cl.threads_in_use(), Cells::auto_threads(n, 6, cores));
+        cl.set_threads(3);
+        assert_eq!(cl.threads_in_use(), 3);
+    }
+
+    #[test]
+    fn threaded_equals_serial_with_swimming_damping_and_one_step_forces() {
+        let run = |threads: usize| {
+            let mut cl = crash_world(threads);
+            cl.opt.drag.enabled = true;
+            cl.opt.types[1].swim = 2.0;
+            for (k, b) in cl.bodies.iter_mut().enumerate() {
+                b.swim = Swim { acc: 200.0, pulse: 0.3, axis: Vector2::new(1.0, 0.0) };
+                b.wave = Wave { mode: WAVE_POSE, amp: 0.3, k: 0.03, omega: 6.0, axis: Vector2::new(1.0, 0.0), half_width: 20.0, bias: 0.002, envelope: 0.5, phase: 0.0, age: 0.0 };
+                b.damp_lin = 0.5 * k as f32;
+                b.damp_ang = 0.3 * k as f32;
+            }
+            for f in 0..120 {
+                if f % 7 == 0 {
+                    for b in cl.bodies.iter_mut() {
+                        b.push_once = Vector2::new(0.0, 500.0);
+                        b.twist_once = 2.0;
+                        b.force_once = vec![Vector2::new(-1.0e4, 0.0); b.n];
+                    }
+                }
+                cl.step(1.0 / 60.0);
+                if f == 60 {
+                    cl.add_cell(0, cl.bodies[0].pos[0] + Vector2::new(-14.0, 0.0), 7.0, 1);
+                }
+            }
+            cl.state_hash()
+        };
+        let a = run(1);
+        assert_eq!(a, run(4));
+        assert_eq!(a, run(0));
+        assert_eq!(a, run(1), "a replay");
     }
 
     #[test]

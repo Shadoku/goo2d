@@ -53,6 +53,10 @@ enum Body {
 ## The join layers it joins at a retopology: two cells may join when each one's mask
 ## holds a layer of the other.
 @export_flags("1", "2", "3", "4", "5", "6", "7", "8") var join_mask: int = 255
+## Its cells' share of the swim drive (GooCellCreature.set_swim()): × their mass; 1 a
+## plain cell, more a fin or spine that pushes harder, 0 none. The creature's whole push
+## stays what set_swim() asks; the weights only share it out.
+@export_range(0.0, 10.0, 0.01, "or_greater") var swim_weight: float = 1.0
 ## Whatever a game's behaviours read (a thruster's force, a sensor's range...).
 @export var behaviours: Dictionary = {}
 
@@ -63,7 +67,7 @@ func kernel_params() -> Dictionary:
 	return {
 		"stretch": stretch, "bend": bend, "break": break_factor, "self_collide": self_collides,
 		"pad": contact_pad * GooTuning.unit, "body": modes[body], "collide": collides,
-		"walls": collides_walls, "color": color,
+		"walls": collides_walls, "color": color, "swim": swim_weight,
 	}
 
 ## Whether cells of this type and of `other` may join (each one's mask holds a layer of

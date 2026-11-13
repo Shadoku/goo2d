@@ -56,7 +56,10 @@ const GRAB_DAMPING: float = 40.0
 const GRAB_REACH: float = 3.0
 
 ## Threads the solver uses (creatures stepped in parallel; threaded == serial bit for bit).
-@export_range(1, 64) var threads: int = 4:
+## 0 (the default): chosen each step from the live cells (1 below 800, 2 below 1600, else
+## 4; at most one per live creature and the machine's cores), measured: a thread pool costs
+## more than it saves below about 800 cells (docs/cells.md, "Threads").
+@export_range(0, 64) var threads: int = 0:
 	set(value):
 		threads = value
 		_send_options()
@@ -115,6 +118,13 @@ const GRAB_REACH: float = 3.0
 @export_range(1.0, 200.0, 0.1, "or_greater") var drag_ratio: float = 20.0:
 	set(value):
 		drag_ratio = value
+		_send_options()
+## The along-edge linear drag (px/s) on its own; below 0 (the default) it is
+## drag_linear_normal / drag_ratio. A brake against the glide that leaves the quadratic
+## terms (and so swimming at speed) much as they are.
+@export var drag_linear_tangent: float = -1.0:
+	set(value):
+		drag_linear_tangent = value
 		_send_options()
 ## The water's mass per px².
 @export var drag_density: float = 1.0:
@@ -233,7 +243,7 @@ func _send_options() -> void:
 	if _cells == null:
 		return
 	var gravity: Vector2 = GooTuning.solver_settings()["gravity"]
-	_cells.set_options({
+	var options := {
 		"threads": threads, "substeps": substeps, "stretch_hz": stretch_hz, "bend_hz": bend_hz,
 		"bend_mode": int(body_mode), "shape_k": shape_stiffness, "link_damp": 0.02, "bend_damp": 0.02,
 		"self_mode": int(self_collision), "margin": MARGIN * GooTuning.unit, "max_speed": MAX_SPEED * GooTuning.unit,
@@ -241,7 +251,14 @@ func _send_options() -> void:
 		"drag_linear_normal": drag_linear_normal, "drag_ratio": drag_ratio, "drag_density": drag_density,
 		"current": current, "break_force": break_force if break_force > 0.0 else INF,
 		"break_excess": break_leaves_out_own_share,
-	})
+	}
+	if drag_linear_tangent >= 0.0:
+		options["drag_linear_tangent"] = drag_linear_tangent
+	_cells.set_options(options)
+
+## The threads the last step ran on (threads 0 chooses them by size).
+func threads_in_use() -> int:
+	return cells().threads_in_use()
 
 # --- Types -----------------------------------------------------------------------------
 

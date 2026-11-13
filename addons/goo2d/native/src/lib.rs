@@ -1973,6 +1973,7 @@ impl GooCells {
     fn set_options(&mut self, options: VarDictionary) {
         let mut colliders = false;
         let mut ratio: Option<f32> = None;
+        let mut linear_tangent: Option<f32> = None;
         for (key, value) in options.iter_shared() {
             let name = key.to_string();
             let x = cells_num(&value);
@@ -2004,7 +2005,7 @@ impl GooCells {
                 "drag_normal" => o.drag.normal = x as f32,
                 "drag_tangent" => o.drag.tangent = x as f32,
                 "drag_linear_normal" => o.drag.linear_normal = x as f32,
-                "drag_linear_tangent" => o.drag.linear_tangent = x as f32,
+                "drag_linear_tangent" => linear_tangent = Some(x as f32),
                 "drag_density" => o.drag.density = x as f32,
                 "drag_facing" => o.drag.facing_only = x != 0.0,
                 "drag_substep" => o.drag_substep = x != 0.0,
@@ -2037,6 +2038,10 @@ impl GooCells {
             o.drag.tangent = o.drag.normal / r;
             o.drag.linear_tangent = o.drag.linear_normal / r;
         }
+        if let Some(t) = linear_tangent {
+            // Given with drag_ratio, it wins: the along-edge linear term set on its own.
+            self.c.opt.drag.linear_tangent = t;
+        }
         if colliders {
             self.c.refresh_colliders();
         }
@@ -2045,7 +2050,7 @@ impl GooCells {
     /// A type's factors: stretch, bend, break (× the options), self_collide (bool),
     /// join_mask (bits of the types it may join), pad (px added to its contact radius),
     /// body (BEND_NONE / BEND_LINK / BEND_SHAPE / BODY_DEFAULT), collide (with other
-    /// creatures), walls (with walls), color (the skin's).
+    /// creatures), walls (with walls), color (the skin's), swim (its share of the swim drive).
     #[func]
     fn set_type(&mut self, t: i64, params: VarDictionary) {
         let tp = &mut self.c.opt.types[(t as usize).min(cells::TYPES - 1)];
@@ -2069,6 +2074,7 @@ impl GooCells {
                 "self_collide" => tp.self_collide = x != 0.0,
                 "join_mask" => tp.join_mask = x as u16,
                 "pad" => tp.pad = x as f32,
+                "swim" => tp.swim = x as f32,
                 other => godot_error!("GooCells: unknown type parameter {}", other),
             }
         }
@@ -2387,6 +2393,65 @@ impl GooCells {
     #[func]
     fn twist(&mut self, c: i64, alpha: f64) {
         self.c.bodies[c as usize].twist = alpha as f32;
+    }
+
+    /// push_creature() for the next step only (added to the kept push; calls add up).
+    #[func]
+    fn push_once(&mut self, c: i64, acceleration: Vector2) {
+        self.c.bodies[c as usize].push_once += acceleration;
+    }
+
+    /// twist() for the next step only (added to the kept twist; calls add up).
+    #[func]
+    fn twist_once(&mut self, c: i64, alpha: f64) {
+        self.c.bodies[c as usize].twist_once += alpha as f32;
+    }
+
+    /// Forces per cell (by index) for the next step only, added to the kept ones (calls add
+    /// up; fewer than the cells: the rest none). They count as outside the creature for the
+    /// break test, as set_cell_force()'s do.
+    #[func]
+    fn add_cell_forces_once(&mut self, c: i64, forces: PackedVector2Array) {
+        let b = &mut self.c.bodies[c as usize];
+        if b.force_once.len() != b.n {
+            b.force_once.clear();
+            b.force_once.resize(b.n, Vector2::ZERO);
+        }
+        for (f, add) in b.force_once.iter_mut().zip(forces.as_slice()) {
+            *f += *add;
+        }
+    }
+
+    /// The swim drive, kept until set again: every cell pushed along `axis` (its forward in
+    /// the creature's design frame) turned by its angle, the forces' magnitudes summing to
+    /// `acceleration` (px/s², negative backward) × its mass, shared by mass × its type's
+    /// swim weight, rippling by ± `pulse` (0..1) with the pose wave's phase. 0 stops it.
+    #[func]
+    fn set_swim(&mut self, c: i64, acceleration: f64, pulse: f64, axis: Vector2) {
+        let b = &mut self.c.bodies[c as usize];
+        b.swim = cells::Swim { acc: acceleration as f32, pulse: pulse as f32, axis: if axis.length_squared() > 0.0 { axis.normalized() } else { Vector2::new(1.0, 0.0) } };
+    }
+
+    /// Damping (1/s) of creature c's mean velocity and of its rigid spin about its centre,
+    /// both relative to the water at its cells: each decays by exp(−rate × time), exactly;
+    /// the motion of its cells relative to that (the stroke) is left alone. 0: none.
+    #[func]
+    fn set_damping(&mut self, c: i64, linear: f64, angular: f64) {
+        let b = &mut self.c.bodies[c as usize];
+        b.damp_lin = (linear as f32).max(0.0);
+        b.damp_ang = (angular as f32).max(0.0);
+    }
+
+    /// The threads the last step ran on (threads 0 chooses them by size each step).
+    #[func]
+    fn threads_in_use(&self) -> i64 {
+        self.c.threads_in_use() as i64
+    }
+
+    /// threads 0's choice for `cells` live cells in `creatures` live creatures on `cores`.
+    #[func]
+    fn auto_threads(cells: i64, creatures: i64, cores: i64) -> i64 {
+        cells::Cells::auto_threads(cells.max(0) as usize, creatures.max(0) as usize, cores.max(1) as usize) as i64
     }
 
     /// Forces per cell, kept until set again (empty: none).
