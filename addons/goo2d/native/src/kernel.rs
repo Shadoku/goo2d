@@ -1179,7 +1179,7 @@ impl Kernel {
         self.frame_forces();
         self.build_pairs(delta);
         for k in 0..n {
-            self.move_dynamic(k, n);
+            self.move_dynamic(k, n, h);
             self.substep(h);
         }
     }
@@ -1278,6 +1278,7 @@ impl Kernel {
             }
         }
         self.contact_velocities(h);
+        self.dynamic_velocities(h);
         self.cap_speeds();
         // Rings touched and woken this substep.
         for k in 0..self.touch_pairs.len() {

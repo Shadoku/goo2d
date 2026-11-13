@@ -464,11 +464,10 @@ pub struct Body {
     pub contact: bool,
     /// The link graph's faces for the skin (cells_draw.rs), walked by after_topology().
     pub faces: std::sync::Arc<crate::cells_draw::Faces>,
-    /// Cells near a moving obstacle this step (cell, wall index) and the momentum the
-    /// step's pushes gave them per obstacle (wall index, impulse, its moment about the
-    /// origin): bridge.rs.
+    /// Cells near a moving obstacle this step (cell, wall index) and the impulses this
+    /// substep's contacts gave them (wall index, point, impulse): obstacles.rs.
     pub dyn_c: Vec<(u32, u32)>,
-    pub dyn_j: Vec<(u32, Vector2, f32)>,
+    pub dyn_sub: Vec<(u32, Vector2, Vector2)>,
 }
 
 pub struct Cells {
@@ -2268,7 +2267,7 @@ impl Cells {
         self.begin_dynamic();
         for s in 0..opt.substeps {
             let ta = Instant::now();
-            self.move_dynamic(s, opt.substeps);
+            self.move_dynamic(s, opt.substeps, h);
             {
                 let walls = &self.statics;
                 par_bodies(&self.pool, &mut self.bodies, |b| {

@@ -14,7 +14,6 @@
 //! `tests/unit/test_goo_kernel.gd` to check against the GDScript reference
 //! implementations on random loops.
 
-mod bridge;
 mod cells;
 mod cells_draw;
 mod colony;
@@ -24,6 +23,7 @@ mod geom;
 mod grid;
 mod kernel;
 mod links;
+mod obstacles;
 mod pinch;
 mod skin;
 mod statics;
