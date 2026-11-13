@@ -39,8 +39,8 @@ var plus: Array[bool] = []
 
 ## membrane+: MEMBRANE a notch further (more definition, more cell light).
 const PLUS: Dictionary = {
-	"wall_strength": 0.26, "membrane_strength": 0.95, "cell_light": 0.3, "corner_radius": 3.0,
-	"brightness": 0.22, "cloud": 0.4,
+	"wall_strength": 0.26, "membrane_strength": 1.0, "cell_light": 0.3, "corner_radius": 3.0,
+	"brightness": 0.22, "cloud": 0.4, "cell_specular_power": 20.0,
 }
 
 # The fluid game's water, a stand-in (still water: no flow texture): deep and shallow

@@ -174,7 +174,7 @@ enum SkinMesh {
 ## The goo skin's look (GooCellLook's presets), put on the default material when it is
 ## made or this changes; CUSTOM leaves the material's uniforms alone. A game tunes the
 ## numbers on current_skin_material() (lengths in px at GooTuning.unit 1).
-@export var skin_preset: GooCellLook.Preset = GooCellLook.Preset.FAINT:
+@export var skin_preset: GooCellLook.Preset = GooCellLook.Preset.MEMBRANE:
 	set(value):
 		skin_preset = value
 		if _material != null and skin_material == null:

@@ -34,12 +34,22 @@ func test_the_default_material_and_its_preset() -> void:
 	var m := w.current_skin_material() as ShaderMaterial
 	assert_not_null(m)
 	assert_eq(m.shader.resource_path, GooCellLook.SHADER_PATH)
-	assert_eq(w.skin_preset, GooCellLook.Preset.FAINT)
-	var faint: Dictionary = GooCellLook.PRESETS[GooCellLook.Preset.FAINT]
-	assert_almost_eq(float(m.get_shader_parameter("wall_strength")), float(faint["wall_strength"]), 1e-6)
+	assert_eq(w.skin_preset, GooCellLook.Preset.MEMBRANE)
+	var membrane: Dictionary = GooCellLook.PRESETS[GooCellLook.Preset.MEMBRANE]
+	assert_almost_eq(float(m.get_shader_parameter("wall_strength")), float(membrane["wall_strength"]), 1e-6)
+	assert_almost_eq(float(m.get_shader_parameter("cell_light")), 0.2, 1e-6)
 	w.skin_preset = GooCellLook.Preset.CELLULAR
 	var cellular: Dictionary = GooCellLook.PRESETS[GooCellLook.Preset.CELLULAR]
-	assert_almost_eq(float(m.get_shader_parameter("dome_highlight")), float(cellular["dome_highlight"]), 1e-6)
+	assert_almost_eq(float(m.get_shader_parameter("cell_light")), float(cellular["cell_light"]), 1e-6)
+	# The shader's own defaults are MEMBRANE's (a custom material of it gets the look).
+	var faint: Dictionary = GooCellLook.PRESETS[GooCellLook.Preset.FAINT]
+	var code: String = m.shader.code
+	for key: String in membrane:
+		var re := RegEx.create_from_string("uniform float " + key + "\\b[^=;]*= ([0-9.]+);")
+		var found := re.search(code)
+		assert_not_null(found, key)
+		if found != null:
+			assert_almost_eq(found.get_string(1).to_float(), float(membrane[key]), 1e-6)
 	# Every preset names the same uniforms, each one the shader's.
 	var names: Array = []
 	for u: Dictionary in m.shader.get_shader_uniform_list():
@@ -157,5 +167,5 @@ func test_the_flat_mesh_and_a_custom_material() -> void:
 	assert_eq((w.look_table()["type_color"] as PackedColorArray)[w.type_slot(spine)], Color.CORNFLOWER_BLUE)
 	# The preset leaves a game's own material alone.
 	custom.set_shader_parameter("wall_strength", 0.9)
-	w.skin_preset = GooCellLook.Preset.MEMBRANE
+	w.skin_preset = GooCellLook.Preset.FAINT
 	assert_almost_eq(float(custom.get_shader_parameter("wall_strength")), 0.9, 1e-6)

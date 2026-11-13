@@ -2,7 +2,8 @@
 // translucent goo as the ring bodies' addons/goo2d/goo.gdshader (its tint handling, rim,
 // fresnel, refraction of what is behind it), faintly honeycombed by the cells' walls, the
 // types' colours blended softly where they meet, then a light stage on top (thickness,
-// light from one side, a soft specular highlight, a faint dome per cell). Everything is
+// light from one side, a soft specular highlight, and each cell a small lit volume of its
+// own: the body's light again on the cell's surface, × cell_light). Everything is
 // fixed in the creature's material: it rides the cells as they bend, turn and swim.
 //
 // Two stages in one pass. base() is the goo (what the ring goo draws, made of the
@@ -44,59 +45,73 @@ uniform float length_unit = 1.0;
 
 // --- The goo (base) ---
 // The goo's own colour over what is seen through it (goo.gdshader's goo_opacity).
-uniform float goo_opacity : hint_range(0.0, 1.0) = 0.3;
+uniform float goo_opacity : hint_range(0.0, 1.0) = 0.4;
+// Light the goo gives off itself: its tint added over what shows through (0 none), so a
+// creature over dark water does not read dark (and an orange one not brown).
+uniform float brightness : hint_range(0.0, 1.0) = 0.15;
 // The rim: px over which the surface rolls off to edge-on, its fresnel glow.
-uniform float rim_width : hint_range(1.0, 64.0) = 16.0;
-uniform float rim_strength : hint_range(0.0, 2.0) = 0.85;
+uniform float rim_width : hint_range(1.0, 64.0) = 24.0;
+uniform float rim_strength : hint_range(0.0, 2.0) = 1.0;
 uniform float fresnel_power : hint_range(0.5, 8.0) = 2.2;
 // How much darker and denser the goo is toward the rim (goo.gdshader's 0.35).
-uniform float rim_density : hint_range(0.0, 1.0) = 0.35;
+uniform float rim_density : hint_range(0.0, 1.0) = 0.3;
 // The background seen through the goo: displaced at the rim (screen px at unit 1), and
 // through each cell's dome a little.
-uniform float refraction_px : hint_range(0.0, 64.0) = 18.0;
-uniform float cell_refraction_px : hint_range(0.0, 16.0) = 2.0;
+uniform float refraction_px : hint_range(0.0, 64.0) = 22.0;
+uniform float cell_refraction_px : hint_range(0.0, 16.0) = 1.0;
 // The cell walls: width (px), how dark (0 none), their soft edge (px).
 uniform float wall_width : hint_range(0.0, 8.0) = 1.5;
 uniform float wall_strength : hint_range(0.0, 1.0) = 0.2;
-uniform float wall_softness : hint_range(0.0, 8.0) = 1.0;
+uniform float wall_softness : hint_range(0.0, 8.0) = 1.5;
+// Each cell's corners (where three cells' walls meet) rounded with this radius (px): the
+// walls keep their width away from the corners and widen into a small fillet there. Keep
+// it well under a cell's radius (the corner stays within its triangle: no seams).
+uniform float corner_radius : hint_range(0.0, 8.0) = 2.0;
 // A wall's light side: a thin bright line beside it toward the light (0 none).
 uniform float wall_highlight : hint_range(0.0, 1.0) = 0.0;
 // Walls fade out within the rim (0: they reach the skin, 1: gone at the skin).
-uniform float wall_rim_fade : hint_range(0.0, 1.0) = 0.5;
+uniform float wall_rim_fade : hint_range(0.0, 1.0) = 1.0;
 // Two types' colours blend over their border: 1 a gradient across a whole triangle of
 // cells, higher sharper (the border stays a smooth curve).
-uniform float border_sharpness : hint_range(1.0, 12.0) = 3.0;
+uniform float border_sharpness : hint_range(1.0, 12.0) = 2.5;
 // An outer membrane: a clearer band of this width (px) inside the skin, closed by a line
 // like a wall, covering the walls within it (0 none); membrane_strength how much.
-uniform float membrane_width : hint_range(0.0, 32.0) = 0.0;
-uniform float membrane_strength : hint_range(0.0, 1.0) = 0.0;
+uniform float membrane_width : hint_range(0.0, 32.0) = 9.0;
+uniform float membrane_strength : hint_range(0.0, 1.0) = 0.85;
 // The inside clouded (milky) with depth, each cell a little different (0 clear).
-uniform float cloud : hint_range(0.0, 1.0) = 0.0;
+uniform float cloud : hint_range(0.0, 1.0) = 0.4;
 // Bubbles fixed in the cells: a share of cells holding one (0 none).
-uniform float bubble_density : hint_range(0.0, 1.0) = 0.12;
-uniform float bubble_strength : hint_range(0.0, 2.0) = 0.6;
+uniform float bubble_density : hint_range(0.0, 1.0) = 0.15;
+uniform float bubble_strength : hint_range(0.0, 2.0) = 0.7;
 
 // --- The light (lit) ---
 uniform vec3 light_dir = vec3(-0.55, -0.7, 0.75);
 // Depth (px) over which the creature thickens from its skin; how much darker and denser
 // it gets there; how strongly that thickness is lit from the light's side.
-uniform float shade_depth : hint_range(1.0, 200.0) = 40.0;
-uniform float shade_strength : hint_range(0.0, 1.0) = 0.2;
-uniform float side_light : hint_range(0.0, 1.0) = 0.2;
+uniform float shade_depth : hint_range(1.0, 200.0) = 50.0;
+uniform float shade_strength : hint_range(0.0, 1.0) = 0.12;
+uniform float side_light : hint_range(0.0, 1.0) = 0.25;
 // The surface's specular highlight (goo.gdshader's) and a broad sheen.
-uniform float specular_power : hint_range(1.0, 512.0) = 90.0;
-uniform float specular_strength : hint_range(0.0, 3.0) = 1.4;
-uniform float sheen_strength : hint_range(0.0, 1.0) = 0.22;
-// Each cell a faint dome: how far its surface tilts (bending the light and the rim's
-// normal), and the small highlight it catches.
-uniform float dome_strength : hint_range(0.0, 2.0) = 0.2;
-uniform float dome_highlight : hint_range(0.0, 1.0) = 0.08;
-uniform float dome_power : hint_range(1.0, 128.0) = 18.0;
+uniform float specular_power : hint_range(1.0, 512.0) = 70.0;
+uniform float specular_strength : hint_range(0.0, 3.0) = 1.6;
+uniform float sheen_strength : hint_range(0.0, 1.0) = 0.3;
+// Each cell a small lit volume of its own: its surface rolls off to edge-on at its
+// (rounded) walls over cell_rim of its radius, and the body's light (its density toward
+// the rim, side light, fresnel, specular and sheen) is evaluated again on that surface ×
+// cell_light (0.2: a fifth of what the body gets; a type's dome × it, its gloss × the
+// specular).
+uniform float cell_light : hint_range(0.0, 1.0) = 0.2;
+uniform float cell_rim : hint_range(0.05, 1.0) = 0.6;
+// The cell's specular is broader than the body's (a cell is small): its power. Its peak
+// is lowered by the same share, so it reflects as much light as the body's would, wider.
+uniform float cell_specular_power : hint_range(1.0, 256.0) = 16.0;
 
 // A debugging view in place of the look: 1 the outline distance (a band every 4 px, red
 // within rim_width), 2 the wall distance (a band every 2 px), 3 the cell owned (by its
-// seed) and the types' blend, 4 the outward direction. 0 the look.
-uniform int debug_view : hint_range(0, 4) = 0;
+// seed) and the types' blend, 4 the outward direction, 5 each cell's own surface (its
+// normal's slope as red and green, its roll-off to the rounded walls as blue: a seam
+// between triangles shows as a jump). 0 the look.
+uniform int debug_view : hint_range(0, 5) = 0;
 
 varying vec2 v_pos;
 varying flat vec3 v_cells;
@@ -129,7 +144,8 @@ ivec2 texel(int i, int k) {
 // What a fragment knows of its cells (cells_at()).
 struct Cells {
 	int owner;         // 0..2: the cell it lies in
-	float wall;        // px to that cell's nearest wall among the other two
+	float wall;        // px to that cell's walls among the other two, corners rounded
+	vec2 wall_out;     // the direction that distance falls fastest (toward the wall)
 	float wall_lit;    // the same, the light's side of the wall (wall_highlight)
 	vec3 weight;       // the three cells' share of the types' blend (sharpened)
 	vec2 local;        // its place in the owner cell, turned with the cell, / radius
@@ -170,6 +186,10 @@ Cells cells_at(vec2 p, vec2 light2) {
 	o.owner = w;
 	o.wall = 1e6;
 	o.wall_lit = 1e6;
+	o.wall_out = vec2(0.0, -1.0);
+	float wd[2] = { 1e6, 1e6 };
+	vec2 wn[2] = { vec2(0.0), vec2(0.0) };
+	int nw = 0;
 	for (int k = 0; k < 3; k++) {
 		vec2 e = c[k] - c[w];
 		float l = length(e);
@@ -177,10 +197,31 @@ Cells cells_at(vec2 p, vec2 light2) {
 			continue;
 		}
 		float dist = (pw[k] - pw[w]) / (2.0 * l);
-		o.wall = min(o.wall, dist);
+		wd[nw] = dist;
+		wn[nw] = e / l;
+		nw++;
+		if (dist < o.wall) {
+			o.wall = dist;
+			o.wall_out = e / l;
+		}
 		// The wall's lit face: the side of the wall facing the light, inside the owner.
 		if (dot(e / l, light2) > 0.0) {
 			o.wall_lit = min(o.wall_lit, dist);
+		}
+	}
+	// The corner between the two walls rounded: the cell shrunk by the radius, then grown
+	// by it again (the distance to the shrunk cell's corner where p lies in its normal
+	// cone, else to the nearer wall).
+	float rr = corner_radius * length_unit;
+	if (nw == 2 && rr > 0.0) {
+		float q1 = rr - wd[0];
+		float q2 = rr - wd[1];
+		float cs = dot(wn[0], wn[1]);
+		if (q1 > 0.0 && q2 > 0.0 && abs(cs) < 0.95 && q1 - cs * q2 >= 0.0 && q2 - cs * q1 >= 0.0) {
+			vec2 v = (q1 * (wn[0] - cs * wn[1]) + q2 * (wn[1] - cs * wn[0])) / (1.0 - cs * cs);
+			float lv = length(v);
+			o.wall = rr - lv;
+			o.wall_out = lv > 1e-6 ? v / lv : o.wall_out;
 		}
 	}
 	// The types' blend: barycentric among the three cells; a rim fan along its links.
@@ -227,6 +268,7 @@ Cells cells_at(vec2 p, vec2 light2) {
 vec3 base(vec3 bg, vec3 tint, vec3 wall_colour, vec4 look, Cells cl, float d, float e, float wall_mask, float line_w, float soft, vec4 bubble) {
 	vec3 transmitted = bg * mix(vec3(1.0), tint, 0.4) * 1.6;
 	vec3 body = mix(transmitted, tint, clamp(goo_opacity * look.w, 0.0, 1.0));
+	body += tint * brightness;
 	// Thicker goo toward the rim reads darker and more saturated.
 	body = mix(body, tint * 0.55, rim_density * pow(e, 1.5));
 	// The membrane: a clearer band just inside the skin, closed by a line like a wall.
@@ -254,24 +296,36 @@ vec3 base(vec3 bg, vec3 tint, vec3 wall_colour, vec4 look, Cells cl, float d, fl
 }
 
 // The light stage, over the base.
-vec3 lit(vec3 body, vec3 tint, vec4 look, Cells cl, vec3 n, vec3 n_body, vec3 n_cell, float thick, float wall_lit_mask, vec4 bubble) {
+vec3 lit(vec3 body, vec3 tint, vec4 look, Cells cl, vec3 n, vec3 n_body, vec3 n_cell, vec3 n_cell_body, float e_cell, float inner, float thick, float wall_lit_mask, vec4 bubble) {
 	vec3 L = normalize(light_dir);
 	vec3 H = normalize(L + vec3(0.0, 0.0, 1.0));
+	// The cell's share of the body's light (cell_light × its type's dome), gone where the
+	// walls are (within the rim, under the membrane).
+	float k = cell_light * look.y * inner;
 	// Thickness: darker and denser toward the middle, lit from the light's side.
 	body *= 1.0 - shade_strength * thick;
 	float side = dot(n_body, L) - L.z;
 	body *= 1.0 + side_light * 2.0 * side;
-	// Each cell's dome: its lit side a little lighter, its far side a little darker.
-	body *= 1.0 + 0.8 * (dot(n_cell, L) - L.z);
+	// The cell as a small volume lit from the same side. (Not denser toward its walls as
+	// the body is toward its rim: with the walls that rings every cell and reads as beads.)
+	body *= 1.0 + k * side_light * 2.0 * (dot(n_cell_body, L) - L.z);
 	vec3 rim_colour = mix(tint, vec3(1.0), 0.65);
-	float fresnel = pow(1.0 - clamp(n.z, 0.0, 1.0), fresnel_power) * rim_strength;
 	float gloss = look.z;
+	float fresnel = pow(1.0 - clamp(n.z, 0.0, 1.0), fresnel_power) * rim_strength;
 	float spec = pow(max(dot(n, H), 0.0), specular_power) * specular_strength * gloss;
 	float sheen = pow(max(dot(n_body, H), 0.0), 12.0) * sheen_strength;
-	float dome = pow(max(dot(n_cell, H), 0.0), dome_power) * dome_highlight * look.y * gloss;
+	// The same terms on the cell's surface, dimmed (its fresnel at a quarter of that
+	// again: at full share every wall would glow and read as a light line).
+	float c_fresnel = pow(1.0 - clamp(n_cell.z, 0.0, 1.0), fresnel_power) * rim_strength * k * 0.25;
+	// (Its lobe broader than the body's, its peak lower by the same share: the same light
+	// reflected, spread wider, (n + 2) / (n_body + 2).)
+	float c_spec = pow(max(dot(n_cell_body, H), 0.0), cell_specular_power) * specular_strength * gloss * k
+		* (cell_specular_power + 2.0) / (specular_power + 2.0);
+	float c_sheen = pow(max(dot(n_cell_body, H), 0.0), 12.0) * sheen_strength * k;
 	float bubble_light = (bubble.x * 0.55 + bubble.z * 0.9) * bubble_strength;
-	return body + rim_colour * fresnel + vec3(spec) + vec3(sheen) * mix(tint, vec3(1.0), 0.6)
-		+ mix(tint, vec3(1.0), 0.7) * (dome + wall_highlight * wall_lit_mask)
+	return body + rim_colour * (fresnel + c_fresnel) + vec3(spec + c_spec)
+		+ vec3(sheen + c_sheen) * mix(tint, vec3(1.0), 0.6)
+		+ mix(tint, vec3(1.0), 0.7) * wall_highlight * wall_lit_mask
 		+ mix(tint, vec3(1.0), 0.75) * bubble_light;
 }
 
@@ -310,11 +364,17 @@ void fragment() {
 	float rim_w = max(rim_width * length_unit, 0.5);
 	float e = 1.0 - clamp(d / rim_w, 0.0, 1.0);
 	vec3 n_rim = normalize(vec3(outward * e, sqrt(max(1.0 - e * e, 0.0))));
-	// Each cell's dome: its surface tilted away from its centre.
-	// (The surface's own highlight and fresnel stay on the rim's normal: a dome tilt there
-	// breaks the highlight into one dash per cell.)
-	float tilt = dome_strength * look.y;
-	vec3 n_cell = normalize(vec3(cl.offset * tilt, 1.0));
+	// Each cell's own surface: flat in its middle, rolling off to edge-on at its rounded
+	// walls (toward them), as the body's does at the skin. (The surface's own highlight
+	// and fresnel stay on the rim's normal: a cell's tilt there breaks the highlight into
+	// one dash per cell; the cell's light is its own, dimmer terms.)
+	float e_cell = 1.0 - clamp(max(cl.wall, 0.0) / max(cell_rim * cl.radius, 1e-3), 0.0, 1.0);
+	// Its slope runs out from its centre (so its highlight is a spot, not a dash along a
+	// wall), its steepness from the rounded walls.
+	vec2 radial = length(cl.offset) > 1e-4 ? normalize(cl.offset) : cl.wall_out;
+	vec3 n_cell = normalize(vec3(radial * e_cell, sqrt(max(1.0 - e_cell * e_cell, 0.0))));
+	// and its broad normal (the side light's, the sheen's), as soft as the body's n_body.
+	vec3 n_cell_body = normalize(vec3(radial * e_cell * 0.8, 1.0));
 	vec3 n = n_rim;
 	// The body's thickness and its broad normal.
 	float thick = smoothstep(0.0, shade_depth * length_unit, d);
@@ -344,7 +404,10 @@ void fragment() {
 	}
 
 	vec3 body = base(bg, tint, wall_colour, look, cl, d, e, wall_mask, max(half_w, 0.5 * length_unit), soft, bubble);
-	vec3 col = lit(body, tint, look, cl, n, n_body, n_cell, thick, lit_mask, bubble);
+	float mw = membrane_width * length_unit;
+	float band = mw > 0.0 ? (1.0 - smoothstep(mw - soft, mw, d)) * membrane_strength : 0.0;
+	float inner = (1.0 - wall_rim_fade * e) * (1.0 - band);
+	vec3 col = lit(body, tint, look, cl, n, n_body, n_cell, n_cell_body, e_cell, inner, thick, lit_mask, bubble);
 	// The silhouette: a pixel's antialiased fade at the skin (the triangles have none).
 	float edge = clamp(d / max(fwidth(d), 1e-3), 0.0, 1.0);
 	COLOR = vec4(col, tint4.a * edge);
@@ -356,8 +419,10 @@ void fragment() {
 			dv = vec3(fract(cl.wall / 2.0), cl.wall < half_w ? 1.0 : 0.0, 0.3);
 		} else if (debug_view == 3) {
 			dv = mix(vec3(hash12(vec2(cl.seed * 97.0, 1.0)), hash12(vec2(cl.seed * 53.0, 2.0)), 0.5) * 0.5, tint, 0.5);
-		} else {
+		} else if (debug_view == 4) {
 			dv = vec3(outward * 0.5 + 0.5, 0.5);
+		} else {
+			dv = vec3(n_cell.xy * 0.5 + 0.5, e_cell);
 		}
 		COLOR = vec4(dv, 1.0);
 	}

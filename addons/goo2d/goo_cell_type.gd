@@ -33,7 +33,7 @@ enum Body {
 ## (× the world's wall_strength).
 @export var wall_color: Color = Color(0, 0, 0, 0)
 @export_range(0.0, 4.0, 0.01, "or_greater") var wall_strength: float = 1.0
-## Each cell's dome (× the world's dome_strength and dome_highlight).
+## Each cell's own light (× the world's cell_light: its shading and dim reflection).
 @export_range(0.0, 4.0, 0.01, "or_greater") var dome: float = 1.0
 ## Its highlights (the specular, the domes' spots) × this.
 @export_range(0.0, 4.0, 0.01, "or_greater") var gloss: float = 1.0
