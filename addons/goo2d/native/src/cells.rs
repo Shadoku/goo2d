@@ -63,7 +63,7 @@ pub const TYPES: usize = 16;
 
 /// threads = 0: (live cells from, threads), measured with tools/cell_world_bench.gd
 /// (docs/cells.md, "Threads").
-pub const AUTO_THREADS: [(usize, usize); 3] = [(0, 1), (400, 2), (900, 4)];
+pub const AUTO_THREADS: [(usize, usize); 3] = [(0, 1), (800, 2), (1600, 4)];
 
 /// A type's body mode: the options' bend_mode (TypeParams.body's default).
 pub const BODY_DEFAULT: u8 = 255;
