@@ -221,8 +221,6 @@ func _worm_turn(rects: Array, tip: float, y: float, seconds: float = 3.0) -> Arr
 				away = maxf(away, vel[hi].dot(hit_normal))
 			flung = maxf(flung, cr.velocity().dot(hit_normal))
 		before = vel
-		if f % 10 == 0 and OS.has_environment("SERVO_DEBUG"):
-			print("t %.2f turned %.2f centre %s counts %s" % [t, turned, cr.center(), cr.contact_counts()])
 	w.queue_free()
 	for b: Node in bodies:
 		b.queue_free()
@@ -362,3 +360,39 @@ func test_a_worm_turning_into_a_coupled_ring_tame_and_at_full_power() -> void:
 	for r: String in rows:
 		print("    " + r)
 	assert_lt(fastest[Vector2(0.1, INF)], fastest[Vector2(1.0, INF)], "tame bats the ring less than full power")
+
+func test_the_contact_query() -> void:
+	var floor := _wall(Rect2(0, 600, 1920, 100))
+	var w := _world()
+	w.gravity_scale = 1.0
+	var a := w.spawn(GooCellDesign.hex_blob(2, R), Transform2D(0.0, Vector2(700, 520)))
+	var b := w.spawn(GooCellDesign.hex_blob(2, R), Transform2D(0.0, Vector2(860, 520)))
+	b.push(Vector2(-600, 0))
+	await _frames(2)
+	assert_false(a.contact_tracking(), "off by default")
+	assert_eq(a.contacts().size(), 0, "nothing recorded while off")
+	assert_true(a.contact_tracking(), "contacts() turned it on")
+	await _frames(90)
+	var got := a.contacts()
+	var kinds := {}
+	for c: Dictionary in got:
+		kinds[c["kind"]] = kinds.get(c["kind"], 0) + 1
+		if c["kind"] == GooCellCreature.Touch.WALL:
+			assert_eq(c["what"], floor, "the wall resolves to its StaticBody2D")
+			assert_lt(c["normal"].y, -0.9, "pushed up off the floor")
+		elif c["kind"] == GooCellCreature.Touch.CREATURE:
+			assert_eq(c["what"], b, "the other creature resolves to its handle")
+			assert_lt(c["normal"].x, 0.0, "pushed away from it")
+		assert_eq(a.uids()[c["cell"]], c["uid"])
+	var counts := a.contact_counts()
+	print("    a blob on a floor pressed by another: %d contacts, counts by kind %s; b (not tracked) %s" % [got.size(), counts, b.contact_counts()])
+	assert_eq(counts[GooCellCreature.Touch.WALL], kinds.get(GooCellCreature.Touch.WALL, 0))
+	assert_gt(counts[GooCellCreature.Touch.CREATURE], 0)
+	assert_true(a.touching_walls())
+	assert_true(a.touching(GooCellCreature.Touch.CREATURE))
+	assert_false(a.touching(GooCellCreature.Touch.RING))
+	assert_eq(b.contact_counts(), PackedInt32Array([0, 0, 0, 0]), "an untracked creature records nothing")
+	a.set_contact_tracking(false)
+	await _frames(1)
+	assert_eq(a.contact_counts(), PackedInt32Array([0, 0, 0, 0]), "off again: nothing")
+	await _clear([w])
