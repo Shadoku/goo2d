@@ -70,17 +70,35 @@ enum Body {
 ## plain cell, more a fin or spine that pushes harder, 0 none. The creature's whole push
 ## stays what set_swim() asks; the weights only share it out.
 @export_range(0.0, 10.0, 0.01, "or_greater") var swim_weight: float = 1.0
+@export_group("Thruster and tip")
+## A thruster's maximum thrust (px/s² at GooTuning.unit 1): an acceleration of the cell's
+## own mass. A thrust level (GooCellCreature.set_thrust_levels(), −1..1) pushes the cell
+## along its facing (its design angle turned with it) with level × this × its mass, so a
+## creature whose thrusters weigh a share s of it, all pushing one way at full level,
+## accelerates at s × this (before drag). 0: not a thruster.
+@export_range(0.0, 20000.0, 1.0, "or_greater") var max_thrust: float = 0.0
+## A spike's tip: a small disc `tip_length` × the cell's radius out from its centre along
+## its facing (0: no tip), of `tip_radius` × the cell's radius, held rigidly by the cell
+## (a push on it pushes and turns the cell and its linked neighbours). It collides with
+## walls, moving obstacles, coupled rings and other creatures' cells and tips (swept, so a
+## spinning spike does not pass through a thin wall), never with its own creature, and is
+## not drawn (GooCellCreature.tips() says where it is). Keep tip_length − tip_radius above
+## 1 so the tip stands out of its cell, and tip_radius at most 1.
+@export_range(0.0, 4.0, 0.01, "or_greater") var tip_length: float = 0.0
+@export_range(0.0, 1.0, 0.01) var tip_radius: float = 0.3
+@export_group("")
 ## Whatever a game's behaviours read (a thruster's force, a sensor's range...).
 @export var behaviours: Dictionary = {}
 
 ## GooCells.set_type()'s parameters, but the join mask (the world works it out from every
-## slot's layers) and the pad (× unit).
+## slot's layers); the pad and the maximum thrust × unit.
 func kernel_params() -> Dictionary:
 	var modes := [GooCells.BODY_DEFAULT, GooCells.BEND_LINK, GooCells.BEND_SHAPE, GooCells.BEND_NONE]
 	return {
 		"stretch": stretch, "bend": bend, "break": break_factor, "self_collide": self_collides,
 		"pad": contact_pad * GooTuning.unit, "body": modes[body], "collide": collides,
 		"walls": collides_walls, "color": color, "swim": swim_weight,
+		"thrust": max_thrust * GooTuning.unit, "tip_len": tip_length, "tip_rad": tip_radius if tip_length > 0.0 else 0.0,
 	}
 
 ## The look table's row of this type (goo_honeycomb.gdshader's type_look): wall_strength,

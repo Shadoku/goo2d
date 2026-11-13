@@ -28,7 +28,7 @@ const WORM_STEER: float = 0.0025
 const WORM_SWIM: float = 55.0
 const WORM_PULSE: float = 0.3
 const SPINE_SWIM: float = 2.0
-## The blob's thrusters (force per cell, × its mass) and its spin servo: the fastest spin
+## The blob's thrusters (their type's max_thrust, px/s² of each cell's mass) and its spin servo: the fastest spin
 ## (rad/s), the servo's angular acceleration (rad/s²; it brakes at 0.8 of it), its rim's
 ## top speed (px/s) and how far it yields to what it touches (docs/cells.md, "Turning by the
 ## spin servo": a tame setting).
@@ -86,7 +86,7 @@ func _ready() -> void:
 	spine_type = _type(&"spine", Color(0.35, 0.6, 0.95))
 	spine_type.swim_weight = SPINE_SWIM
 	thruster_type = _type(&"thruster", Color(0.98, 0.55, 0.25))
-	thruster_type.behaviours = {"thrust": THRUST}
+	thruster_type.max_thrust = THRUST
 	segment_type = _type(&"segment", Color(0.75, 0.55, 0.95))
 	segment_type.body = GooCellType.Body.SHAPE
 	_world.water_source = swirl
@@ -184,8 +184,11 @@ func _physics_process(delta: float) -> void:
 		blob.set_spin_target(GooCellCreature.spin_toward(err, BLOB_SPIN, 0.8 * BLOB_TURN, delta))
 		# Thrust only while it roughly faces its goal: it turns on the spot first.
 		var throttle := maxf(0.0, cos(err))
+		var levels := PackedFloat32Array()
+		levels.resize(blob.cell_count())
 		for i: int in _thrusters:
-			blob.set_cell_thrust(i, throttle * THRUST * PI * RADIUS * RADIUS)
+			levels[i] = throttle
+		blob.set_thrust_levels(levels)
 	if crawler != null and crawler.is_alive():
 		var phase := TAU * SWING_HZ * time
 		crawler.set_joint_angle(segment_type, 0, segment_type, 1, SWING * sin(phase))

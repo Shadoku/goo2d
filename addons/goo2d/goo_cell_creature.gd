@@ -183,9 +183,63 @@ func add_cell_forces_once(forces: PackedVector2Array) -> void:
 func set_damping(linear: float, angular: float) -> void:
 	_c().set_damping(id, linear, angular)
 
-## Cell `index` pushes `force` along its heading (cell_angle()), kept until set again.
-func set_cell_thrust(index: int, force: float) -> void:
-	_c().set_thrust_one(id, index, force)
+# ---- Thrusters (docs/cells.md, "Thrusters") ----
+
+## Cell `index`'s thrust level (−1..1, clamped), kept until set again: it pushes along its
+## facing (cell_angle()) with level × its type's max_thrust (× unit) × its mass, its
+## direction followed every substep. A cell whose type has max_thrust 0 never thrusts.
+## (Before thrusters had a maximum this took a force.)
+func set_cell_thrust(index: int, level: float) -> void:
+	_c().set_thrust_one(id, index, level)
+
+## Every cell's thrust level at once, by index (one per cell: cell_count()), kept until set
+## again: the one call a frame an allocator makes. Refused (false, nothing changed) when the
+## array's size is not cell_count(): built before a topology change (a cell removed, a
+## split, a merge) it would push the wrong cells; rebuild it when topology_version()
+## changes. Cells that are not thrusters ignore their entry.
+func set_thrust_levels(levels: PackedFloat32Array) -> bool:
+	return _c().set_thrust_levels(id, levels)
+
+## The thrust levels of the cells of `uids` (the others kept): robust to index changes,
+## a little dearer (a sort of the uids). Returns how many uids were found.
+func set_thrust_levels_by_uid(uids: PackedInt32Array, levels: PackedFloat32Array) -> int:
+	return _c().set_thrust_levels_by_uid(id, uids, levels)
+
+## Every cell's thrust level now, by index.
+func thrust_levels() -> PackedFloat32Array:
+	return _c().thrusts(id)
+
+## Every cell's facing (unit, global): its design angle turned with it (cell_angle()).
+func facings() -> PackedVector2Array:
+	return _c().facings(id)
+
+## Its thrusters, for an allocator, in one call: { "indices", "uids" (PackedInt32Array:
+## the thruster cells), "offsets" (PackedVector2Array: each from the centre of mass, px),
+## "facings" (unit, global), "max_forces" (PackedFloat32Array: max_thrust × unit × the
+## cell's mass, the cells' mass units × px/s²), "levels" (now), "mass" (the creature's),
+## "inertia" (its moment of inertia about the centre of mass, Σ m |p − c|²), "center" }.
+## A thruster at full level gives the creature the acceleration max_forces / mass and the
+## angular acceleration offsets.cross(facings) × max_forces / inertia (clockwise positive).
+func thrusters() -> Dictionary:
+	var a := _c().thrusters(id)
+	var m: PackedFloat64Array = a[6]
+	return { "indices": a[0], "uids": a[1], "offsets": a[2], "facings": a[3], "max_forces": a[4], "levels": a[5], "mass": m[0], "inertia": m[1], "center": Vector2(m[2], m[3]) }
+
+## Its moment of inertia about its centre of mass (Σ m |p − c|², the cells' units × px²).
+func inertia() -> float:
+	return _c().thrusters(id)[6][1]
+
+## Its spike tips now: { "indices", "uids" (PackedInt32Array), "positions" (global),
+## "facings" (unit), "radii" (PackedFloat32Array, px) }. One call per creature; for drawing
+## the spikes and for tests.
+func tips() -> Dictionary:
+	var a := _c().tips(id)
+	return { "indices": a[0], "uids": a[1], "positions": a[2], "facings": a[3], "radii": a[4] }
+
+## A number bumped at every change of its topology (a cell added or removed, a link broken,
+## a split, a join): cell indices are only good while it stays the same.
+func topology_version() -> int:
+	return _c().topology_version(id)
 
 ## A force on cell `index`, kept until set again. Counts as outside the creature for the
 ## break test (as a crash does).
@@ -298,26 +352,48 @@ func set_contact_tracking(on: bool) -> void:
 func contact_tracking() -> bool:
 	return _c().contact_tracking(id)
 
-## What its cells touched in the last step, one entry per cell and thing touched (sorted by
-## cell, kind, id): { "cell": index, "uid", "kind": Touch, "id": the kernel's id (the static
-## shape's, the ring's key, the other creature's slot), "what": that thing (the PhysicsBody2D
-## or TileMapLayer, the Goo2D, the GooCellCreature; null if gone), "normal": unit, pushing the
-## cell out }. Recorded only while tracked or servoed: a first call turns tracking on and
+## What its cells touched in the last step, one entry per cell, thing touched and whether
+## the cell's tip made it (sorted by cell, kind, id, tip): { "cell": index, "uid", "kind":
+## Touch, "id": the kernel's id (the static shape's, the ring's key, the other creature's
+## slot), "what": that thing (the PhysicsBody2D or TileMapLayer, the Goo2D, the
+## GooCellCreature; null if gone), "normal": unit, pushing the cell out, "other_cell": the
+## other creature's cell index (its index in the step it was read in: use other_uid) or the
+## ring's nearest bead (−1 for a wall or an obstacle), "other_uid" (−1: none), "tip": this
+## cell's tip made it, "other_tip": the other creature's tip did, "speed": the closing speed
+## along the normal at the step's first touch (px/s, before it was resolved; negative:
+## parting), "impulse": the impulse the cell took over the step (the cells' mass units ×
+## px/s; with its tip, its cell and neighbours'), "point": the contact point (global, on the
+## other thing: for a ring on its bead chain, where GooWorld2D.cut_along(ring, point, axis)
+## finds it) }. Recorded only while tracked or servoed: a first call turns tracking on and
 ## returns what the last step recorded (nothing, if it was off).
 func contacts() -> Array[Dictionary]:
+	return hits(-INF)
+
+## contacts() with only those whose closing speed is at least `min_speed` (px/s), filtered in
+## the kernel (no dictionary is built for the others): the hits a game deals damage for.
+func hits(min_speed: float) -> Array[Dictionary]:
 	var out: Array[Dictionary] = []
 	if not contact_tracking():
 		set_contact_tracking(true)
-	var got := _c().creature_contacts(id)
+	var got := _c().creature_hits(id, min_speed)
 	var ints: PackedInt64Array = got[0]
 	var normals: PackedVector2Array = got[1]
+	var points: PackedVector2Array = got[2]
+	var floats: PackedFloat32Array = got[3]
 	for k: int in normals.size():
-		var kind := int(ints[4 * k + 2])
-		var thing_id := int(ints[4 * k + 3])
-		out.append({ "cell": int(ints[4 * k]), "uid": int(ints[4 * k + 1]), "kind": kind, "id": thing_id, "what": world.touched_thing(kind, thing_id), "normal": normals[k] })
+		var kind := int(ints[7 * k + 2])
+		var thing_id := int(ints[7 * k + 3])
+		var tip := int(ints[7 * k + 6])
+		out.append({
+			"cell": int(ints[7 * k]), "uid": int(ints[7 * k + 1]), "kind": kind, "id": thing_id,
+			"what": world.touched_thing(kind, thing_id), "normal": normals[k],
+			"other_cell": int(ints[7 * k + 4]), "other_uid": int(ints[7 * k + 5]),
+			"tip": (tip & GooCells.TIP_SELF) != 0, "other_tip": (tip & GooCells.TIP_OTHER) != 0,
+			"speed": floats[2 * k], "impulse": floats[2 * k + 1], "point": points[k],
+		})
 	return out
 
-## The last step's contacts counted by kind (cell-thing pairs), indexed by Touch: [walls,
+## The last step's contacts counted by kind (contacts()' entries), indexed by Touch: [walls,
 ## moving obstacles, rings, creatures]. Cheap: no dictionaries.
 func contact_counts() -> PackedInt32Array:
 	return _c().contact_counts(id)
