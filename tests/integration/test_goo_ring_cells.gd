@@ -407,3 +407,22 @@ func test_small_fast_cells_do_not_tunnel_into_a_ring() -> void:
 			cr.cell_count(), c[1], inside, worst, cr.velocity().x, cr.velocity().y, body.average_velocity().x, body.average_velocity().y])
 		assert_eq(inside, 0)
 		await _clear()
+
+func test_coupled_from_the_ring_world_and_let_go() -> void:
+	_scene(false, false)
+	rings.couple(cells)
+	assert_eq(cells.coupled_world(), rings)
+	assert_gt(cells.process_physics_priority, rings.process_physics_priority, "the cells step after the rings")
+	var body := rings.spawn(40.0, Vector2(800, 540))
+	var cr := cells.spawn(GooCellDesign.hex_blob(2, R), Transform2D(0.0, Vector2(1000, 540)))
+	await _frames(1)
+	body.set_velocity(Vector2(300.0, 0.0))
+	await _frames(40)
+	assert_lt(body.center().x, cr.center().x, "they met and did not pass")
+	# The ring world freed: the cells uncouple and go on alone.
+	rings.queue_free()
+	await _frames(3)
+	assert_null(cells.coupled_world())
+	assert_eq(cells.coupling_stats()["on"], false)
+	cells.uncouple()
+	assert_eq(cr.cell_count(), 19)

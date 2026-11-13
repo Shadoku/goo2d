@@ -181,6 +181,7 @@ var _material: Material = null
 var _grabs: Dictionary[int, Dictionary] = {}
 var _next_grab: int = 1
 var _rings: GooWorld2D = null
+var _coupled: bool = false
 ## The last frame's skin build (µs in the kernel, µs handing it to the RenderingServer).
 var draw_stats: Dictionary = {"mesh_us": 0, "submit_us": 0, "vertices": 0, "triangles": 0}
 
@@ -500,18 +501,20 @@ func _hold_grabs() -> void:
 ## above `world`'s if it is not already (step() by hand: the ring world's first).
 func couple(world: GooWorld2D) -> void:
 	_rings = world
+	_coupled = world != null
 	if world != null and process_physics_priority <= world.process_physics_priority:
 		process_physics_priority = world.process_physics_priority + 1
 
 ## Rings and creatures pass through each other again.
 func uncouple() -> void:
 	_rings = null
+	_coupled = false
 	if _cells != null:
 		_cells.uncouple()
 
 ## The GooWorld2D coupled (null: none).
 func coupled_world() -> GooWorld2D:
-	return _rings if _rings != null and is_instance_valid(_rings) else null
+	return _rings if _coupled and is_instance_valid(_rings) else null
 
 ## The last step's coupling (GooCells.coupling_stats()): rings, active, touched,
 ## cell_pairs, bead_pairs, contacts, inside, worst (px), momentum.
@@ -534,7 +537,7 @@ func step(delta: float) -> void:
 		var points: PackedVector2Array = c.centers_all()[0]
 		c.set_water_all(water_source.call(points))
 	var rings := coupled_world()
-	if rings == null and _rings != null:
+	if rings == null and _coupled:
 		uncouple()
 	if rings != null:
 		c.couple_gather(rings.kernel(), ring_density, ring_rigidity, delta)
