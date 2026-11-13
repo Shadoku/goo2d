@@ -131,6 +131,12 @@ const NO_GRIP_GROUP: StringName = &"goo_no_grip"
 ## mirrors every StaticBody2D whose collision_layer has it into the kernel. The
 ## goo has no physics bodies of its own, so this is the only layer it uses.
 const LAYER_WALLS: int = 1
+## The physics layer bit the goo's proxies are on by default (docs/godot-physics.md: a
+## world's physics_proxies, Godot bodies standing in for its goo so areas, rays,
+## characters and rigid bodies meet it): layer 2. Never LAYER_WALLS, so the goo
+## never takes its own proxies for walls; a body, area or ray meets the goo when
+## its collision mask has this bit.
+const LAYER_PROXIES: int = 2
 
 ## Substeps of the kernel's solver per physics frame (60 Hz): each predicts,
 ## constrains and collides every awake bead once. More converge the contacts

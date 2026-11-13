@@ -22,11 +22,34 @@ var axis: Vector2 = Vector2.RIGHT
 ## What a game keeps on it.
 var data: Dictionary = {}
 
+## The metadata name under which a creature's proxy node holds its handle.
+const PROXY_META: StringName = &"goo_creature"
+
+var _proxy: Node2D = null
+
 func _init(owner: GooCellWorld2D, slot: int, from: GooCellDesign, design_axis: Vector2) -> void:
 	world = owner
 	id = slot
 	design = from
 	axis = design_axis.normalized() if design_axis != Vector2.ZERO else Vector2.RIGHT
+
+## The node that stands for it in Godot's physics while its world has physics_proxies
+## on (docs/godot-physics.md): an internal Node2D child of the world kept at its centre, its
+## proxy body's object, so Area2D.body_entered and a query's collider name it;
+## GooCellWorld2D.creature_of() maps it back. Made on first use.
+func proxy_node() -> Node2D:
+	if _proxy == null or not is_instance_valid(_proxy):
+		_proxy = Node2D.new()
+		_proxy.name = "Proxy%d" % id
+		_proxy.set_meta(PROXY_META, self)
+		world.add_child(_proxy, false, Node.INTERNAL_MODE_BACK)
+	return _proxy
+
+## Frees its proxy node (the world despawned it).
+func free_proxy_node() -> void:
+	if _proxy != null and is_instance_valid(_proxy):
+		_proxy.queue_free()
+	_proxy = null
 
 ## Whether it still lives in its world.
 func is_alive() -> bool:
