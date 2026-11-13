@@ -30,6 +30,10 @@ extends SceneTree
 ## --servo=1: every creature turns toward its point by the spin servo (set_spin_servo(), a
 ## yield of 0.3 and a tip cap of 600 px/s, the target set every frame by spin_toward() of
 ## its heading error, at most 3 rad/s and 12 rad/s²), the swimmers' wave unbent.
+## --thrust=F: every 1/F-th cell a thruster (max_thrust 600 px/s² at unit 1, facings spread
+## round), their levels set every frame toward the creature's point (max(0, cos) of facing
+## and way, one set_thrust_levels() per creature, outside the timing); --spikes=F: every
+## 1/F-th cell (of the others) a spike (tip 1.8 radii out, 0.3 wide), facing outward.
 
 var opts := {}
 
@@ -102,6 +106,27 @@ func _design(swim: bool, m: int) -> GooCellDesign:
 			d.add_cell(full.positions[order[k]], 14.0)
 	if String(o("body", "shape")) == "regions":
 		_regions(d, int(o("segments", 6)))
+	var thrust := float(o("thrust", 0.0))
+	var spikes := float(o("spikes", 0.0))
+	if thrust > 0.0 or spikes > 0.0:
+		var plain := GooCellType.new()
+		var thruster := GooCellType.new()
+		thruster.max_thrust = 600.0
+		var spike := GooCellType.new()
+		spike.tip_length = 1.8
+		spike.tip_radius = 0.3
+		if d.types.is_empty():
+			d.types = [plain]
+		d.types.append(thruster)
+		d.types.append(spike)
+		var c := d.centroid()
+		for i: int in d.cell_count():
+			if thrust > 0.0 and i % maxi(1, int(round(1.0 / thrust))) == 0:
+				d.cell_types[i] = d.types.size() - 2
+				d.angles[i] = float(i) * 2.399
+			elif spikes > 0.0 and i % maxi(1, int(round(1.0 / spikes))) == 1:
+				d.cell_types[i] = d.types.size() - 1
+				d.angles[i] = (d.positions[i] - c).angle()
 	return d
 
 ## Splits `d` into `segments` groups along x of one shape-matched type.
@@ -222,6 +247,16 @@ func _bench() -> void:
 					cr.set_spin_servo(0.0, 12.0, 600.0, 0.3)
 				var err := wrapf(to.angle() - cr.heading().angle(), -PI, PI)
 				cr.set_spin_target(GooCellCreature.spin_toward(err, 3.0, 0.8 * 12.0, 1.0 / 60.0))
+			if float(o("thrust", 0.0)) > 0.0:
+				var th := cr.thrusters()
+				var levels := PackedFloat32Array()
+				levels.resize(cr.cell_count())
+				var way := to.normalized()
+				var fac: PackedVector2Array = th["facings"]
+				var idx: PackedInt32Array = th["indices"]
+				for q: int in idx.size():
+					levels[idx[q]] = maxf(0.0, fac[q].dot(way))
+				cr.set_thrust_levels(levels)
 			if swim:
 				var err := wrapf(to.angle() - cr.heading().angle(), -PI, PI)
 				cr.set_pose_wave(1.0, length, freqs[k], 0.0 if servo else clampf(err, -1.0, 1.0) * 0.003)

@@ -2360,8 +2360,8 @@ fn solve_cross(bodies: &mut [Body], cr: &[Cross], opt: &Opt, h: f32) {
             let l = l2.sqrt();
             let pen = reach - l;
             let ws = a.w[ai] + b.w[bi];
+            let p = d * (pen / (l * ws * (1.0 + kc)));
             let dl = pen / (ws * (1.0 + kc));
-            let p = d * (dl / l);
             let (ra, rb) = (a.records(), b.records());
             let n = d / l;
             let speed = dot(a.vel[ai] - b.vel[bi], n);
