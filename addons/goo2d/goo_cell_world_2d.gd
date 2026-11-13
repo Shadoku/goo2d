@@ -148,16 +148,39 @@ const GRAB_REACH: float = 3.0
 	set(value):
 		break_leaves_out_own_share = value
 		_send_options()
+## Which mesh the skins are drawn as (each with its own shader contract).
+enum SkinMesh {
+	## The goo skin (addons/goo2d/goo_honeycomb.gdshader's contract: each triangle's three
+	## cells, the distance to the outline, the cell table and the look table).
+	GOO,
+	## The flat skin (addons/goo2d/goo_cells.gdshader's contract: COLOR the type's colour,
+	## UV.x 1 inside and 0 on the skin, UV.y type / 16).
+	FLAT,
+}
+
 ## Draw the creatures' skins.
 @export var draw_skins: bool = true
-## The skins' material (null: a ShaderMaterial of addons/goo2d/goo_cells.gdshader). Its
-## shader gets the types' colours as COLOR, UV.x 1 inside and 0 on the skin, UV.y type / 16.
+## The mesh the skins are drawn as; skin_material's shader must read its contract.
+@export var skin_mesh: SkinMesh = SkinMesh.GOO:
+	set(value):
+		skin_mesh = value
+		_apply_material()
+## The skins' material (null: a ShaderMaterial of goo_honeycomb.gdshader for GOO, of
+## goo_cells.gdshader for FLAT).
 @export var skin_material: Material = null:
 	set(value):
 		skin_material = value
 		_apply_material()
-## Lines between cells of different types.
-@export var draw_borders: bool = true
+## The goo skin's look (GooCellLook's presets), put on the default material when it is
+## made or this changes; CUSTOM leaves the material's uniforms alone. A game tunes the
+## numbers on current_skin_material() (lengths in px at GooTuning.unit 1).
+@export var skin_preset: GooCellLook.Preset = GooCellLook.Preset.FAINT:
+	set(value):
+		skin_preset = value
+		if _material != null and skin_material == null:
+			GooCellLook.apply(_material, skin_preset)
+## Lines between cells of different types (the goo skin blends them without).
+@export var draw_borders: bool = false
 @export var border_color: Color = Color(0.03, 0.06, 0.05, 0.85)
 ## px at unit 1.
 @export var border_width: float = 2.0
@@ -233,6 +256,9 @@ var _retopology_capture: float = -1.0
 var _retopology_same: bool = false
 var _item: RID = RID()
 var _material: Material = null
+## The goo skin's cell table (goo_honeycomb.gdshader's cell_table) and its rows.
+var _table: ImageTexture = null
+var _table_rows: int = 0
 var _grabs: Dictionary[int, Dictionary] = {}
 var _next_grab: int = 1
 var _rings: GooWorld2D = null
@@ -326,6 +352,7 @@ func type_slot(type: GooCellType) -> int:
 		return 0
 	_slots.append(type)
 	_send_type(_slots.size() - 1)
+	_send_look()
 	return _slots.size() - 1
 
 ## The GooCellType of kernel slot `slot`.
@@ -338,6 +365,7 @@ func update_type(type: GooCellType) -> void:
 	var k := _slots.find(type)
 	if k >= 0:
 		_send_type(k)
+		_send_look()
 
 ## The region key of cells of `type` and `group` (GooCells.set_joint_angle()'s).
 func region_key(type: GooCellType, group: int) -> int:
@@ -731,22 +759,68 @@ func _apply_material() -> void:
 	_material = skin_material
 	if _material == null:
 		var m := ShaderMaterial.new()
-		m.shader = preload("res://addons/goo2d/goo_cells.gdshader")
+		if skin_mesh == SkinMesh.GOO:
+			m.shader = preload("res://addons/goo2d/goo_honeycomb.gdshader")
+			GooCellLook.apply(m, skin_preset)
+		else:
+			m.shader = preload("res://addons/goo2d/goo_cells.gdshader")
 		_material = m
 	RenderingServer.canvas_item_set_material(_item, _material.get_rid())
+	_send_look()
 
 ## The material the skins draw with now.
 func current_skin_material() -> Material:
 	return _material
 
+## The goo skin's look table (goo_honeycomb.gdshader's type_color, type_wall,
+## type_look), one row per type slot, on the material (sent when a type is registered or
+## updated and when the material changes).
+func _send_look() -> void:
+	var m := _material as ShaderMaterial
+	if m == null or skin_mesh != SkinMesh.GOO:
+		return
+	var colours := PackedColorArray()
+	var walls := PackedColorArray()
+	var looks := PackedVector4Array()
+	colours.resize(16)
+	walls.resize(16)
+	looks.resize(16)
+	for slot: int in 16:
+		var t: GooCellType = _slots[slot] if slot < _slots.size() else default_type
+		if t == null:
+			t = GooCellType.new()
+		colours[slot] = t.color
+		walls[slot] = t.wall_color
+		looks[slot] = t.look_row()
+	m.set_shader_parameter("type_color", colours)
+	m.set_shader_parameter("type_wall", walls)
+	m.set_shader_parameter("type_look", looks)
+	if _table != null:
+		m.set_shader_parameter("cell_table", _table)
+
+## The look table's rows as the material has them (for tests): {type_color, type_wall,
+## type_look}.
+func look_table() -> Dictionary:
+	var m := _material as ShaderMaterial
+	if m == null:
+		return {}
+	return {"type_color": m.get_shader_parameter("type_color"), "type_wall": m.get_shader_parameter("type_wall"), "type_look": m.get_shader_parameter("type_look")}
+
+## The goo skin's cell table (null before the first draw).
+func cell_table() -> ImageTexture:
+	return _table
+
 ## Draws every creature's skin again (step() does after each step).
 func redraw() -> void:
 	var c := cells()
 	RenderingServer.canvas_item_clear(_item)
-	var m: Array = c.meshes_all(draw_borders)
+	var goo := skin_mesh == SkinMesh.GOO
+	var m: Array = c.meshes_all_goo(draw_borders) if goo else c.meshes_all(draw_borders)
 	var t := Time.get_ticks_usec()
 	var points: PackedVector2Array = m[0]
 	RenderingServer.canvas_item_set_transform(_item, global_transform.affine_inverse())
+	if goo:
+		_update_table(m[6], m[7])
 	var indices: PackedInt32Array = m[5]
 	if indices.size() >= 3:
 		RenderingServer.canvas_item_add_triangle_array(_item, indices, points, m[1], m[2])
@@ -754,3 +828,26 @@ func redraw() -> void:
 	if draw_borders and lines.size() >= 2:
 		RenderingServer.canvas_item_add_multiline(_item, lines, PackedColorArray([border_color]), border_width * GooTuning.unit)
 	draw_stats = {"mesh_us": m[4], "submit_us": Time.get_ticks_usec() - t, "vertices": points.size(), "triangles": indices.size() / 3}
+
+## Cells a row of the table (goo_honeycomb.gdshader's TABLE_COLUMNS), two texels each.
+const TABLE_COLUMNS: int = 512
+
+func _update_table(data: PackedFloat32Array, count: int) -> void:
+	var rows := 1
+	while rows * TABLE_COLUMNS < count:
+		rows *= 2
+	var floats := rows * TABLE_COLUMNS * 8
+	if data.size() != floats:
+		data.resize(floats)
+	var image := Image.create_from_data(TABLE_COLUMNS * 2, rows, false, Image.FORMAT_RGBAF, data.to_byte_array())
+	if _table == null or rows != _table_rows:
+		_table = ImageTexture.create_from_image(image)
+		_table_rows = rows
+		var sm := _material as ShaderMaterial
+		if sm != null:
+			sm.set_shader_parameter("cell_table", _table)
+	else:
+		_table.update(image)
+	var sm2 := _material as ShaderMaterial
+	if sm2 != null:
+		sm2.set_shader_parameter("length_unit", GooTuning.unit)

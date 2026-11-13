@@ -389,6 +389,7 @@ func test_threaded_equals_serial_and_a_replay() -> void:
 
 func test_the_skin_mesh() -> void:
 	var w := _world()
+	w.skin_mesh = GooCellWorld2D.SkinMesh.FLAT
 	var spine := GooCellType.new()
 	spine.color = Color.CORNFLOWER_BLUE
 	var d := GooCellDesign.hex_worm(10, 3, R)

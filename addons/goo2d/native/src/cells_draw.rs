@@ -398,8 +398,12 @@ pub fn cell_seed(uid: u32) -> f32 {
 }
 
 /// Per cell: its distance to the skin (px, at its centre) and the direction toward the
-/// skin's nearest point. `skin` is the closed skin polyline.
+/// skin's nearest point. `skin` is the closed skin polyline. Exact (against the polyline)
+/// for the cells within EXACT_HOPS links of the outline, found by searching the stretch of
+/// the skin nearest their nearer neighbours'; deeper cells take the shortest path through
+/// their neighbours (an overestimate there, where only "deep" matters).
 pub fn outline_distances(b: &Body, skin: &[Vector2]) -> (Vec<f32>, Vec<Vector2>) {
+    const EXACT_HOPS: u32 = 3;
     let n = b.n;
     let mut d = vec![f32::INFINITY; n];
     let mut dir = vec![Vector2::new(0.0, -1.0); n];
@@ -411,69 +415,92 @@ pub fn outline_distances(b: &Body, skin: &[Vector2]) -> (Vec<f32>, Vec<Vector2>)
         return (d, dir);
     }
     let mut near = vec![usize::MAX; n];
+    let mut hop = vec![u32::MAX; n];
+    // The squared distance from p to segment j and the nearest point on it.
     let seg = |j: usize, p: Vector2| -> (f32, Vector2) {
-        let a = skin[j % m];
-        let e = skin[(j + 1) % m] - a;
+        let a = skin[j];
+        let e = skin[if j + 1 == m { 0 } else { j + 1 }] - a;
         let l2 = len_sq(e);
         let s = if l2 > 1e-12 { ((p - a).dot(e) / l2).clamp(0.0, 1.0) } else { 0.0 };
         let q = a + e * s;
-        ((q - p).length(), q)
+        (len_sq(q - p), q)
     };
     let per = (m / b.outline.len().max(1)).max(1);
-    let mut queue: Vec<usize> = Vec::with_capacity(n);
-    let mut seen = vec![false; n];
-    // The outline cells: their own stretch of the skin and the next ones'.
-    for (k, &c) in b.outline.iter().enumerate() {
-        let c = c as usize;
+    // Searches segments from..from + count (wrapping) for cell c.
+    let search = |c: usize, from: usize, count: usize, best: &mut (f32, usize, Vector2)| {
         let p = b.pos[c];
-        for o in 0..(4 * per) {
-            let j = (k * per + m + o - 2 * per) % m;
-            let (dist, q) = seg(j, p);
-            if dist < d[c] {
-                d[c] = dist;
-                near[c] = j;
-                let v = q - p;
-                if v.length() > 1e-6 {
-                    dir[c] = v / v.length();
-                }
+        for o in 0..count {
+            let j = (from + o) % m;
+            let (d2, q) = seg(j, p);
+            if d2 < best.0 {
+                *best = (d2, j, q);
             }
         }
-        if !seen[c] {
-            seen[c] = true;
+    };
+    let mut queue: Vec<usize> = Vec::with_capacity(n);
+    for (k, &c) in b.outline.iter().enumerate() {
+        let c = c as usize;
+        let mut best = (d[c] * d[c], near[c], Vector2::ZERO);
+        search(c, (k * per + m - per) % m, 3 * per, &mut best);
+        if best.0 < d[c] * d[c] {
+            d[c] = best.0.sqrt();
+            near[c] = best.1;
+            let v = best.2 - b.pos[c];
+            if d[c] > 1e-6 {
+                dir[c] = v / d[c];
+            }
+        }
+        if hop[c] != 0 {
+            hop[c] = 0;
             queue.push(c);
         }
     }
-    // Inward, breadth first: each cell tries the segments its neighbours found nearest.
     let mut h = 0;
     while h < queue.len() {
         let u = queue[h];
         h += 1;
         for q in b.nb_start[u] as usize..b.nb_start[u + 1] as usize {
             let v = b.nb[q].0 as usize;
-            if seen[v] {
+            if hop[v] != u32::MAX {
                 continue;
             }
-            seen[v] = true;
-            let p = b.pos[v];
+            hop[v] = hop[u] + 1;
+            queue.push(v);
+            // Its two nearest neighbours already reached.
+            let (mut a, mut b2) = (usize::MAX, usize::MAX);
             for w in b.nb_start[v] as usize..b.nb_start[v + 1] as usize {
                 let x = b.nb[w].0 as usize;
-                if near[x] == usize::MAX {
+                if hop[x] >= hop[v] || !d[x].is_finite() {
                     continue;
                 }
-                for o in 0..(2 * per + 1) {
-                    let j = (near[x] + m + o - per) % m;
-                    let (dist, qp) = seg(j, p);
-                    if dist < d[v] {
-                        d[v] = dist;
-                        near[v] = j;
-                        let vv = qp - p;
-                        if vv.length() > 1e-6 {
-                            dir[v] = vv / vv.length();
-                        }
-                    }
+                if a == usize::MAX || d[x] < d[a] {
+                    b2 = a;
+                    a = x;
+                } else if b2 == usize::MAX || d[x] < d[b2] {
+                    b2 = x;
                 }
             }
-            queue.push(v);
+            if a == usize::MAX {
+                continue;
+            }
+            if hop[v] <= EXACT_HOPS {
+                let mut best = (f32::INFINITY, usize::MAX, Vector2::ZERO);
+                for x in [a, b2] {
+                    if x != usize::MAX && near[x] != usize::MAX {
+                        search(v, (near[x] + m - per) % m, 2 * per + 1, &mut best);
+                    }
+                }
+                if best.1 != usize::MAX {
+                    d[v] = best.0.sqrt();
+                    near[v] = best.1;
+                    if d[v] > 1e-6 {
+                        dir[v] = (best.2 - b.pos[v]) / d[v];
+                    }
+                    continue;
+                }
+            }
+            d[v] = d[a] + (b.pos[v] - b.pos[a]).length();
+            dir[v] = dir[a];
         }
     }
     for c in 0..n {

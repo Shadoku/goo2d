@@ -27,6 +27,19 @@ enum Body {
 @export var name: StringName = &"plain"
 ## The skin's colour of this type's cells.
 @export var color: Color = Color(0.35, 0.75, 0.45)
+@export_group("Look")
+## The goo skin's walls round this type's cells (goo_honeycomb.gdshader): their colour
+## (alpha 0: the type's colour, darker; alpha blends toward it) and how strong they are
+## (× the world's wall_strength).
+@export var wall_color: Color = Color(0, 0, 0, 0)
+@export_range(0.0, 4.0, 0.01, "or_greater") var wall_strength: float = 1.0
+## Each cell's dome (× the world's dome_strength and dome_highlight).
+@export_range(0.0, 4.0, 0.01, "or_greater") var dome: float = 1.0
+## Its highlights (the specular, the domes' spots) × this.
+@export_range(0.0, 4.0, 0.01, "or_greater") var gloss: float = 1.0
+## The goo's own colour over what shows through (× the world's goo_opacity).
+@export_range(0.0, 4.0, 0.01, "or_greater") var opacity: float = 1.0
+@export_group("")
 ## Mass per area × this (a cell's mass is its area × the world's density × this).
 @export_range(0.05, 20.0, 0.01, "or_greater") var mass_factor: float = 1.0
 ## A design's radius × this when the creature is made.
@@ -69,6 +82,11 @@ func kernel_params() -> Dictionary:
 		"pad": contact_pad * GooTuning.unit, "body": modes[body], "collide": collides,
 		"walls": collides_walls, "color": color, "swim": swim_weight,
 	}
+
+## The look table's row of this type (goo_honeycomb.gdshader's type_look): wall_strength,
+## dome, gloss, opacity.
+func look_row() -> Vector4:
+	return Vector4(wall_strength, dome, gloss, opacity)
 
 ## Whether cells of this type and of `other` may join (each one's mask holds a layer of
 ## the other's).

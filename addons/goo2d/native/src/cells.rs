@@ -3950,7 +3950,12 @@ mod goo_mesh_tests {
             for i in 0..b.n {
                 let dd = m.cells[CELL_FLOATS * i + 6];
                 let brute = (0..skin.len()).map(|k| seg_dist(b.pos[i], skin[k], skin[(k + 1) % skin.len()])).fold(f32::INFINITY, f32::min);
-                assert!((dd - brute).abs() < 0.01, "cell {i}: {dd} against {brute}");
+                // Exact near the skin; deeper (where it only says "deep") never less.
+                if brute < 3.5 * 7.0 {
+                    assert!((dd - brute).abs() < 0.01, "cell {i}: {dd} against {brute}");
+                } else {
+                    assert!(dd >= brute - 0.01 && dd < brute * 1.2, "cell {i}: {dd} against {brute}");
+                }
                 if b.boundary[i] {
                     // About its radius (less at a corner, which the curve cuts).
                     assert!(dd > 0.6 * 7.0 && dd < 1.1 * 7.0, "an outline cell {dd} px from the skin");
@@ -3959,7 +3964,7 @@ mod goo_mesh_tests {
             // The middle cell: deepest, about three cells in.
             let mid = (0..b.n).min_by(|&x, &y| (b.pos[x] - Vector2::new(300.0, 200.0)).length().partial_cmp(&(b.pos[y] - Vector2::new(300.0, 200.0)).length()).unwrap()).unwrap();
             let deep = m.cells[CELL_FLOATS * mid + 6];
-            assert!(deep > 6.0 * 7.0 && deep < 7.5 * 7.0, "{deep}");
+            assert!(deep > 6.0 * 7.0 && deep < 8.0 * 7.0, "{deep}");
         }
     }
 
@@ -4035,6 +4040,14 @@ mod mesh_bench {
         let mut v = 0;
         for _ in 0..1000 { v = std::hint::black_box(crate::cells_draw::creature_mesh(b, &cl.opt.types, true)).points.len(); }
         let m = t.elapsed().as_micros() as f64 / 1000.0;
-        println!("cells {} walk {:.1} us, mesh {:.1} us, {} vertices", b.n, w, m, v);
+        let t = std::time::Instant::now();
+        let mut vg = 0;
+        for _ in 0..1000 { vg = std::hint::black_box(crate::cells_draw::creature_mesh_goo(b, 0, false)).points.len(); }
+        let g = t.elapsed().as_micros() as f64 / 1000.0;
+        let skin = crate::cells_draw::goo_skin(b);
+        let t = std::time::Instant::now();
+        for _ in 0..1000 { std::hint::black_box(crate::cells_draw::outline_distances(b, &skin)); }
+        let od = t.elapsed().as_micros() as f64 / 1000.0;
+        println!("cells {} walk {:.1} us, mesh {:.1} us, {} vertices; goo mesh {:.1} us ({:.1} of it distances), {} vertices", b.n, w, m, v, g, od, vg);
     }
 }
