@@ -123,8 +123,10 @@ serial, and a replay is identical (tested).
   `self_collision`, `gravity_scale` (1: GooTuning's gravity; 0 top-down), `drag_enabled`,
   `drag_normal`, `drag_linear_normal`, `drag_ratio`, `drag_linear_tangent` (below 0:
   `drag_linear_normal / drag_ratio`), `drag_density`, `current`,
-  `break_force`, `break_leaves_out_own_share`, `draw_skins`, `skin_material`,
-  `draw_borders`, `border_color`, `border_width`, `default_type`.
+  `break_force`, `break_leaves_out_own_share`, `draw_skins`, `skin_mesh` (GOO, the default,
+  or FLAT), `skin_material`, `skin_preset` (GooCellLook's), `draw_borders` (off; lines between
+  types), `border_color`, `border_width`, `default_type`; `current_skin_material()`,
+  `look_table()`, `cell_table()` (the goo skin's, "Drawing").
 
 `GooCellCreature` (a handle; creatures are not nodes): `is_alive()`, `center()`,
 `velocity()`, `turn()`, `heading()`, `spin()`, `mass()`, `cell_count()`, `positions()`,
@@ -535,7 +537,7 @@ creature (threaded) from its link graph:
 - inside the outline, every face of the planar link graph: a face of one type is one
   triangle (or a fan); a face of mixed types is cut into one quad per cell (the cell, its two
   links' midpoints, the face's centre), each in its cell's colour, so **each type's cells are
-  one contiguous piece** with a straight border (drawn as lines, `draw_borders`);
+  one contiguous piece** with a straight border (drawn as lines when `draw_borders` is on);
 - around the outline, per outline cell a fan from its centre to its stretch of the skin, a
   quadratic B-spline through the midpoints of the outline pushed out by each cell's radius;
 - a link is split at its midpoint only where a triangle on either side ends there (the rim, a
@@ -546,15 +548,110 @@ creature (threaded) from its link graph:
   disc); a real pocket stays open;
 - the faces are walked once per topology change, not per frame.
 
-Vertex colours are the types' colours; UV.x is 1 inside and 0 on the skin; UV.y is the
-type's slot / 16. `goo_cells.gdshader` draws them flat with a darker edge band;
-`skin_material` replaces it (the contract is in the shader's head).
+That is the flat mesh (`skin_mesh` FLAT): vertex colours are the types' colours; UV.x is 1
+inside and 0 on the skin; UV.y is the type's slot / 16. `goo_cells.gdshader` draws them flat
+with a darker edge band; `skin_material` replaces it (the contract is in the shader's head).
 
-Cost, 30 × 150 (`tools/cell_world_bench.gd --draw`): headless, building 0.24 ms and handing
-over 0.10 ms a frame (4 threads; 20 400 vertices, about 4.5 per cell); under xvfb with the
-real renderer (llvmpipe, which competes for the same 4 cores) 0.22-0.32 ms and 0.18-0.27 ms;
-100 × 150 under xvfb 1.0 and 1.7 ms. Before this stage's rework the same skins cost 4.7 ms
-and 2.8 ms (115 000 unindexed vertices).
+### The goo skin (the default)
+
+`skin_mesh` GOO (the default) draws the same outline and faces as a mesh that tells the shader,
+`goo_honeycomb.gdshader`, enough to draw the ring bodies' wet goo (`goo.gdshader`'s tint, rim,
+fresnel and refraction) faintly honeycombed by the cells' walls, with a light stage on top.
+`cells_draw.rs`'s `creature_mesh_goo()`:
+
+- **Each triangle names three cells**, the same three on its three corners (COLOR.xyz: their
+  indices into the world's **cell table**; a face's triangles name the face's cells, a rim fan
+  its cell and that cell's two outline neighbours, a larger face's fan triangle its two cells
+  and the face's cell nearest its centre). The cell table is a float texture the world
+  updates each frame (`cell_table()`: 512 cells a row, two RGBA texels a cell: centre, radius,
+  turn; type slot, a seed from the uid, its distance to the outline, on the outline). From
+  the three cells the shader works out, per fragment and exactly: which cell it is in and its
+  distance to that cell's walls in px (the **power diagram**, |p − c|² − r² equal on both
+  sides, so the walls are a constant width at any size and right between mixed sizes), a
+  coordinate fixed in the cell and turned with it (its dome, its bubble), and the types'
+  blend.
+- **Borders between types are smooth**: each triangle's types blend by its barycentric
+  coordinates among its three cells (a rim fan's by projection along its two links, which
+  agree on every shared edge), sharpened (`border_sharpness`): the 50 % line runs straight
+  through the link midpoints, so a row of another type reads as a band with soft straight
+  edges, not the packing's zigzag, and the walls run on across it.
+- **COLOR.w is the distance to the outline in px** (0 on the skin), so the rim has a constant
+  width at any cell size; exact (against the skin curve) for cells within three links of the
+  outline, a shortest path through the cells deeper (where only "deep" matters); UV is the
+  outward direction (toward the nearest point of the skin; the curve's normal on it).
+- Vertices are shared within a face or a fan (one triple), not across: about 1.9 times the
+  flat mesh's (30 × 150: 38 760 against 20 400). Links are split only on the rim now (a mixed
+  face is no longer cut into quads); still no T-junction (the same cargo test).
+- The silhouette is antialiased by the shader over a pixel of the outline distance (the
+  triangles have none).
+
+Two stages in one pass: `base()` is the goo, `lit()` the light (thickness: darker and denser
+toward the middle, lit from the light's side; the surface's specular and fresnel on the rim's
+normal, as the rings'; a broad sheen; each cell a faint dome, lighter on its lit side, with a
+small highlight). One pass, not a second draw, because the light needs only the per-fragment
+fields the pass already has; a second draw would hand the mesh over twice and need a back-buffer
+copy for nothing. Everything is fixed in the material: the walls and domes come from the cells'
+positions, the bubbles from each cell's seed in its own turned frame, so they ride the cells as
+they bend and swim, and a topology change or an added cell changes no fragment's cells but
+those near it (the power diagram is the same whichever triangles name it).
+
+**The look.** World-level uniforms on the material (lengths in px at `GooTuning.unit` 1; the
+world sets `length_unit`), with GooCellLook's presets as uniform sets of them
+(`skin_preset`: FAINT, the default, CELLULAR, MEMBRANE, or CUSTOM to leave the material
+alone; `GooCellLook.apply(material, preset, overrides)`); per type, `GooCellType`'s look
+fields reach a 16-row look table (`type_color`, `type_wall`, `type_look` = wall_strength,
+dome, gloss, opacity), sent when a type is registered or `update_type()`d, so one draw keeps
+serving the whole world:
+
+| uniform | default | FAINT | CELLULAR | MEMBRANE | what |
+|---|---|---|---|---|---|
+| `goo_opacity` | 0.3 | 0.3 | 0.32 | 0.34 | the goo's own colour over what shows through |
+| `rim_width` (px) | 16 | 16 | 14 | 24 | the rim's roll-off to edge-on |
+| `rim_strength`, `fresnel_power` | 0.85, 2.2 | 0.85 | 0.8 | 1.0 | its fresnel glow |
+| `rim_density` | 0.35 | 0.35 | 0.3 | 0.3 | darker, denser toward the rim |
+| `refraction_px` (px) | 18 | 18 | 16 | 22 | the background displaced at the rim |
+| `cell_refraction_px` (px) | 2 | 1.5 | 4 | 1 | each cell's dome a small lens |
+| `wall_width`, `wall_softness` (px) | 1.5, 1 | 1.5, 1 | 2, 1.2 | 1.5, 1.5 | the walls |
+| `wall_strength` | 0.2 | 0.16 | 0.3 | 0.12 | how dark (× a type's `wall_strength`) |
+| `wall_highlight` | 0 | 0 | 0.2 | 0 | a thin light line beside each wall's lit side |
+| `wall_rim_fade` | 0.5 | 0.6 | 0.4 | 1 | walls fading within the rim |
+| `border_sharpness` | 3 | 3 | 4 | 2.5 | the types' blend: 1 a gradient across a triangle |
+| `membrane_width` (px), `membrane_strength` | 0, 0 | 0, 0 | 0, 0 | 9, 0.7 | a clearer band inside the skin closed by a line |
+| `cloud` | 0 | 0 | 0 | 0.4 | milky with depth, each cell its own |
+| `bubble_density`, `bubble_strength` | 0.12, 0.6 | 0.12, 0.6 | 0.1, 0.5 | 0.15, 0.7 | a bubble in that share of cells |
+| `light_dir` | (−0.55, −0.7, 0.75) | | | | the rings' light |
+| `shade_depth` (px), `shade_strength` | 40, 0.2 | 40, 0.18 | 40, 0.15 | 50, 0.12 | thickness |
+| `side_light` | 0.2 | 0.18 | 0.15 | 0.25 | the thickness lit from the light's side |
+| `specular_power`, `specular_strength` | 90, 1.4 | 90, 1.4 | 90, 1.2 | 70, 1.6 | the surface's highlight |
+| `sheen_strength` | 0.22 | 0.22 | 0.15 | 0.3 | a broad sheen |
+| `dome_strength`, `dome_highlight`, `dome_power` | 0.2, 0.08, 18 | 0.15, 0.06, 18 | 0.45, 0.25, 22 | 0.1, 0.04, 16 | each cell's dome: its tilt, its highlight |
+| `debug_view` | 0 | | | | 1 outline distance, 2 wall distance, 3 cells and blend, 4 outward |
+
+`tools/cells_look.gd` renders the presets (examples/cells after 3 s, a strip beside a ring body
+at 14 and 7 px cells, 4× crops, a swimming worm twice) with `--set=uniform=value,...` on top.
+
+**Its cost** (`tools/cell_world_bench.gd --draw --skin=goo|flat`, swimming, 4 threads; the
+build is the kernel's mesh and table, the hand-over the triangle array and the table texture;
+two runs each, the first before the outline distances were limited to three links, on a noisy
+4-core machine):
+
+| | vertices | build (ms) | hand-over (ms) |
+|---|---|---|---|
+| 30 × 150 flat, headless | 20 400 | 0.39-0.40 | 0.14 |
+| 30 × 150 goo, headless | 38 760 | 0.68-0.85 | 0.31 |
+| 30 × 150 flat, xvfb | 20 400 | 0.41-0.42 | 0.34-0.35 |
+| 30 × 150 goo, xvfb | 38 760 | 0.70-1.39 | 0.75-1.41 |
+| 100 × 150 flat, headless | 68 000 | 2.25-2.38 | 0.44-0.45 |
+| 100 × 150 goo, headless | 129 200 | 4.5-4.7 | 0.94-0.97 |
+| 100 × 150 flat, xvfb | 68 000 | 1.15-1.17 | 1.43-2.35 |
+| 100 × 150 goo, xvfb | 129 200 | 2.3-2.4 | 3.4-5.7 |
+
+About twice the flat skin's: 1.9 times the vertices, the outline distances (the cargo bench
+`mesh_cost`, a 169-cell blob single-threaded: flat 7-12 µs, goo 20 µs of which 10 µs the
+distances) and a 128 kB table upload at 100 × 150. Under xvfb llvmpipe renders on the same 4
+cores, so the costlier fragment shader slows the step there too; on a GPU it would not. Not yet
+done: the per-creature parts are copied once more when concatenated, and the table is a fresh
+Image each frame.
 
 **The skin over walls at concave corners: bounded, not fixed.** Every drawn point lies
 within 0.43 of a radius of some cell's disc (measured 5.8 px for 14 px cells; the notch

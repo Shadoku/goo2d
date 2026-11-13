@@ -66,7 +66,8 @@ uniform float wall_rim_fade : hint_range(0.0, 1.0) = 0.5;
 // Two types' colours blend over their border: 1 a gradient across a whole triangle of
 // cells, higher sharper (the border stays a smooth curve).
 uniform float border_sharpness : hint_range(1.0, 12.0) = 3.0;
-// An outer membrane: a denser band of this width (px) inside the skin (0 none).
+// An outer membrane: a clearer band of this width (px) inside the skin, closed by a line
+// like a wall, covering the walls within it (0 none); membrane_strength how much.
 uniform float membrane_width : hint_range(0.0, 32.0) = 0.0;
 uniform float membrane_strength : hint_range(0.0, 1.0) = 0.0;
 // The inside clouded (milky) with depth, each cell a little different (0 clear).
@@ -91,6 +92,11 @@ uniform float sheen_strength : hint_range(0.0, 1.0) = 0.22;
 uniform float dome_strength : hint_range(0.0, 2.0) = 0.2;
 uniform float dome_highlight : hint_range(0.0, 1.0) = 0.08;
 uniform float dome_power : hint_range(1.0, 128.0) = 18.0;
+
+// A debugging view in place of the look: 1 the outline distance (a band every 4 px, red
+// within rim_width), 2 the wall distance (a band every 2 px), 3 the cell owned (by its
+// seed) and the types' blend, 4 the outward direction. 0 the look.
+uniform int debug_view : hint_range(0, 4) = 0;
 
 varying vec2 v_pos;
 varying flat vec3 v_cells;
@@ -218,25 +224,30 @@ Cells cells_at(vec2 p, vec2 light2) {
 }
 
 // The base: what the ring goo draws, from the fields.
-vec3 base(vec3 bg, vec3 tint, vec3 wall_colour, vec4 look, Cells cl, float d, float e, float wall_mask, vec4 bubble) {
+vec3 base(vec3 bg, vec3 tint, vec3 wall_colour, vec4 look, Cells cl, float d, float e, float wall_mask, float line_w, float soft, vec4 bubble) {
 	vec3 transmitted = bg * mix(vec3(1.0), tint, 0.4) * 1.6;
 	vec3 body = mix(transmitted, tint, clamp(goo_opacity * look.w, 0.0, 1.0));
 	// Thicker goo toward the rim reads darker and more saturated.
 	body = mix(body, tint * 0.55, rim_density * pow(e, 1.5));
-	// The membrane: a denser band just inside the skin.
+	// The membrane: a clearer band just inside the skin, closed by a line like a wall.
 	float mw = membrane_width * length_unit;
+	float band = 0.0;
 	if (mw > 0.0) {
-		float band = 1.0 - smoothstep(mw * 0.5, mw, d);
-		body = mix(body, tint * 0.5 + bg * 0.15, membrane_strength * band);
+		band = (1.0 - smoothstep(mw - soft, mw, d)) * membrane_strength;
+		body = mix(body, mix(transmitted, tint, 0.15) * 1.1, band * 0.6);
 	}
-	// Clouded inside: milky with depth, each cell its own a little.
+	// Clouded inside: milky with depth (beyond the membrane), each cell its own a little.
 	if (cloud > 0.0) {
-		float depth = smoothstep(0.0, shade_depth * length_unit, d);
+		float depth = smoothstep(mw, mw + shade_depth * length_unit, d);
 		float own = 0.75 + 0.5 * cl.seed;
 		body = mix(body, mix(tint, vec3(1.0), 0.3), cloud * depth * own * (1.0 - 0.35 * dot(cl.offset, cl.offset)));
 	}
-	// The walls.
-	body = mix(body, wall_colour, clamp(wall_strength * look.x * wall_mask, 0.0, 1.0));
+	// The walls (the membrane covers theirs), and the membrane's own line.
+	body = mix(body, wall_colour, clamp(wall_strength * look.x * wall_mask * (1.0 - band), 0.0, 1.0));
+	if (mw > 0.0) {
+		float line = 1.0 - smoothstep(line_w, line_w + soft, abs(d - mw));
+		body = mix(body, wall_colour, clamp(line * membrane_strength, 0.0, 1.0));
+	}
 	// A bubble: a lens of its own, lighter inside.
 	body = mix(body, mix(body, vec3(1.0), 0.35) + tint * 0.1, bubble.y * 0.45 * bubble_strength);
 	return body;
@@ -332,9 +343,22 @@ void fragment() {
 		lit_mask = (1.0 - smoothstep(0.0, soft + aa, abs(x - soft))) * (1.0 - wall_rim_fade * e);
 	}
 
-	vec3 body = base(bg, tint, wall_colour, look, cl, d, e, wall_mask, bubble);
+	vec3 body = base(bg, tint, wall_colour, look, cl, d, e, wall_mask, max(half_w, 0.5 * length_unit), soft, bubble);
 	vec3 col = lit(body, tint, look, cl, n, n_body, n_cell, thick, lit_mask, bubble);
 	// The silhouette: a pixel's antialiased fade at the skin (the triangles have none).
 	float edge = clamp(d / max(fwidth(d), 1e-3), 0.0, 1.0);
 	COLOR = vec4(col, tint4.a * edge);
+	if (debug_view > 0) {
+		vec3 dv = vec3(0.0);
+		if (debug_view == 1) {
+			dv = vec3(d < rim_w ? 0.8 : 0.2, fract(d / 4.0), 0.3);
+		} else if (debug_view == 2) {
+			dv = vec3(fract(cl.wall / 2.0), cl.wall < half_w ? 1.0 : 0.0, 0.3);
+		} else if (debug_view == 3) {
+			dv = mix(vec3(hash12(vec2(cl.seed * 97.0, 1.0)), hash12(vec2(cl.seed * 53.0, 2.0)), 0.5) * 0.5, tint, 0.5);
+		} else {
+			dv = vec3(outward * 0.5 + 0.5, 0.5);
+		}
+		COLOR = vec4(dv, 1.0);
+	}
 }
