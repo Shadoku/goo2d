@@ -5,7 +5,7 @@ extends SceneTree
 ##   godot --headless --path . -s tools/cell_world_bench.gd -- [--creatures=30] [--cells=150]
 ##     [--mode=collide|swim] [--body=links|shape|regions] [--threads=4] [--substeps=6]
 ##     [--frames=360] [--water=none|uniform|cells] [--ratio=20] [--seed=1]
-##     [--proxies=none|circles|hull] [--real] [--rings=0] [--couple=1] [--servo=0]
+##     [--proxies=none|circles|hull] [--real] [--rings=0] [--couple=1] [--servo=0] [--skin=goo|flat]
 ## collide: hex blobs pushed at 300 px/s² toward a random point that changes every 2 s;
 ## swim: hex worms (cells / 5 long, 5 wide) swimming by their pose wave (slope 1, a body
 ## length, 0.8-1.2 Hz) steered toward their point by a curvature bias. --water=cells feeds
@@ -78,6 +78,7 @@ func _world() -> GooCellWorld2D:
 		_:
 			w.body_mode = GooCellWorld2D.BodyMode.SHAPE
 	w.draw_skins = bool(o("draw", false))
+	w.skin_mesh = GooCellWorld2D.SkinMesh.FLAT if String(o("skin", "goo")) == "flat" else GooCellWorld2D.SkinMesh.GOO
 	root.add_child(w)
 	w.set_physics_process(false)
 	return w
