@@ -449,6 +449,8 @@ pub struct Cells {
     pub events: Vec<[i32; 4]>,
     pub next_uid: u32,
     pub frame: u64,
+    /// A GooKernel's rings coupled to the creatures (couple.rs; off unless given).
+    pub ghosts: crate::couple::Ghosts,
 }
 
 #[derive(Default, Clone, Debug)]
@@ -469,7 +471,7 @@ pub struct Stats {
 
 impl Default for Cells {
     fn default() -> Self {
-        Cells { opt: Opt::default(), bodies: Vec::new(), statics: Vec::new(), next_wall_id: -1, pool: None, pool_threads: 1, grid_cell: 64.0, stats: Stats::default(), cross: Vec::new(), events: Vec::new(), next_uid: 0, frame: 0 }
+        Cells { opt: Opt::default(), bodies: Vec::new(), statics: Vec::new(), next_wall_id: -1, pool: None, pool_threads: 1, grid_cell: 64.0, stats: Stats::default(), cross: Vec::new(), events: Vec::new(), next_uid: 0, frame: 0, ghosts: Default::default() }
     }
 }
 
@@ -2092,6 +2094,9 @@ impl Cells {
         for l in lists {
             self.cross.extend(l);
         }
+        if self.ghosts.on {
+            self.ghosts.broad(&self.bodies, &opt, dt);
+        }
         let t2 = Instant::now();
         let h = dt / opt.substeps as f32;
         let mut solve_us = 0u64;
@@ -2108,6 +2113,9 @@ impl Cells {
             let tb = Instant::now();
             for _ in 0..opt.contact_iters.max(1) {
                 solve_cross(&mut self.bodies, &self.cross, &opt, h);
+            }
+            if self.ghosts.on {
+                self.ghosts.substep(&mut self.bodies, &opt, h, s);
             }
             solve_us += (tb - ta).as_micros() as u64;
             serial_us += tb.elapsed().as_micros() as u64;

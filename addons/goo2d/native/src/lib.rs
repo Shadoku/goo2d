@@ -18,6 +18,7 @@ mod cells;
 mod cells_draw;
 mod colony;
 mod consts;
+mod couple;
 mod forces;
 mod geom;
 mod grid;
@@ -2302,6 +2303,59 @@ impl GooCells {
     #[func]
     fn step(&mut self, delta: f64) {
         self.c.step(delta as f32);
+    }
+
+    /// Couples `kernel`'s rings to the creatures for the next step (src/couple.rs): call it
+    /// after the kernel's step and before this step, then couple_apply() after it. A ring
+    /// weighs its target area × `density` (the cells' units: a cell weighs its area × the
+    /// options' density × its type's mass factor); `rigidity` (0..1 a substep) holds a
+    /// touched ring to its shape within the frame.
+    #[func]
+    fn couple_gather(&mut self, kernel: Gd<GooKernel>, density: f64, rigidity: f64, delta: f64) {
+        let k = kernel.bind();
+        let g = &mut self.c.ghosts;
+        g.on = true;
+        g.rigidity = (rigidity as f32).clamp(0.0, 1.0);
+        g.gather_kernel(&k.k, density as f32, delta as f32);
+    }
+
+    /// The step's corrections handed to `kernel`'s beads (src/couple.rs).
+    #[func]
+    fn couple_apply(&mut self, kernel: Gd<GooKernel>) {
+        let mut k = kernel.clone();
+        let mut kb = k.bind_mut();
+        self.c.ghosts.apply(&mut kb.k);
+    }
+
+    /// Stops coupling (the next step sees no rings).
+    #[func]
+    fn uncouple(&mut self) {
+        let g = &mut self.c.ghosts;
+        g.on = false;
+        g.begin(0.0);
+        g.cell_pairs.clear();
+        g.bead_pairs.clear();
+    }
+
+    /// The last step's coupling: rings (gathered), active (near a creature), touched,
+    /// cell_pairs, bead_pairs, contacts (solved, over the substeps), inside (centres found
+    /// inside the other's outline), worst (the deepest overlap found, px), momentum (what
+    /// the cells handed the rings, cells' units).
+    #[func]
+    fn coupling_stats(&self) -> VarDictionary {
+        let g = &self.c.ghosts;
+        let mut d = VarDictionary::new();
+        put(&mut d, "on", g.on);
+        put(&mut d, "rings", g.rings.len() as i64);
+        put(&mut d, "active", g.rings.iter().filter(|r| r.active).count() as i64);
+        put(&mut d, "touched", g.touched_rings() as i64);
+        put(&mut d, "cell_pairs", g.cell_pairs.len() as i64);
+        put(&mut d, "bead_pairs", g.bead_pairs.len() as i64);
+        put(&mut d, "contacts", g.contacts as i64);
+        put(&mut d, "inside", g.inside as i64);
+        put(&mut d, "worst", g.worst as f64);
+        put(&mut d, "momentum", g.momentum_given());
+        d
     }
 
     /// Creature slots (a merged creature's slot stays, dead).

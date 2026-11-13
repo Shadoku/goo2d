@@ -309,6 +309,12 @@ func refresh_static_shapes() -> void:
 	kernel()
 	_statics.refresh()
 
+## Makes this world's bodies and `cells`' creatures collide: GooCellWorld2D.couple(self)
+## (the cell world resolves the contacts and steps after this one; docs/cells.md, "Rings
+## and cells").
+func couple(cells: GooCellWorld2D) -> void:
+	cells.couple(self)
+
 # Every body's physics frame: the merge locks and transitions (which may swap
 # two bodies for their merge), then the kernel's step (the static shapes
 # brought up to date, the pair passes, every ring's solver substeps, contacts,

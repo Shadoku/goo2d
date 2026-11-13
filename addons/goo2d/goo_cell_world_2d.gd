@@ -6,7 +6,9 @@ extends Node2D
 ## GooWorld2D does), steps it in _physics_process and draws every creature's skin as one
 ## triangle array. Creatures are not nodes: spawn() returns a GooCellCreature handle.
 ##
-## The cell creatures and a GooWorld2D's ring bodies do not collide with each other.
+## The cell creatures collide with a GooWorld2D's ring bodies once the two are coupled
+## (couple(), or ring_world): this world steps after that one and resolves every contact
+## between a ring and a cell itself, both ways (docs/cells.md, "Rings and cells").
 ##
 ## Every frame: walls synced, grabs held, the water fed (water_source), the step, its
 ## events as signals, a retopology when one was asked for, the skins drawn.
@@ -151,6 +153,14 @@ const GRAB_REACH: float = 3.0
 @export var border_width: float = 2.0
 ## The type of cells whose design names none.
 @export var default_type: GooCellType = null
+## A GooWorld2D whose ring bodies collide with this world's creatures (couple() at ready).
+@export var ring_world: NodePath = NodePath()
+## A coupled ring weighs its area × this (a cell weighs its area × its type's mass factor:
+## 1, a ring weighs what cells of its area weigh).
+@export_range(0.0, 10.0, 0.01, "or_greater") var ring_density: float = 1.0
+## How firmly a coupled ring keeps its shape within a frame against a cell's push (0..1, a
+## substep's pull toward a rigid fit of where its beads would be).
+@export_range(0.0, 1.0, 0.01) var ring_rigidity: float = 0.3
 ## Called with every live creature's cell centres (one PackedVector2Array, slot order) each
 ## frame before the step; returns the water's velocity there (empty: none, one value for
 ## all, or one per point), e.g. a flow field's velocities_at. Invalid: not called.
@@ -167,6 +177,7 @@ var _item: RID = RID()
 var _material: Material = null
 var _grabs: Dictionary[int, Dictionary] = {}
 var _next_grab: int = 1
+var _rings: GooWorld2D = null
 ## The last frame's skin build (µs in the kernel, µs handing it to the RenderingServer).
 var draw_stats: Dictionary = {"mesh_us": 0, "submit_us": 0, "vertices": 0, "triangles": 0}
 
@@ -194,6 +205,12 @@ func _ready() -> void:
 	_item = RenderingServer.canvas_item_create()
 	RenderingServer.canvas_item_set_parent(_item, get_canvas_item())
 	_apply_material()
+	if not ring_world.is_empty() and _rings == null:
+		var other := get_node_or_null(ring_world) as GooWorld2D
+		if other == null:
+			push_error("GooCellWorld2D: ring_world is not a GooWorld2D")
+		else:
+			couple(other)
 
 func _notification(what: int) -> void:
 	if what == NOTIFICATION_PREDELETE and _item.is_valid():
@@ -473,6 +490,31 @@ func _hold_grabs() -> void:
 		for k: int in held:
 			c.set_cell_force(cr.id, k, f)
 
+# --- Rings ----------------------------------------------------------------------------
+
+## Makes `world`'s ring bodies and this world's creatures collide (docs/cells.md, "Rings
+## and cells"). This world must step after `world`: its process_physics_priority is raised
+## above `world`'s if it is not already (step() by hand: the ring world's first).
+func couple(world: GooWorld2D) -> void:
+	_rings = world
+	if world != null and process_physics_priority <= world.process_physics_priority:
+		process_physics_priority = world.process_physics_priority + 1
+
+## Rings and creatures pass through each other again.
+func uncouple() -> void:
+	_rings = null
+	if _cells != null:
+		_cells.uncouple()
+
+## The GooWorld2D coupled (null: none).
+func coupled_world() -> GooWorld2D:
+	return _rings if _rings != null and is_instance_valid(_rings) else null
+
+## The last step's coupling (GooCells.coupling_stats()): rings, active, touched,
+## cell_pairs, bead_pairs, contacts, inside, worst (px), momentum.
+func coupling_stats() -> Dictionary:
+	return cells().coupling_stats()
+
 # --- Stepping --------------------------------------------------------------------------
 
 func _physics_process(delta: float) -> void:
@@ -488,7 +530,14 @@ func step(delta: float) -> void:
 	if water_source.is_valid():
 		var points: PackedVector2Array = c.centers_all()[0]
 		c.set_water_all(water_source.call(points))
+	var rings := coupled_world()
+	if rings == null and _rings != null:
+		uncouple()
+	if rings != null:
+		c.couple_gather(rings.kernel(), ring_density, ring_rigidity, delta)
 	c.step(delta)
+	if rings != null:
+		c.couple_apply(rings.kernel())
 	_dispatch_events()
 	if _retopology:
 		_retopology = false
