@@ -382,9 +382,13 @@ pub const SERVO_RELEASE: f32 = 0.1;
 /// force), its change capped at `max_acc` × the substep. The target is capped so the
 /// farthest cell's centre moves at most `max_tip` px/s about the centre. While a cell is in
 /// contact (the last substep's: a wall, a moving obstacle, a ring, another creature) and
-/// the servo's turn would move it into that contact, the change is scaled down toward
-/// `yield_` (1: no yield), smoothly by how squarely it would (the cosine), rising at once
-/// and fading over SERVO_RELEASE.
+/// the commanded turn (the target's way) would move it into that contact, the servo yields:
+/// with scale = 1 − (1 − `yield_`) × the contact share (how squarely: the largest cosine
+/// between the turn's motion at a touching cell and its contact normal, rising at once and
+/// fading over SERVO_RELEASE), it holds only scale × its target and drives toward it with
+/// scale × its acceleration (a spin above that is braked at the full acceleration). So a
+/// creature that meets something slows its turn and leans on it instead of batting it on
+/// at full spin. `yield_` 1: no yield (full power).
 #[derive(Clone, Copy, Debug)]
 pub struct SpinServo {
     pub on: bool,
@@ -1576,14 +1580,14 @@ impl Body {
         let sv = self.servo;
         let rmax = r2.sqrt();
         let cap = if sv.max_tip.is_finite() && rmax > 1e-6 { sv.max_tip.max(0.0) / rmax } else { f32::INFINITY };
-        let target = sv.target.clamp(-cap, cap);
+        let mut target = sv.target.clamp(-cap, cap);
         let step = sv.max_acc.max(0.0) * h;
-        let mut dw = (target - spin).clamp(-step, step);
-        // The yield: how squarely the turn would move a touching cell into its contact.
+        // The yield: how squarely the commanded turn (the target's way) would move a
+        // touching cell into its contact, held (rising at once, fading over SERVO_RELEASE).
         let y = sv.yield_.clamp(0.0, 1.0);
         let mut hold = sv.hold * (-h / SERVO_RELEASE).exp();
-        if y < 1.0 && dw != 0.0 {
-            let s = dw.signum();
+        let s = if target != 0.0 { target.signum() } else { (target - spin).signum() };
+        if y < 1.0 && s != 0.0 {
             let mut g = 0.0f32;
             for &(cell, nrm) in &self.sub_c {
                 let i = cell as usize;
@@ -1605,7 +1609,13 @@ impl Body {
             self.servo.hold_sign = s;
         }
         let scale = 1.0 - (1.0 - y) * hold;
-        dw *= scale;
+        // Yielding, the servo holds only that share of its target and drives toward it with
+        // that share of its acceleration; it brakes a spin above it at full acceleration.
+        target *= scale;
+        let mut dw = (target - spin).clamp(-step, step);
+        if dw * s > 0.0 {
+            dw *= scale;
+        }
         self.servo.hold = hold;
         self.servo.spin = spin;
         self.servo.capped = target;
@@ -3760,6 +3770,7 @@ mod tests {
         println!("after 0.5 s against the floor: spin {:.3} at yield 1 (scale {:.2}), {:.3} at 0.1 (scale {:.2})", full, s1, tame, s2);
         assert_eq!(s1, 1.0);
         assert!(s2 < 0.2);
+        assert!(tame < 0.5 * full, "yielding, it holds a share of its target");
     }
 
     #[test]

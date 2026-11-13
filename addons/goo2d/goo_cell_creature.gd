@@ -249,9 +249,11 @@ func remove_cell(uid: int) -> void:
 ## force), changing at most `max_angular_acceleration` rad/s². `max_tip_speed` (px/s; INF
 ## none) caps the target so its farthest cell's centre moves at most that fast about the
 ## centre. `contact_yield` (0..1; 1 none): while one of its cells touches a wall, a moving
-## obstacle, a ring or another creature and the turn would move that cell into it, the
-## servo's change is scaled down toward this, by how squarely (it rises at once with the
-## contact and fades over 0.1 s), so a turning creature leans on what it meets instead of
+## obstacle, a ring or another creature and the commanded turn would move that cell into
+## it, the servo holds only a share of its target and drives toward it with that share of
+## its acceleration (a faster spin braked at the full acceleration): the share falls toward
+## `contact_yield` by how squarely the turn meets the contact, at once, and comes back over
+## 0.1 s once it is gone. So a turning creature slows and leans on what it meets instead of
 ## batting it away. A target of 0 stops the spin and holds it. Its angular damping
 ## (set_damping()) is not applied while the servo is on. Tame: a yield of 0.1-0.3 and a
 ## tip speed the game can live with; full power: yield 1, no tip cap.
@@ -275,10 +277,15 @@ func spin_servo() -> Dictionary:
 
 ## The spin that turns through `angle_error` (rad, clockwise positive) fastest without
 ## overshoot at `max_angular_acceleration`: sign × min(max_spin, sqrt(2 a |error|)), the
-## braking curve of a bang-bang turn. Feed it to set_spin_target() every frame with the
-## heading error for a heading servo (docs/cells.md has the numbers it reaches).
-static func spin_toward(angle_error: float, max_spin: float, max_angular_acceleration: float) -> float:
+## braking curve of a bang-bang turn, and with `delta` (the frame, s) at most |error| /
+## delta, so a target set once a frame never carries the turn past the heading within the
+## frame. Feed it to set_spin_target() every frame with the heading error for a heading
+## servo; brake at a little under the servo's acceleration (0.8 of it: docs/cells.md has
+## the numbers it reaches).
+static func spin_toward(angle_error: float, max_spin: float, max_angular_acceleration: float, delta: float = 0.0) -> float:
 	var s := minf(max_spin, sqrt(2.0 * maxf(max_angular_acceleration, 0.0) * absf(angle_error)))
+	if delta > 0.0:
+		s = minf(s, absf(angle_error) / delta)
 	return s * signf(angle_error)
 
 # ---- Contacts ----
