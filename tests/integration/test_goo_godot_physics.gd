@@ -291,3 +291,57 @@ func test_a_character_on_the_wall_layer_pushes_a_blob() -> void:
 	assert_lt(deepest, 2.0 * blob.bead_radius(), "not walked through")
 	character.queue_free()
 	floor.queue_free()
+
+## Rings that lose no momentum of their own (no linear damping), so the momentum a crate
+## hands over can be measured.
+class Undamped extends GooWorld2D:
+	func tuning_for(shape: GooShape, tags: Array = []) -> Dictionary:
+		var t := super(shape, tags)
+		t["linear_damp"] = 0.0
+		return t
+
+# Rings of radius 5 to 44 px at unit 0.5 hit by one crate (2 in RigidBody2D.mass at
+# body_mass_scale 1000: the cells' units, 2000) at 150 px/s: with body_mass_density 1 each ring
+# weighs its target area, and the momentum (rings by area, the crate by mass × scale) is kept
+# for every size; at its bead masses (body_mass_density 0) a ring weighs far less, by size.
+func test_rings_of_every_size_weigh_their_area_against_a_crate() -> void:
+	GooTuning.unit = 0.5
+	var rows: Array[String] = []
+	for density: float in [1.0, 0.0]:
+		for radius: float in [5.0, 8.0, 14.0, 24.0, 34.0, 44.0]:
+			var w := Undamped.new()
+			w.gravity_scale = 0.0
+			w.push_bodies = true
+			w.body_mass_scale = 1000.0
+			w.body_mass_density = density
+			add_child(w)
+			w.kernel().set_solver({"base_damp": 0.0})
+			var blob := w.spawn(radius, Vector2(600, 300))
+			await _frames(2)
+			var crate := _crate(20.0, Vector2(600 - radius - 40.0, 300), 2.0)
+			crate.linear_velocity = Vector2(150, 0)
+			await _frames(1)
+			var area_mass := blob.target_area * maxf(density, 1.0)
+			var scale := w.body_mass_scale
+			var p0 := crate.linear_velocity * crate.mass * scale + blob.average_velocity() * area_mass
+			var p1 := p0
+			var touched := false
+			var over := false
+			for f: int in 90:
+				await get_tree().physics_frame
+				var j := w.kernel().static_impulses()
+				var pushing := j.size() >= 4 and Vector2(j[1], j[2]).length() > 0.0
+				touched = touched or pushing
+				if touched and not pushing and not over:
+					over = true
+					p1 = crate.linear_velocity * crate.mass * scale + blob.average_velocity() * area_mass
+			var change := 100.0 * (p1 - p0).length() / p0.length()
+			rows.append("density %.0f, ring %.0f px (area %.0f, bead masses %.1f): crate 150 -> %.1f px/s, ring -> %.1f px/s; momentum by area %.2f%% off" % [density, blob.radius, blob.target_area, blob.body_mass(), crate.linear_velocity.x, blob.average_velocity().x, change])
+			assert_true(over, "the contact ended")
+			if density > 0.0:
+				assert_lt(change, 3.0, "a %.0f px ring hands over momentum by its area within 3%%" % radius)
+			crate.queue_free()
+			w.queue_free()
+			await _frames(2)
+	for r: String in rows:
+		print("    " + r)

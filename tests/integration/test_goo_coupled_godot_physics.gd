@@ -4,8 +4,9 @@ extends TestCase
 ## (docs/godot-physics.md), in real physics frames at unit 0.5 and zero gravity: a ring, a
 ## creature and a RigidBody2D crate thrown at one point together. Nothing ends inside
 ## anything else (cell centres in the ring, beads in the creature, either in the crate), no
-## error is printed, the momentum of the three is kept once the ring world's
-## body_mass_scale weighs the ring as the coupling does (left at 1 it is not: printed), a
+## error is printed, the momentum of the three is kept once the ring world weighs the ring as
+## the coupling does (body_mass_density = ring_density, one body_mass_scale; matched by hand
+## to the ring it is too; at its bead masses it is not: both printed), a
 ## replay is identical, the crate is
 ## excepted from both worlds' proxies and the proxies of the two worlds never meet in
 ## Godot's server; an Area2D on the proxies' layer sees the ring and the creature. Prints what
@@ -117,16 +118,21 @@ func _momentum(body: Goo2D, cr: GooCellCreature, crate: RigidBody2D) -> Vector2:
 	return body.average_velocity() * body.target_area * cells.ring_density + cr.velocity() * cr.mass() + crate.linear_velocity * crate.mass
 
 # The three thrown together; returns what was measured and the final state.
-func _throw(frames: int = 150, match_masses: bool = true, ring_v: float = SPEED, cell_v: float = SPEED, crate_v: float = SPEED, ring_x: float = -90.0, cell_x: float = 90.0) -> Dictionary:
+func _throw(frames: int = 150, masses: String = "density", ring_v: float = SPEED, cell_v: float = SPEED, crate_v: float = SPEED, ring_x: float = -90.0, cell_x: float = 90.0) -> Dictionary:
 	_scene()
 	var radius := 24.0
 	var half := 16.0
 	var body := rings.spawn(radius, CENTRE + Vector2(ring_x, 0))
 	var cr := cells.spawn(GooCellDesign.hex_blob(2, 7.0), Transform2D(0.0, CENTRE + Vector2(cell_x, 0)))
-	# The ring world pushes the crate with its kernel's bead masses, the coupling weighs
-	# the ring as its area × ring_density in the cells' units: one body_mass_scale on the
-	# ring world makes the three agree for this ring (body mass per area depends on size).
-	if match_masses:
+	# The coupling weighs the ring as its area × ring_density in the cells' units.
+	# "density": the ring world weighs it alike against the crate (body_mass_density =
+	# ring_density, the same body_mass_scale): right for every ring size. "hand": the ring
+	# world's kernel bead masses with a body_mass_scale matched to this ring (body mass per
+	# area depends on size). "none": its bead masses at body_mass_scale 1.
+	if masses == "density":
+		rings.body_mass_density = cells.ring_density
+		rings.body_mass_scale = cells.body_mass_scale
+	elif masses == "hand":
 		rings.body_mass_scale = body.body_mass() / (body.target_area * cells.ring_density) * cells.body_mass_scale
 	var crate_mass := cr.mass() * 0.5
 	var crate := _crate(2.0 * half, CENTRE + Vector2(0, -90), crate_mass)
@@ -199,7 +205,7 @@ func test_a_ring_a_creature_and_a_crate_thrown_together() -> void:
 	print("speeds after: ring %s, creature %s, crate %s px/s; momentum %s -> %s (%.2f%% change)" % [m["speeds"][0], m["speeds"][1], m["speeds"][2], p0, p1, 100.0 * (p1 - p0).length() / p0.length()])
 	print("area saw %s; crate excepted from the ring proxies %s, the cell proxies %s; proxy masks %s, modes %s (kinematic %d)" % [m["seen"], m["excepted_rings"], m["excepted_cells"], m["proxy_masks"], m["proxy_modes"], PhysicsServer2D.BODY_MODE_KINEMATIC])
 	assert_true(m["touched_crate_ring"] and m["touched_crate_cells"], "the crate met the ring and the creature")
-	assert_lt((p1 - p0).length(), 0.02 * p0.length(), "the three's momentum kept within 2% (the ring world's body_mass_scale matched)")
+	assert_lt((p1 - p0).length(), 0.02 * p0.length(), "the three's momentum kept within 2% (the ring world's body_mass_density = ring_density)")
 	assert_eq(m["cells_in_ring"], 0, "no cell centre in the ring at any frame")
 	assert_eq(m["beads_in_creature"], 0, "no bead in the creature at any frame")
 	assert_eq(m["centres_in_crate"], 0, "no bead or cell centre in the crate at any frame")
@@ -220,7 +226,7 @@ func test_a_ring_a_creature_and_a_crate_thrown_together() -> void:
 # against the crate (here about 1/180 of what the coupling weighs it): the crate then barely
 # notices the ring, and the momentum in the coupling's units is not kept.
 func test_unmatched_ring_masses_for_reference() -> void:
-	var m := await _throw(150, false)
+	var m := await _throw(150, "none")
 	var p0: Vector2 = m["p0"]
 	var p1: Vector2 = m["p1"]
 	print("ring world body_mass_scale 1: momentum %s -> %s (%.0f%% change); speeds after: ring %s, creature %s, crate %s; cells in the ring %d, beads in the creature %d, centres in the crate %d" % [
@@ -228,6 +234,14 @@ func test_unmatched_ring_masses_for_reference() -> void:
 	assert_eq(m["cells_in_ring"], 0)
 	assert_eq(m["beads_in_creature"], 0)
 	assert_eq(m["centres_in_crate"], 0)
+
+# The old way: the ring world's bead masses with body_mass_scale matched to this one ring.
+func test_hand_matched_ring_masses_for_reference() -> void:
+	var m := await _throw(150, "hand")
+	var p0: Vector2 = m["p0"]
+	var p1: Vector2 = m["p1"]
+	print("ring world body_mass_scale matched by hand to the 24 px ring: momentum %s -> %s (%.2f%% change)" % [p0, p1, 100.0 * (p1 - p0).length() / p0.length()])
+	assert_lt((p1 - p0).length(), 0.02 * p0.length())
 
 func test_a_replay_is_identical() -> void:
 	var a := await _throw(90)
