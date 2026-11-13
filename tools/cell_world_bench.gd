@@ -5,6 +5,7 @@ extends SceneTree
 ##   godot --headless --path . -s tools/cell_world_bench.gd -- [--creatures=30] [--cells=150]
 ##     [--mode=collide|swim] [--body=links|shape|regions] [--threads=4] [--substeps=6]
 ##     [--frames=360] [--water=none|uniform|cells] [--ratio=20] [--seed=1]
+##     [--proxies=none|circles|hull] [--real]
 ## collide: hex blobs pushed at 300 px/s² toward a random point that changes every 2 s;
 ## swim: hex worms (cells / 5 long, 5 wide) swimming by their pose wave (slope 1, a body
 ## length, 0.8-1.2 Hz) steered toward their point by a curvature bias. --water=cells feeds
@@ -12,6 +13,11 @@ extends SceneTree
 ## current. Prints the step's median / p95 (the whole world.step() without drawing, and
 ## the kernel's share), and with --draw (run under xvfb-run with --rendering-driver
 ## opengl3 for the real renderer) the skins' build and hand-over per frame. A RESULT line.
+## --proxies gives every creature a proxy in Godot's physics (docs/godot-physics.md: a
+## circle per boundary cell, or one hull) and implies --real: the world steps in real
+## physics frames (run with --fixed-fps 60), so Godot's physics server steps between,
+## and the whole frame's wall clock is measured too (what moving the proxies costs the
+## server lands there), with the proxies' shapes moved per frame.
 ##
 ##   godot --headless --path . -s tools/cell_world_bench.gd -- --swim-test [--body=...]
 ##     [--ratio=20] [--long=24] [--wide=5] [--freq=1] [--slope=1] [--seconds=10]
@@ -44,7 +50,7 @@ func _run() -> void:
 	if opts.has("swim-test"):
 		_swim_test()
 	else:
-		_bench()
+		await _bench()
 	quit()
 
 ## A world set up from the options.
@@ -141,6 +147,15 @@ func _bench() -> void:
 			for i: int in points.size():
 				out[i] = (points[i] - centre).orthogonal() * -0.02
 			return out
+	var proxies := String(o("proxies", "none"))
+	var real := bool(o("real", false)) or proxies != "none"
+	if proxies != "none":
+		w.physics_proxies = true
+		w.proxy_shape = GooProxies.Shape.HULL if proxies == "hull" else GooProxies.Shape.CIRCLES
+	var frame_ms: Array[float] = []
+	var update_ms: Array[float] = []
+	var moved := 0
+	var last_tick := 0
 	var frames := int(o("frames", 360))
 	var warm := 60
 	var times: Array[float] = []
@@ -162,11 +177,20 @@ func _bench() -> void:
 				cr.set_pose_wave(1.0, length, freqs[k], clampf(err, -1.0, 1.0) * 0.003)
 			else:
 				cr.push(to.normalized() * 300.0)
+		if real:
+			await physics_frame
+			var now := Time.get_ticks_usec()
+			if last_tick > 0 and f >= warm:
+				frame_ms.append((now - last_tick) / 1000.0)
+			last_tick = now
 		var t0 := Time.get_ticks_usec()
 		w.step(1.0 / 60.0)
 		var ms := (Time.get_ticks_usec() - t0) / 1000.0
 		if f >= warm:
 			times.append(ms)
+			if w.proxies() != null:
+				moved += w.proxies().shapes_moved
+				update_ms.append(w.proxies().update_usec / 1000.0)
 			var s := w.cells().stats()
 			var us := 0
 			for key: String in ["prep_us", "broad_us", "solve_us", "vel_us", "topo_us"]:
@@ -190,8 +214,17 @@ func _bench() -> void:
 		draw = ", skins: build %.3f ms, hand-over %.3f ms, %d vertices" % [mesh_us / 1000.0 / cnt, submit_us / 1000.0 / cnt, vertices]
 	print("cell_world_bench %d × %d %s body %s water %s threads %d substeps %d: world.step median %.2f ms, p95 %.2f, min %.2f (kernel median %.2f)%s; walls %d" % [
 		n, design.cell_count(), "swim" if swim else "collide", String(o("body", "shape")), water, w.threads, w.substeps, med, p95, times[0], kernel[cnt / 2], draw, w.wall_count()])
+	if real:
+		frame_ms.sort()
+		var fc := frame_ms.size()
+		var upd := "0"
+		if not update_ms.is_empty():
+			update_ms.sort()
+			upd = "%.2f ms median, p95 %.2f" % [update_ms[update_ms.size() / 2], update_ms[update_ms.size() * 95 / 100]]
+		print("  real frames: whole frame median %.2f ms, p95 %.2f; proxies %s: %d, %.0f shapes moved per frame, their update %s" % [frame_ms[fc / 2], frame_ms[fc * 95 / 100], proxies,
+			w.proxies().count() if w.proxies() != null else 0, float(moved) / cnt, upd])
 	print("  soundness (worst, every 20th frame): cross overlap %.1f px, cells inside another creature %d, self overlap %.1f px, strain %.2f, shape err %.2f, wall overlap %.1f px, not finite %d" % [worst[0], int(worst[1]), worst[2], worst[3], worst[4], worst[6], int(worst[7])])
-	print("RESULT n=%d m=%d mode=%s body=%s threads=%d median=%.2f p95=%.2f inside=%d" % [n, design.cell_count(), "swim" if swim else "collide", String(o("body", "shape")), w.threads, med, p95, int(worst[1])])
+	print("RESULT n=%d m=%d mode=%s body=%s threads=%d proxies=%s median=%.2f p95=%.2f inside=%d" % [n, design.cell_count(), "swim" if swim else "collide", String(o("body", "shape")), w.threads, proxies, med, p95, int(worst[1])])
 
 func _swim_test() -> void:
 	var w := _world()

@@ -31,8 +31,11 @@ enum Shape {
 var layer: int = GooTuning.LAYER_PROXIES
 var mask: int = 0
 var shape: Shape = Shape.CIRCLES
-## Shapes moved by the last frame's updates (a hull counts 1), for the bench.
+## Shapes moved by the last frame's updates (a hull counts 1), and the microseconds
+## the frame's updates took (begin_frame() to end_frame()), for the bench.
 var shapes_moved: int = 0
+var update_usec: int = 0
+var _begin_usec: int = 0
 
 var _space: RID = RID()
 # key -> { "rid", "owner" (instance id), "count" (shapes), "radii" (the radius keys of
@@ -78,12 +81,14 @@ func shape_count(key: int) -> int:
 func begin_frame() -> void:
 	_frame += 1
 	shapes_moved = 0
+	_begin_usec = Time.get_ticks_usec()
 
 ## Removes the proxies no update named since begin_frame().
 func end_frame() -> void:
 	for key: int in _proxies.keys():
 		if _proxies[key]["seen"] != _frame:
 			remove(key)
+	update_usec = Time.get_ticks_usec() - _begin_usec
 
 ## Moves (making it on first sight) the proxy of `key`, whose object is `owner`, to
 ## the circles of `centers` (global) with `radii` (one per centre, or a single entry for
@@ -232,8 +237,26 @@ func _update_hull(entry: Dictionary, center: Vector2, centers: PackedVector2Arra
 	if hull.size() < 4:
 		return
 	hull.remove_at(hull.size() - 1)
-	var grown := Geometry2D.offset_polygon(hull, grow, Geometry2D.JOIN_ROUND)
-	if grown.is_empty():
-		return
-	PhysicsServer2D.shape_set_data(entry["hull"], grown[0])
+	PhysicsServer2D.shape_set_data(entry["hull"], grown_hull(hull, grow))
 	shapes_moved += 1
+
+## `hull` (convex, either way round, no repeated point) grown by `by` px: each corner
+## replaced by its two points on the grown edges (the round join's ends; the polygon
+## between them cuts the corner's arc by at most by × (1 − cos(turn / 2))).
+static func grown_hull(hull: PackedVector2Array, by: float) -> PackedVector2Array:
+	var n := hull.size()
+	var out := PackedVector2Array()
+	out.resize(2 * n)
+	var area := 0.0
+	for i: int in n:
+		area += hull[i].cross(hull[(i + 1) % n])
+	var side := 1.0 if area > 0.0 else -1.0
+	for i: int in n:
+		var a := hull[(i - 1 + n) % n]
+		var b := hull[i]
+		var c := hull[(i + 1) % n]
+		var n_in := (b - a).orthogonal().normalized() * side
+		var n_out := (c - b).orthogonal().normalized() * side
+		out[2 * i] = b + n_in * by
+		out[2 * i + 1] = b + n_out * by
+	return out
