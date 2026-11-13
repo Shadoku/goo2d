@@ -255,3 +255,39 @@ func test_a_crate_rests_on_a_blob() -> void:
 			floor.queue_free()
 			w.queue_free()
 			await _frames(2)
+
+func test_a_character_on_the_wall_layer_pushes_a_blob() -> void:
+	# With push_bodies on, a CharacterBody2D on GooTuning.LAYER_WALLS (its mask without the
+	# proxies' layer) is a moving obstacle: it walks on and shoves the blob ahead of it.
+	GooTuning.unit = 0.5
+	var floor_y := 500.0
+	var floor := _floor(floor_y)
+	var w := _world(1.0)
+	w.push_bodies = true
+	var r := 20.0
+	var blob := w.spawn(r, Vector2(500, floor_y - r))
+	await _frames(60)
+	var character := CharacterBody2D.new()
+	character.collision_layer = WALLS
+	character.collision_mask = WALLS
+	var half := Vector2(10, 20)
+	character.add_child(_box_shape(half * 2.0))
+	character.position = Vector2(400, floor_y - half.y - 1.0)
+	add_child(character)
+	var x0 := blob.center().x
+	var deepest := -INF
+	for f: int in 120:
+		await get_tree().physics_frame
+		character.velocity = Vector2(100, character.velocity.y + GooTuning.gravity() * get_physics_process_delta_time())
+		character.move_and_slide()
+		var inv := character.global_transform.affine_inverse()
+		for p: Vector2 in blob.bead_points():
+			var q := (inv * p).abs()
+			var outside := Vector2(maxf(q.x - half.x, 0.0), maxf(q.y - half.y, 0.0))
+			var d := outside.length() if outside != Vector2.ZERO else -minf(half.x - q.x, half.y - q.y)
+			deepest = maxf(deepest, blob.bead_radius() - d)
+	print("character walked to %.1f, the blob moved %.1f px (now %.1f px/s), deepest bead into the character %.2f px" % [character.position.x, blob.center().x - x0, blob.average_velocity().x, deepest])
+	assert_gt(blob.center().x - x0, 80.0, "shoved along")
+	assert_lt(deepest, 2.0 * blob.bead_radius(), "not walked through")
+	character.queue_free()
+	floor.queue_free()
