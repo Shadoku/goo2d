@@ -351,6 +351,64 @@ pub struct Swim {
     pub axis: Vector2,
 }
 
+/// What a cell touched (`Touch::kind`): a wall (a static shape never given a motion), a
+/// moving obstacle (obstacles.rs), a coupled ring (couple.rs), another creature.
+pub const TOUCH_WALL: u8 = 0;
+pub const TOUCH_OBSTACLE: u8 = 1;
+pub const TOUCH_RING: u8 = 2;
+pub const TOUCH_CREATURE: u8 = 3;
+
+/// One contact of a cell in the last step: the cell (index and uid), what it touched (a
+/// TOUCH_* kind and its id: the static shape's id, the ring's kernel key, the other
+/// creature's slot) and the unit normal pushing the cell out (from the other toward it).
+#[derive(Clone, Copy, Debug)]
+pub struct Touch {
+    pub cell: u32,
+    pub uid: u32,
+    pub kind: u8,
+    pub id: i64,
+    pub normal: Vector2,
+}
+
+/// How fast the spin servo's contact yield lets go once its cells leave the contact (s):
+/// the yield rises at once with a contact and fades over this, so a contact found in one
+/// substep and lost in the next never makes the servo chatter.
+pub const SERVO_RELEASE: f32 = 0.1;
+
+/// The spin servo (`Body::servo`, set_spin_servo()): every substep the creature's spin (its
+/// cells' angular velocity about its centre of mass, the mean velocity taken out: the
+/// world's frame and a frame moving with the water alike) is driven toward `target`
+/// (rad/s, clockwise on screen positive) by a rigid turn about the centre of mass (no net
+/// force), its change capped at `max_acc` × the substep. The target is capped so the
+/// farthest cell's centre moves at most `max_tip` px/s about the centre. While a cell is in
+/// contact (the last substep's: a wall, a moving obstacle, a ring, another creature) and
+/// the servo's turn would move it into that contact, the change is scaled down toward
+/// `yield_` (1: no yield), smoothly by how squarely it would (the cosine), rising at once
+/// and fading over SERVO_RELEASE.
+#[derive(Clone, Copy, Debug)]
+pub struct SpinServo {
+    pub on: bool,
+    pub target: f32,
+    pub max_acc: f32,
+    pub max_tip: f32,
+    pub yield_: f32,
+    /// The contact share held (0..1), rising at once, decaying over SERVO_RELEASE.
+    pub hold: f32,
+    /// The direction of the turn the hold was gathered for (±1; 0 none yet).
+    pub hold_sign: f32,
+    /// Last substep's: the spin measured, the target after the tip cap, the scale the yield
+    /// gave the change (1: none).
+    pub spin: f32,
+    pub capped: f32,
+    pub scale: f32,
+}
+
+impl Default for SpinServo {
+    fn default() -> Self {
+        SpinServo { on: false, target: 0.0, max_acc: 0.0, max_tip: f32::INFINITY, yield_: 1.0, hold: 0.0, hold_sign: 0.0, spin: 0.0, capped: 0.0, scale: 1.0 }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Cross {
     pub a: u32,
@@ -468,6 +526,15 @@ pub struct Body {
     /// substep's contacts gave them (wall index, point, impulse): obstacles.rs.
     pub dyn_c: Vec<(u32, u32)>,
     pub dyn_sub: Vec<(u32, Vector2, Vector2)>,
+    /// The spin servo (off by default: nothing of it runs).
+    pub servo: SpinServo,
+    /// Contacts are recorded (`touches`) while this or the servo is on.
+    pub track: bool,
+    /// This substep's contacts (cell, normal), what the servo's next substep yields to.
+    pub sub_c: Vec<(u32, Vector2)>,
+    /// The last step's contacts, one per cell and thing touched (the last normal), sorted
+    /// by cell, kind and id (`Touch`).
+    pub touches: Vec<Touch>,
 }
 
 pub struct Cells {
@@ -732,6 +799,21 @@ impl Body {
         // Rebuild the creature's own candidates now; stagger later rebuilds by creature.
         self.self_stale = true;
         self.self_age = (self.uid.first().copied().unwrap_or(0).wrapping_mul(2_654_435_761) >> 13) & 0xffff;
+        // Cell indices moved: the servo's last contacts are dropped, the step's contacts
+        // found again by uid (those of cells gone dropped).
+        self.sub_c.clear();
+        if !self.touches.is_empty() {
+            let mut by_uid: Vec<(u32, u32)> = (0..n).map(|i| (self.uid[i], i as u32)).collect();
+            by_uid.sort_unstable();
+            let mut kept = Vec::with_capacity(self.touches.len());
+            for t in &self.touches {
+                if let Ok(k) = by_uid.binary_search_by(|e| e.0.cmp(&t.uid)) {
+                    kept.push(Touch { cell: by_uid[k].1, ..*t });
+                }
+            }
+            kept.sort_by(|a, b| (a.cell, a.kind, a.id).cmp(&(b.cell, b.kind, b.id)));
+            self.touches = kept;
+        }
     }
 
     /// Regions (cells of one type and group joined by links), which cells are shape
@@ -1097,6 +1179,7 @@ impl Body {
             self.build_regions(opt);
         }
         self.contact = false;
+        self.touches.clear();
         // Muscles: a wave, or the scales the script set (muscle[]), times the ease.
         let pose = self.wave.mode == WAVE_POSE;
         self.wave.age += dt;
@@ -1410,11 +1493,129 @@ impl Body {
         }
         let spin = if inertia > 0.0 { l / inertia } else { 0.0 };
         let el = 1.0 - (-self.damp_lin.max(0.0) * h).exp();
-        let ea = 1.0 - (-self.damp_ang.max(0.0) * h).exp();
+        // The spin servo, when on, owns the spin (a target of 0 brakes it).
+        let ea = if self.servo.on { 0.0 } else { 1.0 - (-self.damp_ang.max(0.0) * h).exp() };
         let (dv, dw) = (v * el, spin * ea);
         for i in 0..n {
             self.vel[i] -= dv + perp(self.pos[i] - c) * dw;
             self.om[i] -= dw;
+        }
+    }
+
+    /// Contacts are recorded this step (the game tracks them, or the servo yields to them).
+    #[inline]
+    pub fn records(&self) -> bool {
+        self.track || self.servo.on
+    }
+
+    /// Records cell `i`'s contact with a thing of `kind` and `id`, `normal` pushing it out
+    /// (only while records()).
+    #[inline]
+    pub(crate) fn touch(&mut self, i: usize, kind: u8, id: i64, normal: Vector2) {
+        self.sub_c.push((i as u32, normal));
+        self.touches.push(Touch { cell: i as u32, uid: self.uid[i], kind, id, normal });
+    }
+
+    /// The step's contacts sorted by cell, kind and id, one each (the last substep's normal).
+    fn settle_touches(&mut self) {
+        if self.touches.len() < 2 {
+            return;
+        }
+        // A stable sort keeps the substeps' order among equal keys: the last one wins.
+        self.touches.sort_by(|a, b| (a.cell, a.kind, a.id).cmp(&(b.cell, b.kind, b.id)));
+        let mut w = 0usize;
+        for k in 0..self.touches.len() {
+            let t = self.touches[k];
+            if w > 0 {
+                let last = self.touches[w - 1];
+                if (last.cell, last.kind, last.id) == (t.cell, t.kind, t.id) {
+                    self.touches[w - 1] = t;
+                    continue;
+                }
+            }
+            self.touches[w] = t;
+            w += 1;
+        }
+        self.touches.truncate(w);
+    }
+
+    /// The spin servo's substep (see `SpinServo`): the spin about the centre of mass driven
+    /// toward the capped target by a rigid turn of every cell, its change at most max_acc × h
+    /// and scaled by the contact yield; no net force (Σ m perp(p − c) = 0).
+    fn spin_servo(&mut self, h: f32) {
+        let n = self.n;
+        if n == 0 {
+            return;
+        }
+        let c0 = self.center();
+        let (mut m, mut v, mut off) = (0.0f32, Vector2::ZERO, Vector2::ZERO);
+        for i in 0..n {
+            m += self.mass[i];
+            v += self.vel[i] * self.mass[i];
+            off += (self.pos[i] - c0) * self.mass[i];
+        }
+        if m <= 0.0 {
+            return;
+        }
+        // The centre refined by the residual of the first (f32) pass, so the turn's forces
+        // sum to zero to rounding, not to the centre's error.
+        let c = c0 + off / m;
+        let v = v / m;
+        let (mut l, mut inertia, mut r2) = (0.0f32, 0.0f32, 0.0f32);
+        for i in 0..n {
+            let p = self.pos[i] - c;
+            let p2 = lsq(p);
+            l += self.mass[i] * cross(p, self.vel[i] - v);
+            inertia += self.mass[i] * p2;
+            r2 = r2.max(p2);
+        }
+        if inertia <= 0.0 {
+            return;
+        }
+        let spin = l / inertia;
+        let sv = self.servo;
+        let rmax = r2.sqrt();
+        let cap = if sv.max_tip.is_finite() && rmax > 1e-6 { sv.max_tip.max(0.0) / rmax } else { f32::INFINITY };
+        let target = sv.target.clamp(-cap, cap);
+        let step = sv.max_acc.max(0.0) * h;
+        let mut dw = (target - spin).clamp(-step, step);
+        // The yield: how squarely the turn would move a touching cell into its contact.
+        let y = sv.yield_.clamp(0.0, 1.0);
+        let mut hold = sv.hold * (-h / SERVO_RELEASE).exp();
+        if y < 1.0 && dw != 0.0 {
+            let s = dw.signum();
+            let mut g = 0.0f32;
+            for &(cell, nrm) in &self.sub_c {
+                let i = cell as usize;
+                if i >= n {
+                    continue;
+                }
+                let p = self.pos[i] - c;
+                let pl = lsq(p).sqrt();
+                if pl < 1e-6 {
+                    continue;
+                }
+                g = g.max(-dot(perp(p) * (s / pl), nrm));
+            }
+            // A turn the other way does not inherit the hold of contacts it now leaves.
+            if s != sv.hold_sign {
+                hold = 0.0;
+            }
+            hold = hold.max(g.min(1.0));
+            self.servo.hold_sign = s;
+        }
+        let scale = 1.0 - (1.0 - y) * hold;
+        dw *= scale;
+        self.servo.hold = hold;
+        self.servo.spin = spin;
+        self.servo.capped = target;
+        self.servo.scale = scale;
+        if dw == 0.0 {
+            return;
+        }
+        for i in 0..n {
+            self.vel[i] += perp(self.pos[i] - c) * dw;
+            self.om[i] += dw;
         }
     }
 
@@ -1624,9 +1825,13 @@ impl Body {
         if opt.drag.enabled && opt.drag_substep {
             self.apply_drag(&opt.drag, opt.current, h);
         }
-        if self.damp_lin > 0.0 || self.damp_ang > 0.0 {
+        if self.damp_lin > 0.0 || (self.damp_ang > 0.0 && !self.servo.on) {
             self.damp_rigid(opt.current, h);
         }
+        if self.servo.on {
+            self.spin_servo(h);
+        }
+        self.sub_c.clear();
         let g = opt.gravity + self.push_frame;
         for i in 0..self.n {
             let v = self.vel[i] + (g + (self.force[i] + self.drag_f[i]) * self.w[i]) * h;
@@ -1790,10 +1995,17 @@ impl Body {
                 }
             }
         }
-        for &(c, wi) in &self.wall_c {
+        let rec = self.records();
+        for k in 0..self.wall_c.len() {
+            let (c, wi) = self.wall_c[k];
             let c = c as usize;
-            let p = push_out_of_wall(&walls[wi as usize], self.prev[c], self.pos[c], self.r[c]);
+            let w = &walls[wi as usize];
+            let p = push_out_of_wall(w, self.prev[c], self.pos[c], self.r[c]);
             if p != self.pos[c] {
+                if rec {
+                    let d = p - self.pos[c];
+                    self.touch(c, TOUCH_WALL, w.id, d / lsq(d).sqrt());
+                }
                 self.pos[c] = p;
                 self.contact = true;
             }
@@ -1818,6 +2030,7 @@ impl Body {
     /// The frame's end: velocities, link loads and the links that break.
     fn finish(&mut self, opt: &Opt, h: f32, dt: f32) {
         self.finish_substep(opt, h);
+        self.settle_touches();
         self.broken.clear();
         let a = (dt / opt.break_smooth.max(1e-6)).min(1.0);
         let decay = (-dt / opt.break_envelope_time.max(1e-6)).exp();
@@ -1892,6 +2105,12 @@ fn solve_cross(bodies: &mut [Body], cr: &[Cross], opt: &Opt, h: f32) {
             b.pos[bi] += p * b.w[bi];
             a.contact = true;
             b.contact = true;
+            if a.records() {
+                a.touch(ai, TOUCH_CREATURE, x.b as i64, -d / l);
+            }
+            if b.records() {
+                b.touch(bi, TOUCH_CREATURE, x.a as i64, d / l);
+            }
         } else {
             let m = b.outline.len();
             let e = x.bi as usize;
@@ -1917,6 +2136,13 @@ fn solve_cross(bodies: &mut [Body], cr: &[Cross], opt: &Opt, h: f32) {
             b.pos[q] -= nrm * (dl * t * b.w[q]);
             a.contact = true;
             b.contact = true;
+            if a.records() {
+                a.touch(ai, TOUCH_CREATURE, x.b as i64, nrm);
+            }
+            if b.records() {
+                // The edge's nearer end.
+                b.touch(if t < 0.5 { p } else { q }, TOUCH_CREATURE, x.a as i64, -nrm);
+            }
         }
     }
 }
@@ -1928,7 +2154,7 @@ impl Body {
         for (k, &c) in cells.iter().enumerate() {
             map[c] = k as u32;
         }
-        let mut b = Body { alive: true, n: cells.len(), wave: self.wave, time: self.time, swim: self.swim, damp_lin: self.damp_lin, damp_ang: self.damp_ang, ..Default::default() };
+        let mut b = Body { alive: true, n: cells.len(), wave: self.wave, time: self.time, swim: self.swim, damp_lin: self.damp_lin, damp_ang: self.damp_ang, servo: self.servo, track: self.track, ..Default::default() };
         macro_rules! take {
             ($f:ident) => {
                 b.$f = cells.iter().map(|&c| self.$f[c]).collect();
@@ -3420,6 +3646,149 @@ mod tests {
             cl.state_hash()
         };
         let a = run(1);
+        assert_eq!(a, run(4));
+        assert_eq!(a, run(0));
+        assert_eq!(a, run(1), "a replay");
+    }
+
+    fn servo(target: f32, acc: f32, tip: f32, y: f32) -> SpinServo {
+        SpinServo { on: true, target, max_acc: acc, max_tip: tip, yield_: y, ..Default::default() }
+    }
+
+    fn momentum_of(b: &Body) -> Vector2 {
+        (0..b.n).fold(Vector2::ZERO, |s, i| s + b.vel[i] * b.mass[i])
+    }
+
+    /// The servo reaches its target spin at its acceleration, holds it, brings it back to 0
+    /// and stays there, with no net force (the momentum stays 0 without drag).
+    #[test]
+    fn the_spin_servo_reaches_and_holds_its_target_without_a_net_force() {
+        let mut cl = Cells::default();
+        let c = open_worm(&mut cl, &[0]);
+        cl.bodies[c].servo = servo(2.0, 4.0, f32::INFINITY, 1.0);
+        let mut spins = Vec::new();
+        for f in 0..120 {
+            cl.step(1.0 / 60.0);
+            spins.push(cl.bodies[c].spin());
+            if f == 59 {
+                cl.bodies[c].servo.target = 0.0;
+            }
+        }
+        let b = &cl.bodies[c];
+        let p = momentum_of(b);
+        println!("spin after 0.25 s {:.3}, 0.5 s {:.3}, 1 s {:.3}, 2 s {:.4}; momentum {:?} of {}", spins[14], spins[29], spins[59], spins[119], p, b.total_mass());
+        // 4 rad/s² for 0.25 s: 1 rad/s, then capped at the target from 0.5 s.
+        assert!((spins[14] - 1.0).abs() < 0.08, "{}", spins[14]);
+        assert!((spins[59] - 2.0).abs() < 0.03, "{}", spins[59]);
+        assert!(spins[119].abs() < 0.01, "{}", spins[119]);
+        assert!(spins.iter().all(|&s| s < 2.05), "no overshoot");
+        // The mean velocity left: under 0.02 px/s, rounding (a worm spun at 2 rad/s and let
+        // go without the servo drifts as much: the solver's f32 sums, not the servo).
+        assert!(p.length() < 0.02 * b.total_mass(), "{:?}", p);
+    }
+
+    /// The tip cap: the spin never takes the farthest cell past max_tip.
+    #[test]
+    fn the_spin_servo_caps_the_tip_speed() {
+        let mut cl = Cells::default();
+        let c = open_worm(&mut cl, &[0]);
+        cl.bodies[c].servo = servo(10.0, 100.0, 150.0, 1.0);
+        for _ in 0..90 {
+            cl.step(1.0 / 60.0);
+        }
+        let b = &cl.bodies[c];
+        let ctr = b.center();
+        let rmax = b.pos.iter().map(|&p| (p - ctr).length()).fold(0.0, f32::max);
+        let spin = b.spin();
+        println!("spin {:.3} rad/s, farthest cell {:.1} px: tip {:.1} px/s", spin, rmax, spin * rmax);
+        assert!((spin * rmax - 150.0).abs() < 6.0, "{}", spin * rmax);
+    }
+
+    /// A blob pressed onto a floor records its wall contacts (kind, the wall's id, normals
+    /// pointing up); two blobs pressed together record each other.
+    #[test]
+    fn contacts_are_recorded_by_kind_with_normals() {
+        let mut cl = Cells::default();
+        cl.opt.drag.enabled = false;
+        cl.opt.gravity = Vector2::new(0.0, 500.0);
+        cl.add_static_shape(42, Transform2D::IDENTITY, rect(-400.0, 30.0, 800.0, 50.0), 0.0, 0.0, false);
+        let a = add(&mut cl, hex_design(2, 7.0, Vector2::new(-40.0, 0.0)), 7.0);
+        let b = add(&mut cl, hex_design(2, 7.0, Vector2::new(40.0, 0.0)), 7.0);
+        cl.bodies[a].track = true;
+        cl.bodies[b].push = Vector2::new(-400.0, 0.0);
+        for _ in 0..90 {
+            cl.step(1.0 / 60.0);
+        }
+        assert!(cl.bodies[b].touches.is_empty(), "b is not tracked");
+        let t = &cl.bodies[a].touches;
+        let walls: Vec<&Touch> = t.iter().filter(|x| x.kind == TOUCH_WALL).collect();
+        let others: Vec<&Touch> = t.iter().filter(|x| x.kind == TOUCH_CREATURE).collect();
+        println!("a's contacts: {} wall, {} creature", walls.len(), others.len());
+        assert!(!walls.is_empty() && walls.iter().all(|x| x.id == 42 && x.normal.y < -0.9));
+        assert!(!others.is_empty() && others.iter().all(|x| x.id == b as i64 && x.normal.x < 0.0));
+        for x in t.iter() {
+            assert_eq!(cl.bodies[a].uid[x.cell as usize], x.uid);
+        }
+        // Sorted and one per (cell, kind, id).
+        for w in t.windows(2) {
+            assert!((w[0].cell, w[0].kind, w[0].id) < (w[1].cell, w[1].kind, w[1].id));
+        }
+    }
+
+    /// A blob spun into a wall: with a yield of 0.1 the servo leans on it (far less push
+    /// into the wall than at full power), and the yield scale reads back.
+    #[test]
+    fn the_contact_yield_scales_the_turn_into_a_wall() {
+        let run = |y: f32| {
+            let mut cl = Cells::default();
+            cl.opt.drag.enabled = false;
+            // A worm lying along x, its right end against a wall on its far side from
+            // its spin's direction: a clockwise (positive) spin drives its right end down.
+            cl.add_static_shape(5, Transform2D::IDENTITY, rect(-200.0, 22.0, 400.0, 40.0), 0.0, 0.0, false);
+            let c = open_worm(&mut cl, &[0]);
+            cl.opt.drag.enabled = false;
+            cl.bodies[c].servo = servo(3.0, 40.0, f32::INFINITY, y);
+            let mut scale_min = 1.0f32;
+            for _ in 0..30 {
+                cl.step(1.0 / 60.0);
+                scale_min = scale_min.min(cl.bodies[c].servo.scale);
+            }
+            (cl.bodies[c].spin(), scale_min)
+        };
+        let (full, s1) = run(1.0);
+        let (tame, s2) = run(0.1);
+        println!("after 0.5 s against the floor: spin {:.3} at yield 1 (scale {:.2}), {:.3} at 0.1 (scale {:.2})", full, s1, tame, s2);
+        assert_eq!(s1, 1.0);
+        assert!(s2 < 0.2);
+    }
+
+    #[test]
+    fn threaded_equals_serial_with_the_spin_servo_and_contacts() {
+        let run = |threads: usize| {
+            let mut cl = crash_world(threads);
+            cl.opt.drag.enabled = true;
+            cl.add_static_shape(3, Transform2D::IDENTITY, rect(-300.0, 330.0, 1100.0, 60.0), 0.0, 0.0, false);
+            for (k, b) in cl.bodies.iter_mut().enumerate() {
+                b.servo = servo(if k % 2 == 0 { 3.0 } else { -2.0 }, 20.0 + 5.0 * k as f32, if k == 3 { 200.0 } else { f32::INFINITY }, 0.1 * k as f32);
+                b.track = k == 1;
+                b.damp_ang = 1.0;
+            }
+            let mut h = 0i64;
+            for f in 0..120 {
+                cl.step(1.0 / 60.0);
+                if f == 60 {
+                    cl.add_cell(0, cl.bodies[0].pos[0] + Vector2::new(-14.0, 0.0), 7.0, 0);
+                }
+                for b in &cl.bodies {
+                    for t in &b.touches {
+                        h = h.wrapping_mul(31).wrapping_add((t.cell as i64) ^ (t.id << 8) ^ ((t.normal.x.to_bits() as i64) << 20));
+                    }
+                }
+            }
+            (cl.state_hash(), h)
+        };
+        let a = run(1);
+        assert!(a.1 != 0, "contacts were recorded");
         assert_eq!(a, run(4));
         assert_eq!(a, run(0));
         assert_eq!(a, run(1), "a replay");

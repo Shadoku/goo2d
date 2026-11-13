@@ -137,6 +137,7 @@ impl Kernel {
             return;
         }
         let slop = self.solver.touch_slop;
+        let density = self.solver.body_mass_density;
         let inv_h = 1.0 / h;
         for si in 0..self.statics.len() {
             if !self.statics[si].dynamic {
@@ -149,7 +150,8 @@ impl Kernel {
                     continue;
                 }
                 let (start_i, n_i) = (r.start, r.n);
-                let mass = r.p.bead_mass as f32;
+                // Its beads' masses, or its share of its area's mass (body_mass_density).
+                let mass = if density > 0.0 && r.n > 0 { (r.target_area.max(0.0) as f32) * density / r.n as f32 } else { r.p.bead_mass as f32 };
                 let w = if mass > 0.0 { 1.0 / mass } else { 0.0 };
                 let mu = r.p.friction as f32;
                 let rad_max = r.p.bead_radius as f32;
@@ -275,6 +277,9 @@ impl Body {
             self.pred[c] += n * (excess * h);
             self.pos[c] = p;
             self.contact = true;
+            if self.records() {
+                self.touch(c, crate::cells::TOUCH_OBSTACLE, w.id, n);
+            }
             self.dyn_sub.push((wi as u32, point, j));
         }
     }

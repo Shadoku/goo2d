@@ -25,6 +25,11 @@ var data: Dictionary = {}
 ## The metadata name under which a creature's proxy node holds its handle.
 const PROXY_META: StringName = &"goo_creature"
 
+## What a cell touched (contacts()): a wall (a static shape), a moving obstacle (an
+## AnimatableBody2D, CharacterBody2D or RigidBody2D the world's push_bodies mirrors), a ring
+## of the coupled GooWorld2D, another creature.
+enum Touch { WALL, OBSTACLE, RING, CREATURE }
+
 var _proxy: Node2D = null
 
 func _init(owner: GooCellWorld2D, slot: int, from: GooCellDesign, design_axis: Vector2) -> void:
@@ -235,3 +240,85 @@ func add_cell(at: Vector2, radius: float, type: GooCellType = null, group: int =
 ## Removes the cell of `uid` (its links' cells_parted; a creature that falls apart splits).
 func remove_cell(uid: int) -> void:
 	world.remove_cell(self, uid)
+
+# ---- The spin servo (docs/cells.md, "Turning by the spin servo") ----
+
+## Turns the creature by the solver's spin servo, kept until stopped: every substep its
+## spin about its centre (spin(), rad/s, clockwise positive; the world's frame) is driven
+## toward `target_spin` by a rigid turn of its cells about the centre of mass (no net
+## force), changing at most `max_angular_acceleration` rad/s². `max_tip_speed` (px/s; INF
+## none) caps the target so its farthest cell's centre moves at most that fast about the
+## centre. `contact_yield` (0..1; 1 none): while one of its cells touches a wall, a moving
+## obstacle, a ring or another creature and the turn would move that cell into it, the
+## servo's change is scaled down toward this, by how squarely (it rises at once with the
+## contact and fades over 0.1 s), so a turning creature leans on what it meets instead of
+## batting it away. A target of 0 stops the spin and holds it. Its angular damping
+## (set_damping()) is not applied while the servo is on. Tame: a yield of 0.1-0.3 and a
+## tip speed the game can live with; full power: yield 1, no tip cap.
+func set_spin_servo(target_spin: float, max_angular_acceleration: float, max_tip_speed: float = INF, contact_yield: float = 1.0) -> void:
+	_c().set_spin_servo(id, target_spin, max_angular_acceleration, max_tip_speed, contact_yield)
+
+## The spin servo's target alone (rad/s), cheap enough every frame; nothing while it is off.
+func set_spin_target(target_spin: float) -> void:
+	_c().set_spin_target(id, target_spin)
+
+## Stops the spin servo (the creature keeps the spin it has).
+func stop_spin_servo() -> void:
+	_c().stop_spin_servo(id)
+
+## The spin servo as its last substep left it: on, target, max_acceleration, max_tip_speed,
+## contact_yield, spin (measured), capped (the target after the tip cap), scale (what the
+## yield left of its change: 1 none), hold (the contact share it yields to, 0..1).
+func spin_servo() -> Dictionary:
+	var s := _c().spin_servo_state(id)
+	return { "on": s[0] != 0.0, "target": s[1], "max_acceleration": s[2], "max_tip_speed": s[3], "contact_yield": s[4], "spin": s[5], "capped": s[6], "scale": s[7], "hold": s[8] }
+
+## The spin that turns through `angle_error` (rad, clockwise positive) fastest without
+## overshoot at `max_angular_acceleration`: sign × min(max_spin, sqrt(2 a |error|)), the
+## braking curve of a bang-bang turn. Feed it to set_spin_target() every frame with the
+## heading error for a heading servo (docs/cells.md has the numbers it reaches).
+static func spin_toward(angle_error: float, max_spin: float, max_angular_acceleration: float) -> float:
+	var s := minf(max_spin, sqrt(2.0 * maxf(max_angular_acceleration, 0.0) * absf(angle_error)))
+	return s * signf(angle_error)
+
+# ---- Contacts ----
+
+## Records its cells' contacts every step (contacts()), or stops. The spin servo records
+## them while it is on, whatever this says. Off by default (nothing recorded, no cost).
+func set_contact_tracking(on: bool) -> void:
+	_c().set_contact_tracking(id, on)
+
+func contact_tracking() -> bool:
+	return _c().contact_tracking(id)
+
+## What its cells touched in the last step, one entry per cell and thing touched (sorted by
+## cell, kind, id): { "cell": index, "uid", "kind": Touch, "id": the kernel's id (the static
+## shape's, the ring's key, the other creature's slot), "what": that thing (the PhysicsBody2D
+## or TileMapLayer, the Goo2D, the GooCellCreature; null if gone), "normal": unit, pushing the
+## cell out }. Recorded only while tracked or servoed: a first call turns tracking on and
+## returns what the last step recorded (nothing, if it was off).
+func contacts() -> Array[Dictionary]:
+	var out: Array[Dictionary] = []
+	if not contact_tracking():
+		set_contact_tracking(true)
+	var got := _c().creature_contacts(id)
+	var ints: PackedInt64Array = got[0]
+	var normals: PackedVector2Array = got[1]
+	for k: int in normals.size():
+		var kind := int(ints[4 * k + 2])
+		var thing_id := int(ints[4 * k + 3])
+		out.append({ "cell": int(ints[4 * k]), "uid": int(ints[4 * k + 1]), "kind": kind, "id": thing_id, "what": world.touched_thing(kind, thing_id), "normal": normals[k] })
+	return out
+
+## The last step's contacts counted by kind (cell-thing pairs), indexed by Touch: [walls,
+## moving obstacles, rings, creatures]. Cheap: no dictionaries.
+func contact_counts() -> PackedInt32Array:
+	return _c().contact_counts(id)
+
+## Whether a cell touched a wall in the last step (needs tracking or the servo).
+func touching_walls() -> bool:
+	return _c().contact_counts(id)[Touch.WALL] > 0
+
+## Whether a cell touched anything of `kind` (a Touch) in the last step.
+func touching(kind: int) -> bool:
+	return _c().contact_counts(id)[kind] > 0

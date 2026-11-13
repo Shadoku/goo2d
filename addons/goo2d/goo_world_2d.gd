@@ -291,6 +291,19 @@ const SHAPE_REJUDGE_FRAMES := 4
 ## goo's impulse over this. A body's mass is Goo2D.body_mass() (a 24 px blob at unit 1
 ## is about 1.4); 1 by default.
 @export var body_mass_scale: float = 1.0
+## Against moving obstacles (push_bodies), a ring weighs its target area × this (its beads
+## share it alike) instead of its beads' own masses (Goo2D.body_mass(), GooTuning's, which
+## grow more slowly than the area): > 0 makes one body_mass_scale right for rings of every
+## size. With the same value as a coupled GooCellWorld2D's ring_density (1: a ring weighs
+## what cells of its area weigh) and the two worlds' body_mass_scale equal, a crate meets
+## rings and creatures in one unit. 0 (the default): the beads' own masses, as before.
+## Only the obstacle contacts read it: the rings' own dynamics, gravity and their contacts
+## with each other are unchanged.
+@export var body_mass_density: float = 0.0:
+	set(value):
+		body_mass_density = maxf(value, 0.0)
+		if _kernel != null:
+			_kernel.set_solver({ "body_mass_density": body_mass_density })
 @export_group("")
 
 var _queue := MergeQueue.new()
@@ -348,7 +361,7 @@ func _exit_tree() -> void:
 func kernel() -> GooKernel:
 	if _kernel == null:
 		_kernel = GooTuning.make_kernel()
-		_kernel.set_solver({ "gravity": _scaled_gravity() })
+		_kernel.set_solver({ "gravity": _scaled_gravity(), "body_mass_density": body_mass_density })
 		_kernel.set_pair_passes(true)
 		_statics = GooStatics.new(_kernel)
 		_statics.push_bodies = push_bodies

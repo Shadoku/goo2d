@@ -274,6 +274,11 @@ pub struct Solver {
     /// The parting speed, px/s, past which the Untangler stops pushing a pair
     /// (`Untangler.SEPARATION_SPEED`).
     pub untangle_separation_speed: f64,
+    /// Against moving obstacles (obstacles.rs) a ring weighs its target area × this (its
+    /// beads share it alike), in place of its beads' own masses; 0 (the default): their own.
+    /// The cells' coupling weighs a ring as its area × its ring_density alike, so with the
+    /// two equal one body_mass_scale is right for rings of every size and for the cells.
+    pub body_mass_density: f32,
 }
 
 impl Solver {
@@ -303,6 +308,7 @@ impl Default for Solver {
             max_bead_speed: 3000.0,
             untangle_strength: UNTANGLE_STRENGTH,
             untangle_separation_speed: UNTANGLE_SEPARATION_SPEED,
+            body_mass_density: 0.0,
         }
     }
 }

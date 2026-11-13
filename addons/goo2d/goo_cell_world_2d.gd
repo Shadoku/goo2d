@@ -566,6 +566,22 @@ func _hold_grabs() -> void:
 
 # --- Rings ----------------------------------------------------------------------------
 
+## The thing a contact names (GooCellCreature.contacts()): for a wall or a moving obstacle
+## (GooCellCreature.Touch.WALL / OBSTACLE) the node its static shape `id` was mirrored from
+## (GooStatics.node_of()), for a ring the coupled world's Goo2D of key `id`, for a creature
+## the handle of slot `id`; null when gone.
+func touched_thing(kind: int, id: int) -> Object:
+	match kind:
+		GooCellCreature.Touch.WALL, GooCellCreature.Touch.OBSTACLE:
+			return _statics.node_of(id) if _statics != null else null
+		GooCellCreature.Touch.RING:
+			var body := instance_from_id(id) as Goo2D
+			return body if body != null and is_instance_valid(body) else null
+		GooCellCreature.Touch.CREATURE:
+			var other := creature(id)
+			return other if other != null and other.is_alive() else null
+	return null
+
 ## Makes `world`'s ring bodies and this world's creatures collide (docs/cells.md, "Rings
 ## and cells"). This world must step after `world`: its process_physics_priority is raised
 ## above `world`'s if it is not already (step() by hand: the ring world's first).

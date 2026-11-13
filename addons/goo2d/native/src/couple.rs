@@ -449,6 +449,9 @@ impl Ghosts {
             self.pos[ga] -= nrm * (dl * (1.0 - t) * ring.w);
             self.pos[gb] -= nrm * (dl * t * ring.w);
             b.contact = true;
+            if b.records() {
+                b.touch(c, crate::cells::TOUCH_RING, ring.key, nrm);
+            }
             self.note_touch(ri as usize, pen, dot(b.vel[c] - self.vel[ga], -nrm));
         }
         // Beads against the creatures' outlines.
@@ -522,6 +525,9 @@ impl Ghosts {
             b.pos[i] -= nrm * (dl * (1.0 - t) * wi);
             b.pos[j] -= nrm * (dl * t * wj);
             b.contact = true;
+            if b.records() {
+                b.touch(if t < 0.5 { i } else { j }, crate::cells::TOUCH_RING, ring.key, -nrm);
+            }
             let vc = b.vel[i] * (1.0 - t) + b.vel[j] * t;
             let vg = self.vel[gi];
             self.note_touch(ri, pen, dot(vc - vg, nrm));

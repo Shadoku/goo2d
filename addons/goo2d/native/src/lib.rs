@@ -265,7 +265,9 @@ impl GooKernel {
     /// ring's), "grip_damp" (extra linear damping touching a gripping shape), "touch_slop"
     /// (px), "wake_depth" (px), "wake_speed" (px/s), "max_bead_speed" (px/s, 0 for no cap),
     /// "untangle_strength" (the Untangler's push, px/s² per px of overlap) and
-    /// "untangle_separation_speed" (px/s; both default to the Untangler's constants).
+    /// "untangle_separation_speed" (px/s; both default to the Untangler's constants) and
+    /// "body_mass_density" (> 0: against moving obstacles a ring weighs its target area ×
+    /// it, its beads alike, not its beads' own masses; 0, the default, their own).
     #[func]
     fn set_solver(&mut self, settings: VarDictionary) {
         let s = &mut self.k.solver;
@@ -284,6 +286,7 @@ impl GooKernel {
                 "max_bead_speed" => s.max_bead_speed = number as f32,
                 "untangle_strength" => s.untangle_strength = number,
                 "untangle_separation_speed" => s.untangle_separation_speed = number,
+                "body_mass_density" => s.body_mass_density = (number as f32).max(0.0),
                 other => godot_error!("GooKernel.set_solver(): unknown setting '{}'", other),
             }
         }
@@ -307,6 +310,7 @@ impl GooKernel {
         put(&mut d, "max_bead_speed", s.max_bead_speed as f64);
         put(&mut d, "untangle_strength", s.untangle_strength);
         put(&mut d, "untangle_separation_speed", s.untangle_separation_speed);
+        put(&mut d, "body_mass_density", s.body_mass_density as f64);
         put(&mut d, "last_substeps", self.k.last_substeps as i64);
         put(&mut d, "last_capped", self.k.last_capped as i64);
         put(&mut d, "last_step_usec", self.k.last_step_usec as i64);
@@ -1963,6 +1967,14 @@ impl GooCells {
     const EVENT_SPLIT: i64 = cells::EVENT_SPLIT as i64;
     #[constant]
     const BODY_DEFAULT: i64 = cells::BODY_DEFAULT as i64;
+    #[constant]
+    const TOUCH_WALL: i64 = cells::TOUCH_WALL as i64;
+    #[constant]
+    const TOUCH_OBSTACLE: i64 = cells::TOUCH_OBSTACLE as i64;
+    #[constant]
+    const TOUCH_RING: i64 = cells::TOUCH_RING as i64;
+    #[constant]
+    const TOUCH_CREATURE: i64 = cells::TOUCH_CREATURE as i64;
 
     /// threads, substeps, stretch_hz, bend_hz, bend_mode, shape_k, link_damp, bend_damp,
     /// collide_all, capsules, contact_hz, contact_pad, self_mode, margin, drag (bool),
@@ -2441,6 +2453,82 @@ impl GooCells {
         let b = &mut self.c.bodies[c as usize];
         b.damp_lin = (linear as f32).max(0.0);
         b.damp_ang = (angular as f32).max(0.0);
+    }
+
+    /// The spin servo of creature c (cells.rs' `SpinServo`), kept until stopped: every
+    /// substep its spin about its centre of mass (rad/s, clockwise on screen positive)
+    /// driven toward `target` by a rigid turn (no net force), changing at most
+    /// `max_acceleration` rad/s², the target capped so its farthest cell's centre moves at
+    /// most `max_tip_speed` px/s about the centre (INF or below 0: no cap), and the change
+    /// scaled down toward `contact_yield` (0..1; 1: none) while it would move a touching
+    /// cell into what it touches. Its angular damping is not applied while it is on.
+    #[func]
+    fn set_spin_servo(&mut self, c: i64, target: f64, max_acceleration: f64, max_tip_speed: f64, contact_yield: f64) {
+        let b = &mut self.c.bodies[c as usize];
+        let tip = if max_tip_speed < 0.0 || !max_tip_speed.is_finite() { f32::INFINITY } else { max_tip_speed as f32 };
+        let keep = b.servo;
+        b.servo = cells::SpinServo { on: true, target: target as f32, max_acc: (max_acceleration as f32).max(0.0), max_tip: tip, yield_: (contact_yield as f32).clamp(0.0, 1.0), hold: if keep.on { keep.hold } else { 0.0 }, hold_sign: if keep.on { keep.hold_sign } else { 0.0 }, ..Default::default() };
+    }
+
+    /// The spin servo's target alone (rad/s; nothing while the servo is off).
+    #[func]
+    fn set_spin_target(&mut self, c: i64, target: f64) {
+        let b = &mut self.c.bodies[c as usize];
+        b.servo.target = target as f32;
+    }
+
+    /// Stops creature c's spin servo (its spin is left as it is).
+    #[func]
+    fn stop_spin_servo(&mut self, c: i64) {
+        self.c.bodies[c as usize].servo = cells::SpinServo::default();
+    }
+
+    /// Creature c's spin servo as its last substep left it: [on (0/1), target, max
+    /// acceleration, max tip speed, yield, spin measured, target after the tip cap, the
+    /// scale the yield gave its change (1: none), the contact share held].
+    #[func]
+    fn spin_servo_state(&self, c: i64) -> PackedFloat32Array {
+        let s = self.c.bodies[c as usize].servo;
+        PackedFloat32Array::from(&[s.on as i32 as f32, s.target, s.max_acc, s.max_tip, s.yield_, s.spin, s.capped, s.scale, s.hold][..])
+    }
+
+    /// Whether creature c's contacts are recorded every step (creature_contacts()); the spin
+    /// servo records them while it is on, whatever this says.
+    #[func]
+    fn set_contact_tracking(&mut self, c: i64, on: bool) {
+        self.c.bodies[c as usize].track = on;
+    }
+
+    #[func]
+    fn contact_tracking(&self, c: i64) -> bool {
+        self.c.bodies[c as usize].track
+    }
+
+    /// Creature c's contacts in the last step (recorded while tracked or servoed), one per
+    /// cell and thing touched, sorted by cell, kind and id: [PackedInt64Array of cell index,
+    /// uid, kind (TOUCH_*), id (the static shape's id, the ring's key, the other creature's
+    /// slot) four per contact, PackedVector2Array of their normals (unit, pushing the cell
+    /// out)].
+    #[func]
+    fn creature_contacts(&self, c: i64) -> VarArray {
+        let b = &self.c.bodies[c as usize];
+        let ints = PackedInt64Array::from_iter(b.touches.iter().flat_map(|t| [t.cell as i64, t.uid as i64, t.kind as i64, t.id]));
+        let normals = PackedVector2Array::from_iter(b.touches.iter().map(|t| t.normal));
+        let mut a = VarArray::new();
+        a.push(&ints.to_variant());
+        a.push(&normals.to_variant());
+        a
+    }
+
+    /// Creature c's contacts in the last step counted by kind: [walls, moving obstacles,
+    /// rings, other creatures] (cell-thing pairs).
+    #[func]
+    fn contact_counts(&self, c: i64) -> PackedInt32Array {
+        let mut k = [0i32; 4];
+        for t in &self.c.bodies[c as usize].touches {
+            k[(t.kind as usize).min(3)] += 1;
+        }
+        PackedInt32Array::from(&k[..])
     }
 
     /// The threads the last step ran on (threads 0 chooses them by size each step).

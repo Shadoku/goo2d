@@ -311,6 +311,22 @@ func _rebuild() -> void:
 					for part: PackedVector2Array in _parts(child):
 						_add(child as Node2D, part, friction, bounce, grip, moving)
 
+## The node a kernel shape `id` was mirrored from (a contact's id: GooCellCreature.contacts()):
+## its PhysicsBody2D (a StaticBody2D, an AnimatableBody2D, a moving CharacterBody2D or
+## RigidBody2D), or the TileMapLayer of a tile layer's piece; null for an unknown id or one
+## of a rebuild since (a body coming or going rebuilds the mirror with new ids).
+func node_of(id: int) -> Node:
+	var entry: Dictionary = _by_id.get(id, {})
+	if entry.is_empty():
+		return null
+	if entry.has("body") and is_instance_valid(entry["body"]):
+		return entry["body"]
+	var node: Node = entry["node"] if is_instance_valid(entry["node"]) else null
+	if node == null or node is TileMapLayer:
+		return node
+	var parent := node.get_parent()
+	return parent if parent is PhysicsBody2D else node
+
 # Gives the kernel `part` (convex, in `node`'s space) as a new shape that
 # follows `node`; a moving obstacle of `moving` when one is given.
 func _add(node: Node2D, part: PackedVector2Array, friction: float, bounce: float, grip: bool, moving: PhysicsBody2D = null) -> void:
