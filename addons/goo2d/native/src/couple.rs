@@ -111,6 +111,8 @@ pub struct Ghosts {
     /// Per creature this frame: each cell's place on its outline (u32::MAX: inside).
     opos: Vec<Vec<u32>>,
     rmax: Vec<f32>,
+    /// Per creature this frame: each cell's contact radius against a ring.
+    crad: Vec<Vec<f32>>,
     /// This frame: the deepest overlap a contact found before solving it (px), the
     /// contacts solved (summed over substeps), centres found inside the other's outline.
     pub worst: f32,
@@ -153,14 +155,13 @@ fn contact_radius(b: &Body, i: usize, opt: &Opt) -> f32 {
 
 /// Creature b's outline edge e: its two cells, the closest point to p, t, the radius there.
 #[inline]
-fn outline_edge(b: &Body, opt: &Opt, e: usize, p: Vector2) -> (usize, usize, f32, Vector2, f32) {
+fn outline_edge(b: &Body, crad: &[f32], e: usize, p: Vector2) -> (usize, usize, f32, Vector2, f32) {
     let m = b.outline.len();
     let (i, j) = (b.outline[e % m] as usize, b.outline[(e + 1) % m] as usize);
     let (a, c) = (b.pos[i], b.pos[j]);
     let ab = c - a;
     let t = (dot(p - a, ab) / len_sq(ab).max(1e-9)).clamp(0.0, 1.0);
-    let ri = contact_radius(b, i, opt);
-    let rj = contact_radius(b, j, opt);
+    let (ri, rj) = (crad[i], crad[j]);
     (i, j, t, a + ab * t, ri + (rj - ri) * t)
 }
 
@@ -176,9 +177,9 @@ fn outline_normal(b: &Body, e: usize, orient: f32) -> Vector2 {
 
 /// Whether `q` is inside creature b's outline, judged at its edge e (the nearest): the
 /// edge's outward normal, or at a corner the two edges' normals together (the pseudo-normal).
-fn outline_inside(b: &Body, opt: &Opt, e: usize, q: Vector2, orient: f32) -> bool {
+fn outline_inside(b: &Body, crad: &[f32], e: usize, q: Vector2, orient: f32) -> bool {
     let ml = b.outline.len();
-    let (_, _, t, cp, _) = outline_edge(b, opt, e, q);
+    let (_, _, t, cp, _) = outline_edge(b, crad, e, q);
     let mut pn = outline_normal(b, e, orient);
     if t <= 0.0 {
         pn += outline_normal(b, (e + ml - 1) % ml, orient);
@@ -241,6 +242,7 @@ impl Ghosts {
         let mut near: Vec<u32> = Vec::new();
         if self.opos.len() < bodies.len() {
             self.opos.resize(bodies.len(), Vec::new());
+            self.crad.resize(bodies.len(), Vec::new());
         }
         self.cell_pairs.clear();
         self.bead_pairs.clear();
@@ -276,9 +278,47 @@ impl Ghosts {
                 if ring.hi.x + grow < b.lo.x || b.hi.x + grow < ring.lo.x || ring.hi.y + grow < b.lo.y || b.hi.y + grow < ring.lo.y {
                     continue;
                 }
+                if self.orient[bi] == 0.0 {
+                    self.orient[bi] = winding_sign(b);
+                    self.rmax[bi] = b.r.iter().cloned().fold(0.0f32, f32::max) * (1.0 + opt.contact_pad) + 16.0 * opt.contact_pad;
+                    // Each cell's place on the outline (u32::MAX: not on it) and its contact
+                    // radius this frame.
+                    let opos = &mut self.opos[bi];
+                    opos.clear();
+                    opos.resize(b.n, u32::MAX);
+                    for (e, &c) in b.outline.iter().enumerate() {
+                        if opos[c as usize] == u32::MAX {
+                            opos[c as usize] = e as u32;
+                        }
+                    }
+                    let crad = &mut self.crad[bi];
+                    crad.clear();
+                    crad.extend((0..b.n).map(|c| contact_radius(b, c, opt)));
+                }
+                let crad = &self.crad[bi][..];
+                let orient = self.orient[bi];
+                let rmax = self.rmax[bi];
+                // The creature's colliders near the ring (its colliders' grid, over the
+                // ring's box grown by a contact's reach and an outline edge).
+                let pad = grow + 3.0 * rmax;
+                let (qlo, qhi) = (
+                    Vector2::new((ring.lo.x - pad).max(b.lo.x), (ring.lo.y - pad).max(b.lo.y)),
+                    Vector2::new((ring.hi.x + pad).min(b.hi.x), (ring.hi.y + pad).min(b.hi.y)),
+                );
+                near.clear();
+                let (k0, k1) = (key(qlo.x, qlo.y, cell), key(qhi.x, qhi.y, cell));
+                let mut cx = k0.0 + 1;
+                while cx - 1 <= k1.0 {
+                    let mut cy = k0.1 + 1;
+                    while cy - 1 <= k1.1 {
+                        grid_query(&b.grid, (cx, cy), &mut near);
+                        cy += 3;
+                    }
+                    cx += 3;
+                }
                 // Outline cells near the ring's bead chain (or inside its loop).
-                for &c in &b.colliders {
-                    let c = c as usize;
+                for &o in near.iter() {
+                    let c = b.colliders[o as usize] as usize;
                     if !opt.types[b.typ[c] as usize].collide {
                         continue;
                     }
@@ -298,40 +338,24 @@ impl Ghosts {
                 if ml < 3 {
                     continue;
                 }
-                if self.orient[bi] == 0.0 {
-                    self.orient[bi] = winding_sign(b);
-                    self.rmax[bi] = b.r.iter().cloned().fold(0.0f32, f32::max) * (1.0 + opt.contact_pad) + 16.0 * opt.contact_pad;
-                    // Each cell's place on the outline (u32::MAX: not on it).
-                    let opos = &mut self.opos[bi];
-                    opos.clear();
-                    opos.resize(b.n, u32::MAX);
-                    for (e, &c) in b.outline.iter().enumerate() {
-                        if opos[c as usize] == u32::MAX {
-                            opos[c as usize] = e as u32;
-                        }
-                    }
-                }
-                let orient = self.orient[bi];
-                let rmax = self.rmax[bi];
                 let near_box = ring.br + m + rmax;
+                let near_cell = near_box + 2.0 * rmax;
                 for k in 0..n {
                     let q = self.pos[g0 + k];
                     if q.x + near_box < b.lo.x || q.x - near_box > b.hi.x || q.y + near_box < b.lo.y || q.y - near_box > b.hi.y {
                         continue;
                     }
-                    // The outline edges at the outline cells near the bead (the colliders'
-                    // grid): the one whose capsule it is deepest in.
-                    near.clear();
-                    grid_query(&b.grid, key(q.x, q.y, cell), &mut near);
+                    // The outline edges at the outline cells near the bead: the one whose
+                    // capsule it is deepest in.
                     let mut best = (usize::MAX, f32::INFINITY);
                     for &o in near.iter() {
                         let c = b.colliders[o as usize] as usize;
                         let e = self.opos[bi][c];
-                        if e == u32::MAX {
+                        if e == u32::MAX || len_sq(b.pos[c] - q) > near_cell * near_cell {
                             continue;
                         }
                         for ee in [e as usize, (e as usize + ml - 1) % ml] {
-                            let (_, _, _, cp, rr) = outline_edge(b, opt, ee, q);
+                            let (_, _, _, cp, rr) = outline_edge(b, crad, ee, q);
                             let gap = len_sq(q - cp).sqrt() - rr;
                             if gap < best.1 || (gap == best.1 && ee < best.0) {
                                 best = (ee, gap);
@@ -339,7 +363,7 @@ impl Ghosts {
                         }
                     }
                     let (inside, e0) = if best.0 != usize::MAX {
-                        (outline_inside(b, opt, best.0, q, orient), best.0)
+                        (outline_inside(b, crad, best.0, q, orient), best.0)
                     } else {
                         // No outline cell near: far outside, or deep inside.
                         let mut inside = false;
@@ -428,12 +452,14 @@ impl Ghosts {
             self.note_touch(ri as usize, pen, dot(b.vel[c] - self.vel[ga], -nrm));
         }
         // Beads against the creatures' outlines.
+        let crads = std::mem::take(&mut self.crad);
         for x in 0..self.bead_pairs.len() {
             let bp = self.bead_pairs[x];
             let gi = bp.g as usize;
             let ri = self.ring_of(gi);
             let ring = self.rings[ri];
             let b = &mut bodies[bp.body as usize];
+            let crad = &crads[bp.body as usize][..];
             let ml = b.outline.len();
             if ml < 3 {
                 continue;
@@ -445,7 +471,7 @@ impl Ghosts {
             let mut inside = false;
             if bp.full {
                 for e in 0..ml {
-                    let (i, j, _, cp, rr) = outline_edge(b, opt, e, q);
+                    let (i, j, _, cp, rr) = outline_edge(b, crad, e, q);
                     let (a, c) = (b.pos[i], b.pos[j]);
                     if (a.y > q.y) != (c.y > q.y) && q.x < a.x + (q.y - a.y) * (c.x - a.x) / (c.y - a.y) {
                         inside = !inside;
@@ -458,7 +484,7 @@ impl Ghosts {
             } else {
                 for o in -WINDOW..=WINDOW {
                     let e = (bp.e0 as i32 + o).rem_euclid(ml as i32) as usize;
-                    let (_, _, _, cp, rr) = outline_edge(b, opt, e, q);
+                    let (_, _, _, cp, rr) = outline_edge(b, crad, e, q);
                     let gap = len_sq(q - cp).sqrt() - rr;
                     if gap < best.1 {
                         best = (e, gap);
@@ -467,9 +493,9 @@ impl Ghosts {
             }
             let e = best.0;
             self.bead_pairs[x].e0 = e as u32;
-            let (i, j, t, cp, rr) = outline_edge(b, opt, e, q);
+            let (i, j, t, cp, rr) = outline_edge(b, crad, e, q);
             if !bp.full {
-                inside = outline_inside(b, opt, e, q, orient);
+                inside = outline_inside(b, crad, e, q, orient);
             }
             let reach = rr + ring.br;
             let d = len_sq(q - cp).sqrt();
@@ -500,6 +526,7 @@ impl Ghosts {
             let vg = self.vel[gi];
             self.note_touch(ri, pen, dot(vc - vg, nrm));
         }
+        self.crad = crads;
         // The ghosts kept out of the walls (as the kernel keeps their beads): a bead pressed
         // between a cell and a wall stays out of the wall here, not just next frame.
         if !walls.is_empty() {

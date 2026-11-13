@@ -175,6 +175,7 @@ func _bench() -> void:
 	var couple_us: Array[float] = []
 	var broad_us: Array[float] = []
 	var pairs := 0
+	var bead_pairs := 0
 	var touched := 0
 	var mesh_us := 0
 	var submit_us := 0
@@ -214,6 +215,7 @@ func _bench() -> void:
 				couple_us.append(int(cs.get("us", 0)) / 1000.0)
 				broad_us.append(int(cs.get("broad_us", 0)) / 1000.0)
 				pairs += int(cs.get("cell_pairs", 0)) + int(cs.get("bead_pairs", 0))
+				bead_pairs += int(cs.get("bead_pairs", 0))
 				touched += int(cs.get("touched", 0))
 			var s := w.cells().stats()
 			var us := 0
@@ -244,8 +246,8 @@ func _bench() -> void:
 		both.sort()
 		couple_us.sort()
 		broad_us.sort()
-		print("  %d rings, coupled %s: ring world step median %.2f ms, p95 %.2f; both worlds median %.2f ms, p95 %.2f; the coupling inside the cells' step median %.3f ms (broad phase %.3f), p95 %.3f; rings touched per frame %.1f, candidate pairs %.0f" % [
-			ring_count, w.coupled_world() != null, ring_times[cnt / 2], ring_times[cnt * 95 / 100], both[cnt / 2], both[cnt * 95 / 100], couple_us[cnt / 2], broad_us[cnt / 2], couple_us[cnt * 95 / 100], float(touched) / cnt, float(pairs) / cnt])
+		print("  %d rings, coupled %s: ring world step median %.2f ms, p95 %.2f; both worlds median %.2f ms, p95 %.2f; the coupling inside the cells' step median %.3f ms (broad phase %.3f), p95 %.3f; rings touched per frame %.1f, candidate pairs %.0f (beads %.0f)" % [
+			ring_count, w.coupled_world() != null, ring_times[cnt / 2], ring_times[cnt * 95 / 100], both[cnt / 2], both[cnt * 95 / 100], couple_us[cnt / 2], broad_us[cnt / 2], couple_us[cnt * 95 / 100], float(touched) / cnt, float(pairs) / cnt, float(bead_pairs) / cnt])
 		print("RINGS rings=%d coupled=%s ring_median=%.2f both_median=%.2f both_p95=%.2f couple_median=%.3f" % [ring_count, w.coupled_world() != null, ring_times[cnt / 2], both[cnt / 2], both[cnt * 95 / 100], couple_us[cnt / 2]])
 	print("RESULT n=%d m=%d mode=%s body=%s threads=%d median=%.2f p95=%.2f inside=%d" % [n, design.cell_count(), "swim" if swim else "collide", String(o("body", "shape")), w.threads, med, p95, int(worst[1])])
 
