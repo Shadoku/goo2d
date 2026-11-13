@@ -29,6 +29,8 @@ pub struct Mesh {
     pub indices: Vec<i32>,
     /// Borders between types: pairs of points.
     pub lines: Vec<Vector2>,
+    /// The goo mesh's cell table, CELL_FLOATS per cell (creature_mesh_goo()).
+    pub cells: Vec<f32>,
 }
 
 impl Mesh {
@@ -67,6 +69,7 @@ impl Mesh {
         self.uvs.extend(o.uvs);
         self.indices.extend(o.indices.iter().map(|&i| i + base));
         self.lines.extend(o.lines);
+        self.cells.extend(o.cells);
     }
 }
 
@@ -366,4 +369,402 @@ pub fn creature_mesh(b: &Body, types: &[TypeParams; TYPES], border: bool) -> Mes
         }
     }
     m
+}
+
+// --- The goo skin's mesh (goo_cells_goo.gdshader) -------------------------------------
+//
+// Every triangle names three cells, the same three on each of its corners, so a fragment
+// knows which three cells it lies among and fetches their centres, radii, turns, types and
+// seeds from the world's cell table (cell_data(), a texture the world updates each frame):
+// from them it works out the power diagram's walls exactly (the honeycomb, a constant
+// width in px at any size), which cell it is in, a coordinate fixed in that cell, and the
+// types' blend. Vertices are shared within a face or a rim fan (one triple), not across.
+//
+// Per vertex: COLOR = (cell a, cell b, cell c, distance to the outline in px), the cells'
+// indices into the table (global over the world's creatures); a rim fan's third index is
+// stored as −(index + 1), telling the shader to blend its types along the two links (a
+// projection) instead of by barycentric coordinates. UV = the outward direction (toward
+// the nearest point of the outline; the curve's normal on the skin).
+
+/// Floats per cell in the table: (x, y, radius, turn), (type slot, seed 0..1, distance
+/// to the outline px, 1 on the outline else 0).
+pub const CELL_FLOATS: usize = 8;
+
+/// A cell's seed in 0..1 from its uid (stable while the cell lives).
+#[inline]
+pub fn cell_seed(uid: u32) -> f32 {
+    let h = uid.wrapping_mul(2654435761).wrapping_add(0x9e3779b9).rotate_left(13).wrapping_mul(0x85ebca6b);
+    (h >> 8) as f32 / (1u32 << 24) as f32
+}
+
+/// Per cell: its distance to the skin (px, at its centre) and the direction toward the
+/// skin's nearest point. `skin` is the closed skin polyline.
+pub fn outline_distances(b: &Body, skin: &[Vector2]) -> (Vec<f32>, Vec<Vector2>) {
+    let n = b.n;
+    let mut d = vec![f32::INFINITY; n];
+    let mut dir = vec![Vector2::new(0.0, -1.0); n];
+    let m = skin.len();
+    if m < 3 {
+        for c in 0..n {
+            d[c] = b.r[c];
+        }
+        return (d, dir);
+    }
+    let mut near = vec![usize::MAX; n];
+    let seg = |j: usize, p: Vector2| -> (f32, Vector2) {
+        let a = skin[j % m];
+        let e = skin[(j + 1) % m] - a;
+        let l2 = len_sq(e);
+        let s = if l2 > 1e-12 { ((p - a).dot(e) / l2).clamp(0.0, 1.0) } else { 0.0 };
+        let q = a + e * s;
+        ((q - p).length(), q)
+    };
+    let per = (m / b.outline.len().max(1)).max(1);
+    let mut queue: Vec<usize> = Vec::with_capacity(n);
+    let mut seen = vec![false; n];
+    // The outline cells: their own stretch of the skin and the next ones'.
+    for (k, &c) in b.outline.iter().enumerate() {
+        let c = c as usize;
+        let p = b.pos[c];
+        for o in 0..(4 * per) {
+            let j = (k * per + m + o - 2 * per) % m;
+            let (dist, q) = seg(j, p);
+            if dist < d[c] {
+                d[c] = dist;
+                near[c] = j;
+                let v = q - p;
+                if v.length() > 1e-6 {
+                    dir[c] = v / v.length();
+                }
+            }
+        }
+        if !seen[c] {
+            seen[c] = true;
+            queue.push(c);
+        }
+    }
+    // Inward, breadth first: each cell tries the segments its neighbours found nearest.
+    let mut h = 0;
+    while h < queue.len() {
+        let u = queue[h];
+        h += 1;
+        for q in b.nb_start[u] as usize..b.nb_start[u + 1] as usize {
+            let v = b.nb[q].0 as usize;
+            if seen[v] {
+                continue;
+            }
+            seen[v] = true;
+            let p = b.pos[v];
+            for w in b.nb_start[v] as usize..b.nb_start[v + 1] as usize {
+                let x = b.nb[w].0 as usize;
+                if near[x] == usize::MAX {
+                    continue;
+                }
+                for o in 0..(2 * per + 1) {
+                    let j = (near[x] + m + o - per) % m;
+                    let (dist, qp) = seg(j, p);
+                    if dist < d[v] {
+                        d[v] = dist;
+                        near[v] = j;
+                        let vv = qp - p;
+                        if vv.length() > 1e-6 {
+                            dir[v] = vv / vv.length();
+                        }
+                    }
+                }
+            }
+            queue.push(v);
+        }
+    }
+    for c in 0..n {
+        if !d[c].is_finite() {
+            d[c] = b.r[c];
+        }
+    }
+    (d, dir)
+}
+
+/// The skin curve as a closed polyline: per outline cell four points of its quadratic
+/// B-spline (through the outline surface's midpoints, `surf` its control points).
+fn skin_curve(surf: &[Vector2], mid_s: &[Vector2]) -> Vec<Vector2> {
+    let ol = surf.len();
+    let mut skin: Vec<Vector2> = Vec::with_capacity(4 * ol);
+    for k in 0..ol {
+        let (p0, p1, p2) = (mid_s[(k + ol - 1) % ol], surf[k], mid_s[k]);
+        for t in [0.0f32, 0.25, 0.5, 0.75] {
+            skin.push(p0 * ((1.0 - t) * (1.0 - t)) + p1 * (2.0 * t * (1.0 - t)) + p2 * (t * t));
+        }
+    }
+    skin
+}
+
+/// A creature's skin curve (as the goo mesh draws it), for the tests.
+#[allow(dead_code)]
+pub fn goo_skin(b: &Body) -> Vec<Vector2> {
+    let ol = b.outline.len();
+    if ol < 3 {
+        return Vec::new();
+    }
+    let surf: Vec<Vector2> = (0..ol).map(|k| b.pos[b.outline[k] as usize] + outward(b, k) * b.r[b.outline[k] as usize]).collect();
+    let mid_s: Vec<Vector2> = (0..ol).map(|k| (surf[k] + surf[(k + 1) % ol]) * 0.5).collect();
+    skin_curve(&surf, &mid_s)
+}
+
+/// The goo skin's mesh of one creature (see above) and its rows of the cell table.
+/// `base` is the creature's first cell's index in the world's table.
+pub fn creature_mesh_goo(b: &Body, base: u32, border: bool) -> Mesh {
+    let mut m = Mesh::default();
+    let n = b.n;
+    if n == 0 {
+        return m;
+    }
+    let ol = b.outline.len();
+    m.reserve(6 * n + 8 * ol, 3 * (2 * n + 6 * ol));
+    // The rim's geometry first: the skin curve, which the distances are measured to.
+    let surf: Vec<Vector2> = if ol >= 3 {
+        (0..ol).map(|k| {
+            let c = b.outline[k] as usize;
+            b.pos[c] + outward(b, k) * b.r[c]
+        }).collect()
+    } else {
+        Vec::new()
+    };
+    let mid_s: Vec<Vector2> = (0..surf.len()).map(|k| (surf[k] + surf[(k + 1) % ol]) * 0.5).collect();
+    const TS: [f32; 5] = [0.0, 0.25, 0.5, 0.75, 1.0];
+    let skin = skin_curve(&surf, &mid_s);
+    let (dist, dir) = outline_distances(b, &skin);
+    // The cell table's rows.
+    m.cells.reserve(CELL_FLOATS * n);
+    for c in 0..n {
+        m.cells.extend_from_slice(&[b.pos[c].x, b.pos[c].y, b.r[c], b.th[c], b.typ[c] as f32, cell_seed(b.uid[c]), dist[c], b.boundary[c] as u8 as f32]);
+    }
+    let gi = |c: usize| (base as usize + c) as f32;
+    let attr = |t: [usize; 3], rim: bool, d: f32| -> Color {
+        let z = if rim { -gi(t[2]) - 1.0 } else { gi(t[2]) };
+        Color::from_rgba(gi(t[0]), gi(t[1]), z, d)
+    };
+    let vert = |m: &mut Mesh, p: Vector2, a: Color, o: Vector2| -> i32 {
+        m.points.push(p);
+        m.colors.push(a);
+        m.uvs.push(o);
+        m.points.len() as i32 - 1
+    };
+    let avg_dir = |a: Vector2, c: Vector2| -> Vector2 {
+        let s = a + c;
+        if s.length() > 1e-6 { s / s.length() } else { a }
+    };
+    let fw: &Faces = &b.faces;
+    let nf = fw.faces.len();
+    let mut drawn = vec![true; nf];
+    let mut centre = vec![Vector2::ZERO; nf];
+    for (fi, f) in fw.faces.iter().enumerate() {
+        let k = f.len();
+        let mut g = Vector2::ZERO;
+        let mut rs = 0.0;
+        for &c in f {
+            g += b.pos[c as usize];
+            rs += b.r[c as usize];
+        }
+        g /= k as f32;
+        centre[fi] = g;
+        if k > 3 {
+            let mut dd = f32::INFINITY;
+            for &c in f {
+                dd = dd.min((b.pos[c as usize] - g).length() - b.r[c as usize]);
+            }
+            if dd > 0.6 * rs / k as f32 {
+                drawn[fi] = false;
+            }
+        }
+    }
+    // A link is split at its midpoint only on the rim (where the outline fans end).
+    let split = |h: u32| -> bool { fw.face_of[fw.twin[h as usize] as usize] == OUTER };
+    let mut poly: Vec<i32> = Vec::with_capacity(16);
+    for (fi, f) in fw.faces.iter().enumerate() {
+        if !drawn[fi] {
+            continue;
+        }
+        let k = f.len();
+        let g = centre[fi];
+        let hs = &fw.halves[fi];
+        if k == 3 {
+            let t = [f[0] as usize, f[1] as usize, f[2] as usize];
+            poly.clear();
+            let mut splits = 0;
+            for q in 0..3 {
+                let c = t[q];
+                poly.push(vert(&mut m, b.pos[c], attr(t, false, dist[c]), dir[c]));
+                if split(hs[q]) {
+                    let cn = t[(q + 1) % 3];
+                    let mid = (b.pos[c] + b.pos[cn]) * 0.5;
+                    poly.push(vert(&mut m, mid, attr(t, false, 0.5 * (dist[c] + dist[cn])), avg_dir(dir[c], dir[cn])));
+                    splits += 1;
+                }
+            }
+            if splits == 0 {
+                m.tri_i(poly[0], poly[1], poly[2]);
+            } else {
+                // A fan from a corner whose two links are whole, else from the centre.
+                let mut whole = usize::MAX;
+                let mut at = 0;
+                for q in 0..3 {
+                    if !split(hs[q]) && !split(hs[(q + 2) % 3]) {
+                        whole = at;
+                    }
+                    at += 1 + split(hs[q]) as usize;
+                }
+                let pl = poly.len();
+                if whole != usize::MAX {
+                    let v = poly[whole];
+                    for s in 1..pl - 1 {
+                        m.tri_i(v, poly[(whole + s) % pl], poly[(whole + s + 1) % pl]);
+                    }
+                } else {
+                    let dg = (dist[t[0]] + dist[t[1]] + dist[t[2]]) / 3.0;
+                    let og = avg_dir(avg_dir(dir[t[0]], dir[t[1]]), dir[t[2]]);
+                    let gv = vert(&mut m, g, attr(t, false, dg), og);
+                    for s in 0..pl {
+                        m.tri_i(gv, poly[s], poly[(s + 1) % pl]);
+                    }
+                }
+            }
+            if border {
+                for q in 0..3 {
+                    let (c, cn) = (t[q], t[(q + 1) % 3]);
+                    if b.typ[c] != b.typ[cn] {
+                        m.lines.push((b.pos[c] + b.pos[cn]) * 0.5);
+                        m.lines.push(g);
+                    }
+                }
+            }
+            continue;
+        }
+        // A larger face (a gap the discs nearly cover): a fan from its centre, each
+        // triangle naming its two cells and the face's other cell nearest the centre.
+        let mut dg = 0.0;
+        let mut og = Vector2::ZERO;
+        for &c in f {
+            dg += dist[c as usize];
+            og += dir[c as usize];
+        }
+        dg /= k as f32;
+        let og = if og.length() > 1e-6 { og / og.length() } else { Vector2::new(0.0, -1.0) };
+        for q in 0..k {
+            let (c, cn) = (f[q] as usize, f[(q + 1) % k] as usize);
+            let mut third = c;
+            let mut best = f32::INFINITY;
+            for &x in f {
+                let x = x as usize;
+                if x != c && x != cn {
+                    let e = (b.pos[x] - g).length() - b.r[x];
+                    if e < best {
+                        best = e;
+                        third = x;
+                    }
+                }
+            }
+            let t = [c, cn, third];
+            let gv = vert(&mut m, g, attr(t, false, dg), og);
+            let cv = vert(&mut m, b.pos[c], attr(t, false, dist[c]), dir[c]);
+            let nv = vert(&mut m, b.pos[cn], attr(t, false, dist[cn]), dir[cn]);
+            if split(hs[q]) {
+                let mid = (b.pos[c] + b.pos[cn]) * 0.5;
+                let mv = vert(&mut m, mid, attr(t, false, 0.5 * (dist[c] + dist[cn])), avg_dir(dir[c], dir[cn]));
+                m.tri_i(gv, cv, mv);
+                m.tri_i(gv, mv, nv);
+            } else {
+                m.tri_i(gv, cv, nv);
+            }
+            if border && b.typ[c] != b.typ[cn] {
+                m.lines.push((b.pos[c] + b.pos[cn]) * 0.5);
+                m.lines.push(g);
+            }
+        }
+    }
+    // The rim.
+    if ol < 3 {
+        for (k, &c) in b.outline.iter().enumerate() {
+            let c = c as usize;
+            let other = b.outline[(k + 1) % ol] as usize;
+            let t = [c, other, other];
+            const SIDES: usize = 16;
+            let cv = vert(&mut m, b.pos[c], attr(t, true, b.r[c]), Vector2::new(0.0, -1.0));
+            let mut ring = [0i32; SIDES];
+            for s in 0..SIDES {
+                let a = std::f32::consts::TAU * s as f32 / SIDES as f32;
+                let o = Vector2::new(a.cos(), a.sin());
+                ring[s] = vert(&mut m, b.pos[c] + o * b.r[c], attr(t, true, 0.0), o);
+            }
+            for s in 0..SIDES {
+                m.tri_i(cv, ring[s], ring[(s + 1) % SIDES]);
+            }
+        }
+        return m;
+    }
+    for k in 0..ol {
+        let kp = (k + ol - 1) % ol;
+        let kn = (k + 1) % ol;
+        let c = b.outline[k] as usize;
+        let (cpv, cnv) = (b.outline[kp] as usize, b.outline[kn] as usize);
+        let t = [c, cpv, cnv];
+        let pc = b.pos[c];
+        let (p0, p1, p2) = (mid_s[kp], surf[k], mid_s[k]);
+        let bz = |s: f32| p0 * ((1.0 - s) * (1.0 - s)) + p1 * (2.0 * s * (1.0 - s)) + p2 * (s * s);
+        // The curve's outward normal: its tangent turned toward the cell's outside.
+        let out_k = outward(b, k);
+        let normal = |s: f32| -> Vector2 {
+            let tg = (p1 - p0) * (2.0 * (1.0 - s)) + (p2 - p1) * (2.0 * s);
+            let l = tg.length();
+            if l < 1e-6 {
+                return out_k;
+            }
+            let nn = Vector2::new(-tg.y, tg.x) / l;
+            if nn.dot(out_k) < 0.0 { -nn } else { nn }
+        };
+        let cv = vert(&mut m, pc, attr(t, true, dist[c]), dir[c]);
+        let mpv = vert(&mut m, (pc + b.pos[cpv]) * 0.5, attr(t, true, 0.5 * (dist[c] + dist[cpv])), avg_dir(dir[c], dir[cpv]));
+        let mnv = vert(&mut m, (pc + b.pos[cnv]) * 0.5, attr(t, true, 0.5 * (dist[c] + dist[cnv])), avg_dir(dir[c], dir[cnv]));
+        let mut ring = [0i32; 7];
+        ring[0] = mpv;
+        for (q, &s) in TS.iter().enumerate() {
+            ring[q + 1] = vert(&mut m, bz(s), attr(t, true, 0.0), normal(s));
+        }
+        ring[6] = mnv;
+        let pts = [(pc + b.pos[cpv]) * 0.5, p0, bz(0.25), bz(0.5), bz(0.75), p2, (pc + b.pos[cnv]) * 0.5];
+        for q in 0..6 {
+            if len_sq(pts[q + 1] - pts[q]) < 1e-12 {
+                continue;
+            }
+            m.tri_i(cv, ring[q], ring[q + 1]);
+        }
+        if border && b.typ[c] != b.typ[cnv] {
+            m.lines.push((pc + b.pos[cnv]) * 0.5);
+            m.lines.push(p2);
+        }
+    }
+    m
+}
+
+/// What the shader works out at `p` among a triangle's three cells (for the tests: keep
+/// it in step with goo_cells_goo.gdshader's `cells_at()`): the cell it lies in (0..2) and
+/// its distance in px to that cell's nearest wall among the other two (the power
+/// diagram's: |p − c|² − r² equal on both sides).
+#[allow(dead_code)]
+pub fn wall_distance(p: Vector2, c: [Vector2; 3], r: [f32; 3]) -> (usize, f32) {
+    let pw = |i: usize| len_sq(p - c[i]) - r[i] * r[i];
+    let mut o = 0;
+    for i in 1..3 {
+        if pw(i) < pw(o) {
+            o = i;
+        }
+    }
+    let mut w = f32::INFINITY;
+    for i in 0..3 {
+        let l = (c[i] - c[o]).length();
+        if i == o || l < 1e-4 {
+            continue;
+        }
+        w = w.min((pw(i) - pw(o)) / (2.0 * l));
+    }
+    (o, w)
 }

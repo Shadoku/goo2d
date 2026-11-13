@@ -2308,6 +2308,28 @@ impl GooCells {
         a
     }
 
+    /// Every live creature's goo skin mesh (cells_draw.rs, creature_mesh_goo()):
+    /// [points, attributes (COLOR: three cells' indices into the table and the distance
+    /// to the outline in px), outward directions (UV), border lines (pairs), build µs,
+    /// indices, the cell table (8 floats a cell), cells in the table].
+    #[func]
+    fn meshes_all_goo(&self, borders: bool) -> VarArray {
+        let t = std::time::Instant::now();
+        let m = self.c.meshes_all_goo(borders);
+        let us = t.elapsed().as_micros() as i64;
+        let mut a = VarArray::new();
+        a.push(&PackedVector2Array::from(m.points.as_slice()).to_variant());
+        a.push(&PackedColorArray::from(m.colors.as_slice()).to_variant());
+        a.push(&PackedVector2Array::from(m.uvs.as_slice()).to_variant());
+        a.push(&PackedVector2Array::from(m.lines.as_slice()).to_variant());
+        a.push(&us.to_variant());
+        a.push(&PackedInt32Array::from(m.indices.as_slice()).to_variant());
+        let cells = (m.cells.len() / crate::cells_draw::CELL_FLOATS) as i64;
+        a.push(&PackedFloat32Array::from(m.cells.as_slice()).to_variant());
+        a.push(&cells.to_variant());
+        a
+    }
+
     #[func]
     fn add_creature(&mut self, centers: PackedVector2Array, radii: PackedFloat32Array, types: PackedInt32Array) -> i64 {
         let t: Vec<u8> = types.as_slice().iter().map(|&x| x as u8).collect();

@@ -3051,6 +3051,33 @@ impl Cells {
         out
     }
 
+    /// Every live creature's goo skin mesh (cells_draw.rs, creature_mesh_goo()) and the
+    /// cell table its triangles index, threaded, concatenated in creature order.
+    pub fn meshes_all_goo(&self, border: bool) -> crate::cells_draw::Mesh {
+        let n = self.bodies.len();
+        let mut base = vec![0u32; n];
+        let mut at = 0u32;
+        for c in 0..n {
+            base[c] = at;
+            if self.bodies[c].alive {
+                at += self.bodies[c].n as u32;
+            }
+        }
+        let f = |c: usize| if self.bodies[c].alive { crate::cells_draw::creature_mesh_goo(&self.bodies[c], base[c], border) } else { crate::cells_draw::Mesh::default() };
+        let parts: Vec<crate::cells_draw::Mesh> = match &self.pool {
+            Some(pool) => pool.install(|| (0..n).into_par_iter().map(f).collect()),
+            None => (0..n).map(f).collect(),
+        };
+        let mut out = crate::cells_draw::Mesh::default();
+        out.reserve(parts.iter().map(|p| p.points.len()).sum(), parts.iter().map(|p| p.indices.len()).sum());
+        out.lines.reserve(parts.iter().map(|p| p.lines.len()).sum());
+        out.cells.reserve(parts.iter().map(|p| p.cells.len()).sum());
+        for part in parts {
+            out.append(part);
+        }
+        out
+    }
+
     /// One creature's skin: its outline surface smoothed (Chaikin, `iterations`).
     pub fn skin(&self, c: usize, iterations: usize) -> Vec<Vector2> {
         let mut s = Vec::new();
@@ -3845,6 +3872,147 @@ mod tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod goo_mesh_tests {
+    use super::*;
+    use crate::cells_draw::{creature_mesh_goo, goo_skin, wall_distance, CELL_FLOATS};
+
+    fn lsq(v: Vector2) -> f32 { v.dot(v) }
+
+    fn no_t_junctions(m: &crate::cells_draw::Mesh) {
+        let p = m.triangles();
+        for t in p.chunks(3) {
+            for e in 0..3 {
+                let (a, c) = (t[e], t[(e + 1) % 3]);
+                let ac = c - a;
+                let l2 = lsq(ac);
+                for &v in p.iter() {
+                    let s = (v - a).dot(ac) / l2;
+                    if s > 1e-3 && s < 1.0 - 1e-3 {
+                        let off = cross(ac, v - a).abs() / l2.sqrt();
+                        assert!(off > 1e-3, "a vertex {:?} inside the edge {:?} {:?}", v, a, c);
+                    }
+                }
+            }
+        }
+    }
+
+    fn seg_dist(p: Vector2, a: Vector2, b: Vector2) -> f32 {
+        let e = b - a;
+        let s = ((p - a).dot(e) / lsq(e).max(1e-12)).clamp(0.0, 1.0);
+        (a + e * s - p).length()
+    }
+
+    #[test]
+    fn goo_mesh_of_a_hex_blob() {
+        for two in [false, true] {
+            let mut cl = Cells::default();
+            let d = hex_design(3, 7.0, Vector2::new(300.0, 200.0));
+            let t: Vec<u8> = d.iter().map(|p| (two && p.x > 300.0) as u8).collect();
+            let c = cl.add_creature(&d, &vec![7.0; d.len()], &t);
+            let b = &cl.bodies[c];
+            let base = 1000;
+            let m = creature_mesh_goo(b, base, false);
+            // The table: a row per cell; every triangle names one triple of this
+            // creature's cells on all three corners.
+            assert_eq!(m.cells.len(), CELL_FLOATS * b.n);
+            for tri in m.indices.chunks(3) {
+                let a = m.colors[tri[0] as usize];
+                for &v in tri {
+                    let o = m.colors[v as usize];
+                    assert_eq!((o.r, o.g, o.b), (a.r, a.g, a.b));
+                }
+                let z = if a.b < 0.0 { -a.b - 1.0 } else { a.b };
+                for x in [a.r, z, a.g] {
+                    assert!(x >= base as f32 && x < (base as usize + b.n) as f32 && x.fract() == 0.0, "{x}");
+                }
+            }
+            // The same area as the flat mesh, and still no T-junction.
+            let flat = crate::cells_draw::creature_mesh(b, &cl.opt.types, false);
+            let area = |m: &crate::cells_draw::Mesh| m.triangles().chunks(3).map(|t| 0.5 * cross(t[1] - t[0], t[2] - t[0]).abs()).sum::<f32>();
+            assert!((area(&m) - area(&flat)).abs() < 1.0, "{} {}", area(&m), area(&flat));
+            no_t_junctions(&m);
+            // The distance to the outline in px: 0 on the skin, at each cell's centre the
+            // distance to the skin curve (brute force over it).
+            let skin = goo_skin(b);
+            let mut on_skin = 0;
+            for (v, col) in m.points.iter().zip(&m.colors) {
+                let brute = (0..skin.len()).map(|k| seg_dist(*v, skin[k], skin[(k + 1) % skin.len()])).fold(f32::INFINITY, f32::min);
+                if col.a == 0.0 {
+                    on_skin += 1;
+                    assert!(brute < 0.05, "a skin vertex {brute} px off the curve");
+                }
+            }
+            assert!(on_skin > 0);
+            for i in 0..b.n {
+                let dd = m.cells[CELL_FLOATS * i + 6];
+                let brute = (0..skin.len()).map(|k| seg_dist(b.pos[i], skin[k], skin[(k + 1) % skin.len()])).fold(f32::INFINITY, f32::min);
+                assert!((dd - brute).abs() < 0.01, "cell {i}: {dd} against {brute}");
+                if b.boundary[i] {
+                    // About its radius (less at a corner, which the curve cuts).
+                    assert!(dd > 0.6 * 7.0 && dd < 1.1 * 7.0, "an outline cell {dd} px from the skin");
+                }
+            }
+            // The middle cell: deepest, about three cells in.
+            let mid = (0..b.n).min_by(|&x, &y| (b.pos[x] - Vector2::new(300.0, 200.0)).length().partial_cmp(&(b.pos[y] - Vector2::new(300.0, 200.0)).length()).unwrap()).unwrap();
+            let deep = m.cells[CELL_FLOATS * mid + 6];
+            assert!(deep > 6.0 * 7.0 && deep < 7.5 * 7.0, "{deep}");
+        }
+    }
+
+    #[test]
+    fn wall_distance_on_the_wall_and_at_the_centre() {
+        let c = [Vector2::new(0.0, 0.0), Vector2::new(14.0, 0.0), Vector2::new(7.0, 12.124)];
+        let r = [7.0f32; 3];
+        // On the wall between the first two: zero.
+        let (_, w) = wall_distance(Vector2::new(7.0, 3.0), c, r);
+        assert!(w.abs() < 1e-4, "{w}");
+        // At a centre: the largest, half the link.
+        let (o, w0) = wall_distance(c[0], c, r);
+        assert_eq!(o, 0);
+        assert!((w0 - 7.0).abs() < 1e-3, "{w0}");
+        for k in 0..400 {
+            let p = Vector2::new((k % 20) as f32 * 0.7, (k / 20) as f32 * 0.6);
+            let (o, w) = wall_distance(p, c, r);
+            assert!(w >= -1e-4 && w <= (p - c[o]).length().max(0.0) + 7.0 + 1e-3);
+            if o == 0 {
+                assert!(w <= w0 + 1e-4, "{w} at {p:?} beyond the centre's {w0}");
+            }
+        }
+        // Unequal radii: the wall moves toward the smaller cell (the power diagram).
+        let (o, _) = wall_distance(Vector2::new(8.0, 0.0), [c[0], c[1], c[2]], [10.0, 5.0, 7.0]);
+        assert_eq!(o, 0);
+    }
+
+    #[test]
+    fn goo_mesh_of_two_creatures_and_mixed_sizes() {
+        let mut cl = Cells::default();
+        let d = hex_design(2, 7.0, Vector2::ZERO);
+        cl.add_creature(&d, &vec![7.0; d.len()], &vec![0; d.len()]);
+        let d2 = hex_design(2, 7.0, Vector2::new(200.0, 0.0));
+        let radii: Vec<f32> = (0..d2.len()).map(|i| if i % 3 == 0 { 9.0 } else { 6.0 }).collect();
+        cl.add_creature(&d2, &radii, &vec![1; d2.len()]);
+        for _ in 0..30 {
+            cl.step(1.0 / 60.0);
+        }
+        let m = cl.meshes_all_goo(false);
+        let total: usize = cl.bodies.iter().filter(|b| b.alive).map(|b| b.n).sum();
+        assert_eq!(m.cells.len(), CELL_FLOATS * total);
+        // Every index within the table; each creature's triangles name only its cells.
+        let n0 = cl.bodies[0].n as f32;
+        for tri in m.indices.chunks(3) {
+            let a = m.colors[tri[0] as usize];
+            let z = if a.b < 0.0 { -a.b - 1.0 } else { a.b };
+            let first = a.r < n0;
+            for x in [a.r, a.g, z] {
+                assert!(x >= 0.0 && x < total as f32);
+                assert_eq!(x < n0, first, "a triangle naming two creatures' cells");
+            }
+        }
+        no_t_junctions(&m);
     }
 }
 
