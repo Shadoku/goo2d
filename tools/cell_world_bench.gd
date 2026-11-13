@@ -5,7 +5,7 @@ extends SceneTree
 ##   godot --headless --path . -s tools/cell_world_bench.gd -- [--creatures=30] [--cells=150]
 ##     [--mode=collide|swim] [--body=links|shape|regions] [--threads=4] [--substeps=6]
 ##     [--frames=360] [--water=none|uniform|cells] [--ratio=20] [--seed=1]
-##     [--proxies=none|circles|hull] [--real] [--rings=0] [--couple=1]
+##     [--proxies=none|circles|hull] [--real] [--rings=0] [--couple=1] [--servo=0]
 ## collide: hex blobs pushed at 300 px/s² toward a random point that changes every 2 s;
 ## swim: hex worms (cells / 5 long, 5 wide) swimming by their pose wave (slope 1, a body
 ## length, 0.8-1.2 Hz) steered toward their point by a curvature bias. --water=cells feeds
@@ -27,6 +27,9 @@ extends SceneTree
 ##     [--ratio=20] [--long=24] [--wide=5] [--freq=1] [--slope=1] [--seconds=10]
 ## One worm alone in open water: body lengths per stroke cycle and px/s. --body=regions
 ## makes it --segments=6 shape-matched segments joined by joints.
+## --servo=1: every creature turns toward its point by the spin servo (set_spin_servo(), a
+## yield of 0.3 and a tip cap of 600 px/s, the target set every frame by spin_toward() of
+## its heading error, at most 3 rad/s and 12 rad/s²), the swimmers' wave unbent.
 
 var opts := {}
 
@@ -116,6 +119,7 @@ func _bench() -> void:
 	var n := int(o("creatures", 30))
 	var m := int(o("cells", 150))
 	var swim := String(o("mode", "collide")) == "swim"
+	var servo := int(o("servo", 0)) != 0
 	var rng := RandomNumberGenerator.new()
 	rng.seed = int(o("seed", 1))
 	var design := _design(swim, m)
@@ -212,9 +216,14 @@ func _bench() -> void:
 		for k: int in n:
 			var cr := creatures[k]
 			var to := targets[k] - cr.center()
+			if servo:
+				if f == 0:
+					cr.set_spin_servo(0.0, 12.0, 600.0, 0.3)
+				var err := wrapf(to.angle() - cr.heading().angle(), -PI, PI)
+				cr.set_spin_target(GooCellCreature.spin_toward(err, 3.0, 0.8 * 12.0, 1.0 / 60.0))
 			if swim:
 				var err := wrapf(to.angle() - cr.heading().angle(), -PI, PI)
-				cr.set_pose_wave(1.0, length, freqs[k], clampf(err, -1.0, 1.0) * 0.003)
+				cr.set_pose_wave(1.0, length, freqs[k], 0.0 if servo else clampf(err, -1.0, 1.0) * 0.003)
 			else:
 				cr.push(to.normalized() * 300.0)
 		if real:
@@ -286,7 +295,7 @@ func _bench() -> void:
 		print("  %d rings, coupled %s: ring world step median %.2f ms, p95 %.2f; both worlds median %.2f ms, p95 %.2f; the coupling inside the cells' step median %.3f ms (broad phase %.3f), p95 %.3f; rings touched per frame %.1f, candidate pairs %.0f (beads %.0f)" % [
 			ring_count, w.coupled_world() != null, ring_times[cnt / 2], ring_times[cnt * 95 / 100], both[cnt / 2], both[cnt * 95 / 100], couple_us[cnt / 2], broad_us[cnt / 2], couple_us[cnt * 95 / 100], float(touched) / cnt, float(pairs) / cnt, float(bead_pairs) / cnt])
 		print("RINGS rings=%d coupled=%s ring_median=%.2f both_median=%.2f both_p95=%.2f couple_median=%.3f" % [ring_count, w.coupled_world() != null, ring_times[cnt / 2], both[cnt / 2], both[cnt * 95 / 100], couple_us[cnt / 2]])
-	print("RESULT n=%d m=%d mode=%s body=%s threads=%d proxies=%s median=%.2f p95=%.2f inside=%d" % [n, design.cell_count(), "swim" if swim else "collide", String(o("body", "shape")), w.threads, proxies, med, p95, int(worst[1])])
+	print("RESULT n=%d m=%d mode=%s body=%s threads=%d proxies=%s servo=%d median=%.2f p95=%.2f inside=%d" % [n, design.cell_count(), "swim" if swim else "collide", String(o("body", "shape")), w.threads, proxies, int(servo), med, p95, int(worst[1])])
 
 func _swim_test() -> void:
 	var w := _world()

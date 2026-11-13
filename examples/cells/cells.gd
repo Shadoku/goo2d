@@ -5,7 +5,7 @@ extends Node2D
 ## (docs/cells.md): a worm 24 × 5 driven by its swim drive (its spine row pushing hardest)
 ## with a gentle pose wave as its visible stroke, steered toward points round the tank by
 ## the wave's curvature bias alone (WORM), a blob pushed by a ring of thruster cells at its back and turned
-## by a twist (BLOB), a mixed-size creature from a saved design (mixed.tres) drifting, and
+## by the solver's spin servo (BLOB), a mixed-size creature from a saved design (mixed.tres) drifting, and
 ## a crawler of three shape-matched segments whose two joints swing (CRAWLER). The water
 ## turns slowly round the tank's middle (the world's water_source, per cell). Drag a
 ## creature with the mouse; R builds the tank again.
@@ -28,9 +28,15 @@ const WORM_STEER: float = 0.0025
 const WORM_SWIM: float = 55.0
 const WORM_PULSE: float = 0.3
 const SPINE_SWIM: float = 2.0
-## The blob's thrusters (force per cell, × its mass) and turning (rad/s² per rad of error).
+## The blob's thrusters (force per cell, × its mass) and its spin servo: the fastest spin
+## (rad/s), the servo's angular acceleration (rad/s²; it brakes at 0.8 of it), its rim's
+## top speed (px/s) and how far it yields to what it touches (docs/cells.md, "Turning by the
+## spin servo": a tame setting).
 const THRUST: float = 600.0
-const TURN_GAIN: float = 2.5
+const BLOB_SPIN: float = 3.0
+const BLOB_TURN: float = 12.0
+const BLOB_TIP: float = 500.0
+const BLOB_YIELD: float = 0.3
 ## The crawler's joints' swing (rad) and frequency (Hz).
 const SWING: float = 0.45
 const SWING_HZ: float = 0.6
@@ -154,6 +160,7 @@ func build() -> void:
 			_thrusters.append(i)
 	worm.set_pose_wave(WORM_SLOPE, worm.design.length(), WORM_HZ)
 	worm.set_swim(WORM_SWIM, WORM_PULSE)
+	blob.set_spin_servo(0.0, BLOB_TURN, BLOB_TIP, BLOB_YIELD)
 	_update_label()
 
 ## The waypoint a swimmer heads for now.
@@ -173,7 +180,8 @@ func _physics_process(delta: float) -> void:
 		worm.set_pose_wave(WORM_SLOPE, worm.design.length(), WORM_HZ, clampf(err, -1.0, 1.0) * WORM_STEER)
 	if blob != null and blob.is_alive():
 		var err := _steer(blob)
-		blob.twist(TURN_GAIN * err - 1.5 * blob.spin())
+		# The servo's target each frame: the fastest spin that stops on the heading.
+		blob.set_spin_target(GooCellCreature.spin_toward(err, BLOB_SPIN, 0.8 * BLOB_TURN, delta))
 		# Thrust only while it roughly faces its goal: it turns on the spot first.
 		var throttle := maxf(0.0, cos(err))
 		for i: int in _thrusters:
