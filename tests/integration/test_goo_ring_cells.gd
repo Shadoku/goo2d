@@ -11,6 +11,7 @@ const R: float = 14.0
 
 var rings: GooWorld2D
 var cells: GooCellWorld2D
+var walls: Array[Node] = []
 
 func before_each() -> void:
 	GooTuning.unit = 0.5
@@ -53,12 +54,25 @@ func _frames(n: int) -> void:
 
 # A floor (a wall both worlds see) whose top is at y.
 func _floor(y: float, x0: float = 0.0, x1: float = 1920.0) -> void:
+	_wall(Rect2(x0, y, x1 - x0, 60.0))
+
+func _wall(rect: Rect2) -> void:
 	var body := StaticBody2D.new()
 	body.collision_layer = GooTuning.LAYER_WALLS
 	var poly := CollisionPolygon2D.new()
-	poly.polygon = PackedVector2Array([Vector2(x0, y), Vector2(x1, y), Vector2(x1, y + 60), Vector2(x0, y + 60)])
+	poly.polygon = PackedVector2Array([rect.position, Vector2(rect.end.x, rect.position.y), rect.end, Vector2(rect.position.x, rect.end.y)])
 	body.add_child(poly)
 	add_child(body)
+	walls.append(body)
+
+# Frees the scene (worlds and walls) and waits a frame.
+func _clear() -> void:
+	rings.queue_free()
+	cells.queue_free()
+	for w: Node in walls:
+		w.queue_free()
+	walls.clear()
+	await _frames(1)
 
 # Cell centres of `cr` inside `body`'s bead loop.
 static func _cells_inside(cr: GooCellCreature, body: Goo2D) -> int:
@@ -169,9 +183,7 @@ func test_impacts_at_unit_half() -> void:
 		var m := await _impact(speed, 40.0, R)
 		_report("unit 0.5, %d px/s each, ring 40 px, cells 14 px" % speed, m)
 		_check_impact(m)
-		rings.queue_free()
-		cells.queue_free()
-		await _frames(1)
+		await _clear()
 
 func test_impacts_at_unit_one() -> void:
 	GooTuning.unit = 1.0
@@ -179,6 +191,199 @@ func test_impacts_at_unit_one() -> void:
 		var m := await _impact(speed, 80.0, 2.0 * R)
 		_report("unit 1, %d px/s each, ring 80 px, cells 28 px" % speed, m)
 		_check_impact(m)
-		rings.queue_free()
-		cells.queue_free()
+		await _clear()
+
+# The fastest any cell of `cr` or bead of `body` moves (px/s).
+static func _fastest(body: Goo2D, cr: GooCellCreature) -> float:
+	return maxf(_fastest_bead(body), _fastest_cell(cr))
+
+static func _fastest_bead(body: Goo2D) -> float:
+	var v := 0.0
+	for u: Vector2 in body.bead_velocities():
+		v = maxf(v, u.length())
+	return v
+
+static func _fastest_cell(cr: GooCellCreature) -> float:
+	var v := 0.0
+	for u: Vector2 in cr.velocities():
+		v = maxf(v, u.length())
+	return v
+
+# Rest under gravity for `seconds`: [ring centre drift px/s over the last 3 s, creature
+# drift, fastest particle in the first and last second, worst overlap, centres/beads inside].
+func _rest(body: Goo2D, cr: GooCellCreature, seconds: float) -> Dictionary:
+	var frames := int(seconds * 60.0)
+	var ring_at := Vector2.ZERO
+	var blob_at := Vector2.ZERO
+	var early := 0.0
+	var late := 0.0
+	var late_bead := 0.0
+	var late_cell := 0.0
+	var worst := 0.0
+	var inside := 0
+	for f: int in frames:
 		await _frames(1)
+		if f == frames - 180:
+			ring_at = body.center()
+			blob_at = cr.center()
+		if f >= 60 and f < 120:
+			early = maxf(early, _fastest(body, cr))
+		if f >= frames - 60:
+			late = maxf(late, _fastest(body, cr))
+			late_bead = maxf(late_bead, _fastest_bead(body))
+			late_cell = maxf(late_cell, _fastest_cell(cr))
+		if f >= 60:
+			worst = maxf(worst, _overlap(body, cr))
+			inside = maxi(inside, _cells_inside(cr, body) + _beads_inside(body, cr))
+	return {"ring_drift": body.center().distance_to(ring_at) / 3.0, "blob_drift": cr.center().distance_to(blob_at) / 3.0,
+		"early": early, "late": late, "late_bead": late_bead, "late_cell": late_cell, "worst": worst, "inside": inside}
+
+func test_a_ring_resting_on_a_creature() -> void:
+	_scene(true)
+	_floor(800.0)
+	var cr := cells.spawn(GooCellDesign.hex_worm(14, 3, R), Transform2D(0.0, Vector2(960, 800.0 - 3.0 * R)))
+	var body := rings.spawn(40.0, Vector2(960, 800.0 - 6.0 * R - 50.0))
+	await _frames(60)
+	var m := await _rest(body, cr, 5.0)
+	print("  a 40 px ring on a 14 × 3 worm under gravity, 5 s: ring drifts %.2f px/s, worm %.2f px/s over the last 3 s; fastest particle %.1f px/s in the second second, %.1f in the last; worst overlap %.2f px; centres/beads inside %d" % [
+		m["ring_drift"], m["blob_drift"], m["early"], m["late"], m["worst"], m["inside"]])
+	assert_lt(body.center().y, cr.center().y - 2.0 * R, "the ring stays on top")
+	assert_lt(m["ring_drift"], 2.0, "the ring rests")
+	assert_lt(m["blob_drift"], 2.0, "the worm rests")
+	assert_lt(m["late"], maxf(m["early"], 20.0), "no jitter growing")
+	assert_eq(m["inside"], 0)
+
+func test_a_creature_resting_on_rings() -> void:
+	# A blob in the dip between two rings held between two low walls (one ring alone is
+	# a ball a creature rolls off, and on two it slides off one side unless it sits in
+	# the dip between them: nothing has friction).
+	_scene(true)
+	_floor(800.0)
+	_wall(Rect2(778.0, 740.0, 60.0, 60.0))
+	_wall(Rect2(1082.0, 740.0, 60.0, 60.0))
+	var body := rings.spawn(40.0, Vector2(900, 800.0 - 40.0))
+	var other := rings.spawn(40.0, Vector2(1020, 800.0 - 40.0))
+	var cr := cells.spawn(GooCellDesign.hex_blob(2, R), Transform2D(0.0, Vector2(960, 800.0 - 80.0 - 4.0 * R)))
+	await _frames(60)
+	var m := await _rest(body, cr, 5.0)
+	print("  a 19-cell blob in the dip between two 40 px rings held between low walls, under gravity, 5 s: ring drifts %.2f px/s, worm %.2f px/s over the last 3 s; fastest particle %.1f px/s in the second second, %.1f in the last; worst overlap %.2f px; centres/beads inside %d; ring area %.2f of target, the other ring's overlap %.2f px" % [
+		m["ring_drift"], m["blob_drift"], m["early"], m["late"], m["worst"], m["inside"], body.area() / body.target_area, _overlap(other, cr)])
+	print("    in the last second: fastest bead %.1f px/s, fastest cell %.1f px/s" % [m["late_bead"], m["late_cell"]])
+	assert_lt(cr.center().y, body.center().y - 30.0, "the blob stays on top")
+	assert_lt(m["ring_drift"], 2.0, "the ring rests")
+	assert_lt(m["blob_drift"], 2.0, "the blob rests")
+	assert_lt(m["late"], maxf(m["early"], 20.0), "no jitter growing")
+	assert_eq(m["inside"], 0)
+
+func test_resting_alone_for_reference() -> void:
+	# The same bodies resting on a floor, uncoupled: how much a resting ring's beads and a
+	# resting blob's cells move by themselves.
+	_scene(true, false)
+	_floor(800.0)
+	var body := rings.spawn(40.0, Vector2(700, 760.0))
+	var cr := cells.spawn(GooCellDesign.hex_blob(2, R), Transform2D(0.0, Vector2(1200, 800.0 - 5.0 * R)))
+	await _frames(60)
+	var m := await _rest(body, cr, 5.0)
+	print("  alone on a floor, 5 s: a 40 px ring drifts %.2f px/s (settled: %s), a 19-cell blob %.2f px/s; in the last second fastest bead %.1f px/s, fastest cell %.1f px/s" % [
+		m["ring_drift"], body.settled, m["blob_drift"], m["late_bead"], m["late_cell"]])
+
+func test_rings_below_and_above_the_cells_size() -> void:
+	# The smallest ring (14 px at unit 0.5) against cells of 36 px, and a ring of 80 px
+	# against cells of 8 px.
+	for c: Array in [[14.0, 36.0, 1], [80.0, 8.0, 4]]:
+		var m := await _impact(400.0, c[0], c[1], c[2])
+		_report("ring %d px, cells %d px, 400 px/s each" % [c[0], c[1]], m)
+		_check_impact(m)
+		await _clear()
+
+func test_a_polygon_ring() -> void:
+	for sides: int in [3, 4]:
+		var m := await _impact(400.0, 40.0, R, 3, sides)
+		_report("a %d-sided ring of 40 px, 400 px/s each" % sides, m)
+		_check_impact(m)
+		await _clear()
+
+func test_a_worm_wrapping_round_a_ring() -> void:
+	# The ring weighs 40 times its area (else the worm just carries it along).
+	_scene()
+	cells.body_mode = GooCellWorld2D.BodyMode.NONE
+	cells.ring_density = 40.0
+	var body := rings.spawn(36.0, Vector2(960, 540))
+	var design := GooCellDesign.hex_worm(24, 2, R)
+	var cr := cells.spawn(design, Transform2D(PI / 2, Vector2(960 + 36.0 + 3.0 * R, 540)))
+	await _frames(1)
+	cr.set_velocity(Vector2(-350.0, 0.0))
+	var worst := 0.0
+	var inside := 0
+	var wrap := -INF
+	for f: int in 120:
+		await _frames(1)
+		worst = maxf(worst, cells.coupling_stats()["worst"])
+		inside = maxi(inside, _cells_inside(cr, body) + _beads_inside(body, cr))
+		# Wrapped: the worm's ends past the ring's centre along its travel.
+		var p := cr.positions()
+		wrap = maxf(wrap, body.center().x - (p[0].x + p[p.size() - 1].x) * 0.5)
+	print("  a 24 × 2 worm (lengths only, floppy) thrown broadside at 350 px/s onto a 36 px ring: worst overlap %.2f px, centres/beads inside at most %d, at the end %d; the worm's ends at most %.0f px past the ring's centre (wrapped round it), then springing back; overlap at end %.2f px; ring area %.2f of target" % [
+		worst, inside, _cells_inside(cr, body) + _beads_inside(body, cr), wrap, _overlap(body, cr), body.area() / body.target_area])
+	assert_eq(_cells_inside(cr, body) + _beads_inside(body, cr), 0)
+	assert_gt(wrap, 36.0, "the worm's ends went round the ring")
+	assert_eq(inside, 0, "never inside each other")
+	assert_lt(_overlap(body, cr), 2.0 * GooTuning.unit)
+
+func test_a_settled_ring_is_woken() -> void:
+	_scene(true)
+	_floor(800.0)
+	var body := rings.spawn(40.0, Vector2(960, 760.0))
+	var frames := 0
+	while not body.settled and frames < 600:
+		await _frames(1)
+		frames += 1
+	assert_true(body.settled, "the ring settled on the floor")
+	var cr := cells.spawn(GooCellDesign.hex_blob(2, R), Transform2D(0.0, Vector2(940, 600.0)))
+	cr.set_velocity(Vector2(0.0, 300.0))
+	var woke := -1
+	var worst := 0.0
+	for f: int in 120:
+		await _frames(1)
+		if woke < 0 and not body.settled:
+			woke = f
+		worst = maxf(worst, _overlap(body, cr))
+	print("  a settled ring (after %d frames) hit by a falling blob: woken %d frames later, worst overlap %.2f px, ring settled again %s" % [frames, woke, worst, body.settled])
+	assert_gt(woke, -1, "woken")
+	assert_lt(cr.center().y, body.center().y, "the blob stays on top")
+	assert_eq(_cells_inside(cr, body) + _beads_inside(body, cr), 0)
+
+func test_uncoupled_worlds_pass_through() -> void:
+	_scene(false, false)
+	var body := rings.spawn(40.0, Vector2(800, 540))
+	var cr := cells.spawn(GooCellDesign.hex_blob(2, R), Transform2D(0.0, Vector2(1100, 540)))
+	await _frames(1)
+	body.set_velocity(Vector2(300.0, 0.0))
+	cr.set_velocity(Vector2(-300.0, 0.0))
+	await _frames(60)
+	assert_gt(body.center().x, cr.center().x + 100.0, "passed through each other")
+	assert_eq(cells.coupling_stats()["on"], false)
+	assert_almost_eq(body.average_velocity().x, 300.0, 1.0)
+
+# A coupled scene of several rings and creatures, `frames` long; the state at the end.
+func _replay(threads: int) -> Array:
+	await _frames(1)
+	_scene(true, true, threads)
+	_floor(900.0)
+	for k: int in 4:
+		rings.spawn(30.0 + 6.0 * k, Vector2(700.0 + 150.0 * k, 400.0 + 40.0 * (k % 2)))
+		cells.spawn(GooCellDesign.hex_blob(2, R), Transform2D(0.3 * k, Vector2(760.0 + 150.0 * k, 650.0)))
+	await _frames(150)
+	var out: Array = [cells.cells().state_hash()]
+	for b: Goo2D in rings.bodies():
+		out.append(b.bead_points())
+	return out
+
+func test_replay_and_threads() -> void:
+	var a := await _replay(1)
+	await _clear()
+	var b := await _replay(1)
+	await _clear()
+	var c := await _replay(4)
+	assert_eq(a, b, "a replay is identical")
+	assert_eq(a, c, "threaded == serial")

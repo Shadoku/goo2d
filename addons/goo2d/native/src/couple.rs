@@ -33,6 +33,7 @@
 use crate::cells::{Body, Opt};
 use crate::geom::{centroid, cross, dot, len_sq, Rect};
 use crate::kernel::Kernel;
+use crate::statics::StaticShape;
 use godot::builtin::Vector2;
 
 /// Edges either side of a bead's nearest outline edge tested in a substep (the bead was
@@ -297,7 +298,7 @@ impl Ghosts {
 
     /// One of the cells' substeps (`s` of them so far, each `h` long): the ghosts moved,
     /// the contacts solved both ways, the touched rings held to their shape.
-    pub fn substep(&mut self, bodies: &mut [Body], opt: &Opt, h: f32, s: usize) {
+    pub fn substep(&mut self, bodies: &mut [Body], opt: &Opt, walls: &[StaticShape], h: f32, s: usize) {
         if self.cell_pairs.is_empty() && self.bead_pairs.is_empty() {
             return;
         }
@@ -308,6 +309,43 @@ impl Ghosts {
             for k in r.g0 as usize..(r.g0 + r.n) as usize {
                 self.prev[k] = self.pos[k];
                 self.pos[k] += self.vel[k] * h;
+            }
+        }
+        // The touched rings held to their own shape: a rigid fit of where their beads
+        // would be without the cells.
+        let time = (s + 1) as f32 * h - self.dt;
+        if self.rigidity > 0.0 {
+            for r in &self.rings {
+                if !r.active || r.settled {
+                    continue;
+                }
+                let (g0, n) = (r.g0 as usize, r.n as usize);
+                let mut xc = Vector2::ZERO;
+                let mut uc = Vector2::ZERO;
+                for k in g0..g0 + n {
+                    xc += self.pos[k];
+                    uc += self.p_end[k] + self.v0[k] * time;
+                }
+                xc /= n as f32;
+                uc /= n as f32;
+                let (mut sc, mut ss) = (0.0f32, 0.0f32);
+                for k in g0..g0 + n {
+                    let u = self.p_end[k] + self.v0[k] * time - uc;
+                    let x = self.pos[k] - xc;
+                    sc += dot(u, x);
+                    ss += cross(u, x);
+                }
+                let l = (sc * sc + ss * ss).sqrt();
+                if l < 1e-9 {
+                    continue;
+                }
+                let (co, si) = (sc / l, ss / l);
+                for k in g0..g0 + n {
+                    let u = self.p_end[k] + self.v0[k] * time - uc;
+                    let goal = xc + Vector2::new(u.x * co - u.y * si, u.x * si + u.y * co);
+                    let p = self.pos[k];
+                    self.pos[k] = p + (goal - p) * self.rigidity;
+                }
             }
         }
         // Cells against the rings' bead chains.
@@ -432,40 +470,26 @@ impl Ghosts {
             let vg = self.vel[gi];
             self.note_touch(ri, pen, dot(vc - vg, nrm));
         }
-        // The touched rings held to their own shape: a rigid fit of where their beads
-        // would be without the cells.
-        let time = (s + 1) as f32 * h - self.dt;
-        if self.rigidity > 0.0 {
+        // The ghosts kept out of the walls (as the kernel keeps their beads): a bead pressed
+        // between a cell and a wall stays out of the wall here, not just next frame.
+        if !walls.is_empty() {
             for r in &self.rings {
                 if !r.active || r.settled {
                     continue;
                 }
-                let (g0, n) = (r.g0 as usize, r.n as usize);
-                let mut xc = Vector2::ZERO;
-                let mut uc = Vector2::ZERO;
-                for k in g0..g0 + n {
-                    xc += self.pos[k];
-                    uc += self.p_end[k] + self.v0[k] * time;
-                }
-                xc /= n as f32;
-                uc /= n as f32;
-                let (mut sc, mut ss) = (0.0f32, 0.0f32);
-                for k in g0..g0 + n {
-                    let u = self.p_end[k] + self.v0[k] * time - uc;
-                    let x = self.pos[k] - xc;
-                    sc += dot(u, x);
-                    ss += cross(u, x);
-                }
-                let l = (sc * sc + ss * ss).sqrt();
-                if l < 1e-9 {
-                    continue;
-                }
-                let (co, si) = (sc / l, ss / l);
-                for k in g0..g0 + n {
-                    let u = self.p_end[k] + self.v0[k] * time - uc;
-                    let goal = xc + Vector2::new(u.x * co - u.y * si, u.x * si + u.y * co);
-                    let p = self.pos[k];
-                    self.pos[k] = p + (goal - p) * self.rigidity;
+                for k in r.g0 as usize..(r.g0 + r.n) as usize {
+                    let mut at = self.pos[k];
+                    for w in walls {
+                        if !w.aabb.grow(r.br).has_point(at) {
+                            continue;
+                        }
+                        if let Some((gap, dir)) = w.gap(at, r.br, 0.0) {
+                            if gap < 0.0 {
+                                at += dir * -gap;
+                            }
+                        }
+                    }
+                    self.pos[k] = at;
                 }
             }
         }

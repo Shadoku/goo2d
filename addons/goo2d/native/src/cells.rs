@@ -2115,7 +2115,7 @@ impl Cells {
                 solve_cross(&mut self.bodies, &self.cross, &opt, h);
             }
             if self.ghosts.on {
-                self.ghosts.substep(&mut self.bodies, &opt, h, s);
+                self.ghosts.substep(&mut self.bodies, &opt, &self.statics, h, s);
             }
             solve_us += (tb - ta).as_micros() as u64;
             serial_us += tb.elapsed().as_micros() as u64;
