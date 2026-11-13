@@ -18,12 +18,14 @@ numbers, the limits and the quirks a game should be designed around.
 | `addons/goo2d/native/src/cells_draw.rs` | the skins' meshes |
 | `addons/goo2d/goo_cells_sim.gd` | `GooCellsSim`, the exploration's thin layer (still used by its tools) |
 | `examples/cells/` | a tank of four creatures (the example) |
+| `addons/goo2d/native/src/couple.rs` | rings and cells colliding (below, "Rings and cells") |
+| `examples/rings_and_cells/` | ring bodies and creatures in one tank |
 | `tools/cell_world_bench.gd` | cost, draw and swimming through the world node |
-| tests | `tests/integration/test_goo_cell_world.gd`, `tests/unit/test_goo_cell_design.gd`, `tests/integration/examples/test_cells.gd`, `tests/unit/test_goo_cells.gd` (the exploration's), cargo tests in `cells.rs` |
+| tests | `tests/integration/test_goo_cell_world.gd`, `tests/unit/test_goo_cell_design.gd`, `tests/integration/examples/test_cells.gd`, `tests/unit/test_goo_cells.gd` (the exploration's), cargo tests in `cells.rs`; the coupling's `tests/integration/test_goo_ring_cells.gd`, `tests/integration/examples/test_rings_and_cells.gd`, cargo tests in `couple.rs` |
 
-**Rings and cell creatures do not collide with each other** in this stage: a
-`GooWorld2D`'s bodies and a `GooCellWorld2D`'s creatures pass through each other. Both read
-the same walls. `GooColony` (the ring-per-cell colony) is untouched.
+A `GooWorld2D`'s ring bodies and a `GooCellWorld2D`'s creatures collide once the two worlds
+are **coupled** (`couple()`, below "Rings and cells"); uncoupled, they pass through each other.
+Both read the same walls. `GooColony` (the ring-per-cell colony) is untouched.
 
 
 ## The model
@@ -309,9 +311,153 @@ GDScript closure 3.18 swimming. 100 × 150 swimming fits a 10 ms frame on 4 thre
 p95 under it; with drawing (about 1-3 ms more at that size) it does not leave much.
 
 
+## Rings and cells
+
+`GooCellWorld2D.couple(world)` (or `GooWorld2D.couple(cells)`, or the cell world's
+`ring_world` export, resolved at ready) makes a ring world's bodies and the creatures collide,
+coupled directly between the two solvers (`addons/goo2d/native/src/couple.rs`), not through
+Godot's physics. `uncouple()` undoes it (a freed ring world uncouples on its own);
+`coupled_world()`, `coupling_stats()` (rings gathered, near a creature, touched, candidate pairs,
+contacts solved, centres found inside, the deepest overlap found, the momentum handed over, the
+microseconds it took).
+
+**One solver resolves every ring-cell contact: the cells'.** It steps after the ring world:
+`couple()` raises the cell world's `process_physics_priority` above the ring world's (a scene
+may list them in either order; stepping by hand, step the ring world first). Each frame:
+
+1. before the cells' step, every ring's beads as the kernel's step left them (position and
+   velocity), its bead radius, mass and whether it is settled (`couple_gather()`);
+2. after the cells' broad phase, the rings near a creature and the candidate pairs: outline
+   cells near a ring's bead chain or inside its loop, beads near a creature's outline or inside
+   it (found through the creature's colliders' grid); rings near nothing take no further part;
+3. in each of the cells' substeps, after their own contacts: the touched rings' beads move as
+   **ghost particles** along the path the kernel gave them (from p − v·dt to p, so they are
+   time-aligned with the cells), then
+   - a cell against a ring: the nearest edge of the ring's bead loop as a capsule of the bead
+     radius, the whole loop searched with its winding, so a cell whose centre got inside is
+     pushed out across the nearest edge (a reach beyond it), not further in;
+   - a bead against a creature: the outline (its outline cells' centres) as capsules of the
+     cells' contact radii, seven edges round the nearest one searched each substep (the
+     whole outline for a bead that started inside), the side from the edge's normal (at a
+     corner the two edges' pseudo-normal);
+   - both solved as position corrections split by inverse mass (both sides move: the cell and
+     the edge's two beads, or the bead and the edge's two cells, as the cells' own edge
+     contacts do), so the pair's momentum is kept;
+   - the ghosts kept out of the walls (a bead pressed between a cell and a wall stays out of it
+     within the frame, not just at the kernel's next step: without it a ring resting under a
+     blob buzzed at 60 px/s);
+   - a touched ring's change of velocity drawn toward its rigid part (`ring_rigidity`, 0.3 a
+     substep: its mean and its turn about its centre, momentum and angular momentum kept),
+     so within one frame a ring answers a push as a whole, as its constraints would, and its
+     dent stays for the kernel's own elasticity to undo;
+4. after the step, each touched ring's beads get their ghosts' change of position (position
+   and previous position, so no velocity comes of it) and velocity (`couple_apply()`).
+
+Nothing is counted twice: the kernel never sees the creatures, and the cells resolve each
+contact once, with both masses. The cost is about one frame of lag for the ring's own
+constraints: they answer a push at the kernel's next step (the rigidity stands in for them
+within the frame).
+
+**Masses.** The two solvers' masses are in different units (a ring's are `GooTuning`'s, small;
+a cell's its area × the cells' density, 1 per px²), so a coupled ring weighs its target area ×
+`ring_density` (1: a ring weighs what cells of its area weigh; the bead mass is that / its
+bead count). The momentum the tests measure is in these units.
+
+**Settled rings.** A settled ring's ghosts are immovable (the cell takes the whole push), and a
+contact deeper than the kernel's wake depth or closing faster than its wake speed wakes it
+(`GooKernel.wake()`, so the world's `woke` handling runs). A ring that touched a creature this
+frame has its calm time restarted: it never settles while resting on or under a creature (the
+kernel cannot see what holds it up).
+
+**Determinism.** Gather, the coupling's broad phase, its substeps and apply are serial and in
+a fixed order: a replay is identical and the cells' threaded step equals their serial one
+(tested from GDScript and in cargo). Without a partner nothing of it runs: the golden trace
+(`tools/trace.gd`) is unchanged and both worlds behave as before (`ghosts.on` gates every hook).
+
+`GooTuning.unit`: every length the coupling uses comes from the solvers (bead radii, cell radii,
+the cells' margin), so it scales with them; the tests run at unit 0.5 and 1.
+
+### Measured (`tests/integration/test_goo_ring_cells.gd`, simulated time, no water drag)
+
+Thrown at each other at the given speed each, zero gravity, the rings undamped for the
+momentum (a ring's own linear damping, 0.1-0.5 /s, loses a third of its momentum in 1.5 s
+otherwise):
+
+| case | worst overlap found in a substep / measured after a frame | centres in a ring, beads in a creature (any frame / end) | momentum error | after |
+|---|---|---|---|---|
+| unit 0.5, ring 40 px, 37 cells of 14 px, 300 px/s | 2.08 / 0.65 px | 0 / 0 | 0.02 % | apart (ring −331, blob −161 px/s) |
+| unit 0.5, same, 600 px/s | 3.68 / 1.17 px | 0 / 0 | 0.01 % | apart (−616, −332) |
+| unit 1, ring 80 px, cells of 28 px, 300 px/s | 1.73 / 0.63 px | 0 / 0 | 0.02 % | apart |
+| unit 1, same, 600 px/s | 4.15 / 1.29 px | 0 / 0 | 0.04 % | apart |
+| ring 14 px (the smallest at 0.5) against 7 cells of 36 px, 400 px/s | 3.38 / 0.46 px | 0 / 0 | 0.04 % | apart |
+| ring 80 px against 61 cells of 8 px, 400 px/s | 4.23 / 0.78 px | 0 / 0 | 0.04 % | apart |
+| a triangle ring / a square ring of 40 px, 400 px/s | 3.11 / 0.56, 2.12 / 0.62 px | 0 / 0 | 0.09 %, 0.01 % | apart |
+| 1 and 7 cells of 6 px shot at 1200 and 2400 px/s into a 60 px ring | 2.4-7.6 px found | 0 centres inside | | deflected |
+
+At rest under gravity (5 s after 1 s of settling; drift of the centres over the last 3 s,
+fastest particle in the last second):
+
+| case | drift | fastest bead / cell | overlap |
+|---|---|---|---|
+| a 40 px ring on a 14 × 3 worm on the floor | ring 0.04, worm 0.58 px/s | 1.6 px/s | 0.01 px |
+| a 19-cell blob in the dip between two 40 px rings held by low walls | rings 0.23, blob 0.17 px/s | 9.2 / 5.9 px/s | 0.02 px |
+| the same ring and blob alone on the floor, uncoupled (reference) | 0.00, 0.15 px/s | 0.0 / 0.3 px/s | |
+
+No jitter grows (the fastest particle falls from the second second to the fifth). A blob on a
+ring under gravity buzzes slightly where alone it would be still: the frame of lag. The
+rigidity was swept for it (fastest bead in the dip case: 51.6 px/s at 0, 9.2 at 0.3, 15.6 at
+0.6, 28.9 at 1; deeper in-frame overlaps above 0.6); an earlier rigidity, a pull toward a rigid
+fit of the ring's unperturbed path, sprang dented beads back into the cells (a bead moving
+121 px/s into the blob that had just pushed it) and was replaced.
+
+A 24 × 2 worm (lengths only) thrown broadside at 350 px/s onto a 36 px ring 40 times as heavy
+as its area wraps round it, its ends 136 px past the ring's centre, then springs back: worst
+overlap 0.93 px, never a centre or bead inside. A settled ring hit by a falling blob wakes 12
+frames later. Uncoupled worlds pass through each other as before.
+
+**Cost** (`tools/cell_world_bench.gd -- --rings=40 [--couple=0]`: 30 creatures of 150 cells and
+40 rings of 18-26 px thrown about every 2 s in the gaps between them, unit 0.5, both worlds
+stepped by hand; one machine shared with other work, load 2-5 on 4 cores, so ±0.3 ms):
+
+| mode, threads | both worlds' steps median / p95, uncoupled | coupled | the coupling inside the cells' step (median, of it the broad phase) | rings touched a frame, candidate pairs |
+|---|---|---|---|---|
+| colliding, 4 | 2.14-2.44 / 2.74-3.69 ms | 2.38-2.71 / 2.84-3.53 ms | 0.18-0.20 ms (0.09-0.11) | 5.5-5.8, 94-97 |
+| colliding, 1 | 4.10-4.11 / 5.44-5.74 ms | 4.01-4.26 / 4.69-5.97 ms | 0.18-0.19 ms (0.10) | 5.5, 94 |
+| swimming, 4 | 3.46-3.63 / 4.49-4.86 ms | 4.22-4.41 / 5.88-6.53 ms | 0.36-0.43 ms (0.15-0.17) | 6.9-8.1, 278-317 |
+| swimming, 1 | 6.91-7.23 / 7.69-9.86 ms | 7.91-8.08 / 8.51-8.62 ms | 0.42 ms (0.16) | 8.1, 317 |
+
+The coupling itself costs 0.2 ms colliding and 0.4 ms swimming (the worms' long outlines give
+three times the candidate pairs); the rest of the difference is the ring world's own step
+growing (0.45 to 0.65 ms swimming), because the rings are now shoved about and collide with
+each other more, which a game would pay for any interaction.
+
+### Quirks to design around
+
+1. **The cell world must step after the ring world.** `couple()` arranges it through the
+   priority; a game that sets `process_physics_priority` itself, or steps worlds by hand, keeps
+   the ring world first (else the cells meet the rings a frame late, 10 px at 600 px/s).
+2. **Rings resting on or under creatures never settle**, so they keep costing the kernel's step,
+   and buzz slightly (under 10 px/s at unit 0.5 measured).
+3. **Masses are a choice**: `ring_density` 1 makes a ring as heavy as cells of its area, far
+   heavier than its own (GooTuning's) mass; ring-ring collisions inside the kernel keep using
+   GooTuning's masses, so momentum is only kept in the cells' units for ring-cell contacts.
+4. **No friction and no restitution** between rings and cells (the cells have neither): a ring
+   slides off a creature, a creature off a round ring; a blob rests on rings only in a dip.
+5. **A ring's bead chain is a capsule chain**: a cell meets a ring's beads plus their radius,
+   which is where the ring's skin is drawn; a creature is its outline cells' discs and the
+   capsules between them, which is about where its skin is drawn (the skin's B-spline lies up
+   to 0.43 radius off).
+6. **Overlap within a frame** reaches 2-4 px at unit 0.5 in a 600 px/s crash before the
+   substeps resolve it, and about 1 px remains after the frame (the rigidity moves the beads after
+   the contacts); a game drawing both skins sees them touch, not cross.
+7. **Ring-ring contacts are the kernel's, cell-cell the cells'**: a ring squeezed between two
+   creatures gets both pushes from the cells in one frame, but a ring pressed between a creature
+   and another ring meets the other ring only at the kernel's next step.
+
 ## Limits
 
-- Rings (`GooWorld2D`) and cell creatures do not collide with each other.
+- Rings (`GooWorld2D`) and cell creatures collide only when coupled; one ring world per cell
+  world (a cell world couples to one `GooWorld2D`).
 - No friction: creatures slide off each other and along walls.
 - No editor plugin: designs are made in code or as parallel arrays in the inspector (a
   creature editor is a later stage).
