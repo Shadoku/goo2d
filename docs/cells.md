@@ -208,6 +208,12 @@ seam between two convex pieces of a concave wall is tunnelled (18 shots at 3000 
 speed cap at unit 0.5, into a 4 px wall and a V's seam: none through). A blob pushed into a
 U of three convex pieces for 3 s: 0.00 px overlap.
 
+With `push_bodies` on, character and rigid bodies on that layer are walls too, and every body
+that moves is a moving obstacle judged on the cells' motion relative to it (a rigid body moved
+by its own velocity, mass and inertia within the step and taking the reaction after it); with
+`physics_proxies` on, each creature stands in Godot's physics as a kinematic body of circles
+(its boundary cells) so areas, rays, characters and rigid bodies meet it: docs/godot-physics.md.
+
 
 ## Water per cell
 
