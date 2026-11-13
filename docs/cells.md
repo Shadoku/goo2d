@@ -556,7 +556,8 @@ with a darker edge band; `skin_material` replaces it (the contract is in the sha
 
 `skin_mesh` GOO (the default) draws the same outline and faces as a mesh that tells the shader,
 `goo_honeycomb.gdshader`, enough to draw the ring bodies' wet goo (`goo.gdshader`'s tint, rim,
-fresnel and refraction) faintly honeycombed by the cells' walls, with a light stage on top.
+fresnel and refraction) honeycombed by the cells' walls inside a membrane, with a light stage on
+top in which each cell is a small lit volume of its own.
 `cells_draw.rs`'s `creature_mesh_goo()`:
 
 - **Each triangle names three cells**, the same three on its three corners (COLOR.xyz: their
@@ -585,50 +586,81 @@ fresnel and refraction) faintly honeycombed by the cells' walls, with a light st
 - The silhouette is antialiased by the shader over a pixel of the outline distance (the
   triangles have none).
 
-Two stages in one pass: `base()` is the goo, `lit()` the light (thickness: darker and denser
-toward the middle, lit from the light's side; the surface's specular and fresnel on the rim's
-normal, as the rings'; a broad sheen; each cell a faint dome, lighter on its lit side, with a
-small highlight). One pass, not a second draw, because the light needs only the per-fragment
+- **Corners are rounded** (`corner_radius`, px at unit 1): of a fragment's two walls (among
+  its triangle's three cells) the distance is that to the cell shrunk by the radius and grown
+  again: in the shrunk cell's corner's normal cone, the radius less the distance to that
+  corner (from the two wall distances and the angle between the walls), elsewhere the nearer
+  wall's. So the walls keep their width away from a corner and widen into a small fillet
+  where three cells meet. The corner where three walls meet lies inside the triangle naming
+  those three cells (about 8 px from its edges for 14 px cells), so a radius well under that
+  never reaches a neighbouring triangle, which names another third cell: no seams
+  (`debug_view` 5 shows each cell's surface, smooth across triangle edges at 6 px).
+
+Two stages in one pass: `base()` is the goo (lifted by its own tint, `brightness`, so a
+creature over dark water does not read dark nor an orange type brown), `lit()` the light
+(thickness: darker and denser toward the middle, lit from the light's side; the surface's
+specular and fresnel on the rim's normal, as the rings'; a broad sheen). **Each cell is a small
+lit volume of its own**: its surface rolls off from flat in its middle to edge-on at its rounded
+walls over `cell_rim` of its radius (sloping out from its centre, so its highlight is a spot,
+not a dash along a wall), and the body's light terms are evaluated again on it × `cell_light`
+(0.2: a fifth of what the body gets) × its type's `dome`: the side light and the sheen on a
+normal as soft as the body's, a quarter of the fresnel (at the full share every wall glows
+and reads as a light line), and the specular with a broader lobe (`cell_specular_power`)
+whose peak is lowered by (n + 2) / (n_body + 2), so it reflects what the body's would, spread
+wider; the type's `gloss` × that. Not the body's density toward the rim: with the walls it
+rings every cell and reads as beads. The cell's light fades within the rim and under the
+membrane, as the walls do. One pass, not a second draw, because the light needs only the per-fragment
 fields the pass already has; a second draw would hand the mesh over twice and need a back-buffer
-copy for nothing. Everything is fixed in the material: the walls and domes come from the cells'
+copy for nothing. Everything is fixed in the material: the walls and cells' light come from the cells'
 positions, the bubbles from each cell's seed in its own turned frame, so they ride the cells as
 they bend and swim, and a topology change or an added cell changes no fragment's cells but
 those near it (the power diagram is the same whichever triangles name it).
 
 **The look.** World-level uniforms on the material (lengths in px at `GooTuning.unit` 1; the
 world sets `length_unit`), with GooCellLook's presets as uniform sets of them
-(`skin_preset`: FAINT, the default, CELLULAR, MEMBRANE, or CUSTOM to leave the material
+(`skin_preset`: MEMBRANE, the default, FAINT, CELLULAR, or CUSTOM to leave the material
 alone; `GooCellLook.apply(material, preset, overrides)`); per type, `GooCellType`'s look
 fields reach a 16-row look table (`type_color`, `type_wall`, `type_look` = wall_strength,
 dome, gloss, opacity), sent when a type is registered or `update_type()`d, so one draw keeps
 serving the whole world:
 
-| uniform | default | FAINT | CELLULAR | MEMBRANE | what |
+| uniform | default = MEMBRANE | FAINT | CELLULAR | MEMBRANE+ (`cells_look.gd`) | what |
 |---|---|---|---|---|---|
-| `goo_opacity` | 0.3 | 0.3 | 0.32 | 0.34 | the goo's own colour over what shows through |
-| `rim_width` (px) | 16 | 16 | 14 | 24 | the rim's roll-off to edge-on |
-| `rim_strength`, `fresnel_power` | 0.85, 2.2 | 0.85 | 0.8 | 1.0 | its fresnel glow |
-| `rim_density` | 0.35 | 0.35 | 0.3 | 0.3 | darker, denser toward the rim |
-| `refraction_px` (px) | 18 | 18 | 16 | 22 | the background displaced at the rim |
-| `cell_refraction_px` (px) | 2 | 1.5 | 4 | 1 | each cell's dome a small lens |
-| `wall_width`, `wall_softness` (px) | 1.5, 1 | 1.5, 1 | 2, 1.2 | 1.5, 1.5 | the walls |
-| `wall_strength` | 0.2 | 0.16 | 0.3 | 0.12 | how dark (× a type's `wall_strength`) |
-| `wall_highlight` | 0 | 0 | 0.2 | 0 | a thin light line beside each wall's lit side |
-| `wall_rim_fade` | 0.5 | 0.6 | 0.4 | 1 | walls fading within the rim |
-| `border_sharpness` | 3 | 3 | 4 | 2.5 | the types' blend: 1 a gradient across a triangle |
-| `membrane_width` (px), `membrane_strength` | 0, 0 | 0, 0 | 0, 0 | 9, 0.7 | a clearer band inside the skin closed by a line |
-| `cloud` | 0 | 0 | 0 | 0.4 | milky with depth, each cell its own |
-| `bubble_density`, `bubble_strength` | 0.12, 0.6 | 0.12, 0.6 | 0.1, 0.5 | 0.15, 0.7 | a bubble in that share of cells |
+| `goo_opacity` | 0.4 | 0.3 | 0.32 | | the goo's own colour over what shows through |
+| `brightness` | 0.15 | 0 | 0 | 0.22 | the goo's tint added over what shows through (a lift) |
+| `rim_width` (px) | 24 | 16 | 14 | | the rim's roll-off to edge-on |
+| `rim_strength`, `fresnel_power` | 1.0, 2.2 | 0.85 | 0.8 | | its fresnel glow |
+| `rim_density` | 0.3 | 0.35 | 0.3 | | darker, denser toward the rim |
+| `refraction_px` (px) | 22 | 18 | 16 | | the background displaced at the rim |
+| `cell_refraction_px` (px) | 1 | 1.5 | 4 | | each cell a small lens |
+| `wall_width`, `wall_softness` (px) | 1.5, 1.5 | 1.5, 1 | 2, 1.2 | | the walls |
+| `wall_strength` | 0.2 | 0.16 | 0.3 | 0.26 | how dark (× a type's `wall_strength`) |
+| `corner_radius` (px) | 2 | 0 | 0 | 3 | each cell's corners rounded |
+| `wall_highlight` | 0 | 0 | 0.2 | | a thin light line beside each wall's lit side |
+| `wall_rim_fade` | 1 | 0.6 | 0.4 | | walls (and the cells' light) fading within the rim |
+| `border_sharpness` | 2.5 | 3 | 4 | | the types' blend: 1 a gradient across a triangle |
+| `membrane_width` (px), `membrane_strength` | 9, 0.85 | 0, 0 | 0, 0 | 9, 1.0 | a clearer band inside the skin closed by a line |
+| `cloud` | 0.4 | 0 | 0 | 0.4 | milky with depth, each cell its own |
+| `bubble_density`, `bubble_strength` | 0.15, 0.7 | 0.12, 0.6 | 0.1, 0.5 | | a bubble in that share of cells |
 | `light_dir` | (−0.55, −0.7, 0.75) | | | | the rings' light |
-| `shade_depth` (px), `shade_strength` | 40, 0.2 | 40, 0.18 | 40, 0.15 | 50, 0.12 | thickness |
-| `side_light` | 0.2 | 0.18 | 0.15 | 0.25 | the thickness lit from the light's side |
-| `specular_power`, `specular_strength` | 90, 1.4 | 90, 1.4 | 90, 1.2 | 70, 1.6 | the surface's highlight |
-| `sheen_strength` | 0.22 | 0.22 | 0.15 | 0.3 | a broad sheen |
-| `dome_strength`, `dome_highlight`, `dome_power` | 0.2, 0.08, 18 | 0.15, 0.06, 18 | 0.45, 0.25, 22 | 0.1, 0.04, 16 | each cell's dome: its tilt, its highlight |
-| `debug_view` | 0 | | | | 1 outline distance, 2 wall distance, 3 cells and blend, 4 outward |
+| `shade_depth` (px), `shade_strength` | 50, 0.12 | 40, 0.18 | 40, 0.15 | | thickness |
+| `side_light` | 0.25 | 0.18 | 0.15 | | the thickness lit from the light's side |
+| `specular_power`, `specular_strength` | 70, 1.6 | 90, 1.4 | 90, 1.2 | | the surface's highlight |
+| `sheen_strength` | 0.3 | 0.22 | 0.15 | | a broad sheen |
+| `cell_light` | 0.2 | 0.12 | 0.35 | 0.3 | each cell's share of the body's light (× a type's `dome`) |
+| `cell_rim` | 0.6 | 0.6 | 0.7 | | the share of a cell's radius its surface rolls off over |
+| `cell_specular_power` | 16 | 24 | 24 | 20 | a cell's broader highlight (its peak lowered to match) |
+| `debug_view` | 0 | | | | 1 outline distance, 2 wall distance, 3 cells and blend, 4 outward, 5 each cell's surface |
+
+(Round 2 of the look, 2026-11-13, replaced each cell's faint dome, `dome_strength`,
+`dome_highlight` and `dome_power`, with `cell_light`, `cell_rim` and `cell_specular_power`;
+round 1's MEMBRANE had `goo_opacity` 0.34, `wall_strength` 0.12, `membrane_strength` 0.7 and
+no `brightness` or rounding, and FAINT was the default.)
 
 `tools/cells_look.gd` renders the presets (examples/cells after 3 s, a strip beside a ring body
-at 14 and 7 px cells, 4× crops, a swimming worm twice) with `--set=uniform=value,...` on top.
+at 14 and 7 px cells on a dotted pattern and again on a stand-in for the fluid game's water,
+4× crops, a swimming worm twice) with `--set=uniform=value,...` on top; `--preset=membrane+`
+is MEMBRANE with the column above on top.
 
 **Its cost** (`tools/cell_world_bench.gd --draw --skin=goo|flat`, swimming, 4 threads; the
 build is the kernel's mesh and table, the hand-over the triangle array and the table texture;

@@ -35,7 +35,7 @@ enum Body {
 @export_range(0.0, 4.0, 0.01, "or_greater") var wall_strength: float = 1.0
 ## Each cell's own light (× the world's cell_light: its shading and dim reflection).
 @export_range(0.0, 4.0, 0.01, "or_greater") var dome: float = 1.0
-## Its highlights (the specular, the domes' spots) × this.
+## Its highlights (the specular, the cells' own) × this.
 @export_range(0.0, 4.0, 0.01, "or_greater") var gloss: float = 1.0
 ## The goo's own colour over what shows through (× the world's goo_opacity).
 @export_range(0.0, 4.0, 0.01, "or_greater") var opacity: float = 1.0
