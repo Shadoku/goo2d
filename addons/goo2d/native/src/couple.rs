@@ -30,7 +30,7 @@
 //! Everything here is serial and in a fixed order: a replay is identical and the cells'
 //! threaded step stays equal to their serial one.
 
-use crate::cells::{grid_query, key, Body, Opt};
+use crate::cells::{grid_query, key, Body, Hit, Opt, TIP_SELF, TOUCH_RING};
 use crate::geom::{centroid, cross, dot, len_sq, Rect};
 use crate::kernel::Kernel;
 use crate::statics::StaticShape;
@@ -106,6 +106,8 @@ pub struct Ghosts {
     /// Outline cells near a ring: (creature, cell, ring).
     pub cell_pairs: Vec<CellPair>,
     pub bead_pairs: Vec<BeadPair>,
+    /// Tips near a ring's bead chain (CellPair's cell: the tip's cell).
+    pub tip_pairs: Vec<CellPair>,
     /// Per creature this frame: the sign of its outline's winding (0: not computed).
     orient: Vec<f32>,
     /// Per creature this frame: each cell's place on its outline (u32::MAX: inside).
@@ -246,6 +248,7 @@ impl Ghosts {
         }
         self.cell_pairs.clear();
         self.bead_pairs.clear();
+        self.tip_pairs.clear();
         self.worst = 0.0;
         self.contacts = 0;
         self.inside = 0;
@@ -333,6 +336,26 @@ impl Ghosts {
                         active = true;
                     }
                 }
+                // Tips near the ring's bead chain (or inside its loop).
+                if !b.tips.is_empty() {
+                    let mt = opt.margin + (b.tip_vmax + ring.vmax) * dt;
+                    for &c in &b.tips {
+                        let tp = &opt.types[b.typ[c as usize] as usize];
+                        if !tp.collide {
+                            continue;
+                        }
+                        let (p, rt) = b.tip(tp, c as usize, false);
+                        let reach = rt + ring.br + mt;
+                        if p.x + reach < ring.lo.x || p.x - reach > ring.hi.x || p.y + reach < ring.lo.y || p.y - reach > ring.hi.y {
+                            continue;
+                        }
+                        let (k, _, _, d2, inside) = loop_nearest(&loop_pts, p);
+                        if inside || d2 < reach * reach {
+                            self.tip_pairs.push(CellPair { body: bi as u32, cell: c, ring: ri as u32, e0: k as u32, full: inside });
+                            active = true;
+                        }
+                    }
+                }
                 // Beads near the creature's outline (or inside it).
                 let ml = b.outline.len();
                 if ml < 3 {
@@ -393,7 +416,7 @@ impl Ghosts {
     /// One of the cells' substeps (`h` long): the ghosts moved, the contacts solved both
     /// ways, the ghosts kept out of the walls, a touched ring's push spread over it.
     pub fn substep(&mut self, bodies: &mut [Body], opt: &Opt, walls: &[StaticShape], h: f32) {
-        if self.cell_pairs.is_empty() && self.bead_pairs.is_empty() {
+        if self.cell_pairs.is_empty() && self.bead_pairs.is_empty() && self.tip_pairs.is_empty() {
             return;
         }
         let clock = std::time::Instant::now();
@@ -445,14 +468,65 @@ impl Ghosts {
             self.worst = self.worst.max(pen);
             self.contacts += 1;
             let dl = pen / (wc + we);
+            let closing = dot(b.vel[c] - self.vel[ga], -nrm);
+            if b.records() {
+                let speed = -dot((p - b.prev[c]) / h - self.vel[ga] * (1.0 - t) - self.vel[gb] * t, nrm);
+                let bead = if t < 0.5 { k } else { (k + 1) % n };
+                b.touch(c, Hit { kind: TOUCH_RING, id: ring.key, normal: nrm, other: bead as i32, other_uid: -1, tip: 0, speed, impulse: dl / h, point: q });
+            }
             b.pos[c] = p + nrm * (dl * wc);
             self.pos[ga] -= nrm * (dl * (1.0 - t) * ring.w);
             self.pos[gb] -= nrm * (dl * t * ring.w);
             b.contact = true;
-            if b.records() {
-                b.touch(c, crate::cells::TOUCH_RING, ring.key, nrm);
+            self.note_touch(ri as usize, pen, closing);
+        }
+        // Tips against the rings' bead chains: the tip's push moves its cell and
+        // neighbours rigidly (it turns them).
+        for x in 0..self.tip_pairs.len() {
+            let tpair = self.tip_pairs[x];
+            let (bi, c, ri) = (tpair.body as usize, tpair.cell as usize, tpair.ring as usize);
+            let ring = self.rings[ri];
+            let (g0, n) = (ring.g0 as usize, ring.n as usize);
+            let b = &mut bodies[bi];
+            let tp = &opt.types[b.typ[c] as usize];
+            let (p, rt) = b.tip(tp, c, false);
+            let (from, _) = b.tip(tp, c, true);
+            let loop_pts = &self.pos[g0..g0 + n];
+            let (k, t, q, d2, inside) = loop_nearest(loop_pts, p);
+            self.tip_pairs[x].e0 = k as u32;
+            let (ea, eb) = (loop_pts[k], loop_pts[(k + 1) % n]);
+            let reach = rt + ring.br;
+            if !inside && d2 >= reach * reach {
+                continue;
             }
-            self.note_touch(ri as usize, pen, dot(b.vel[c] - self.vel[ga], -nrm));
+            let d = d2.sqrt();
+            let (nrm, pen) = if inside {
+                let nrm = if d > 1e-6 { (q - p) / d } else { -edge_left(ea, eb) };
+                self.inside += 1;
+                (nrm, d + reach)
+            } else {
+                let nrm = if d > 1e-6 { (p - q) / d } else { edge_left(ea, eb) };
+                (nrm, reach - d)
+            };
+            let (ga, gb) = (g0 + k, g0 + (k + 1) % n);
+            let wc = b.tip_w(c, p, nrm);
+            let we = (1.0 - t) * (1.0 - t) * ring.w + t * t * ring.w;
+            if wc + we <= 0.0 {
+                continue;
+            }
+            self.worst = self.worst.max(pen);
+            self.contacts += 1;
+            let dl = pen / (wc + we);
+            let speed = -dot((p - from) / h - self.vel[ga] * (1.0 - t) - self.vel[gb] * t, nrm);
+            b.push_at(c, p, nrm, dl);
+            self.pos[ga] -= nrm * (dl * (1.0 - t) * ring.w);
+            self.pos[gb] -= nrm * (dl * t * ring.w);
+            b.contact = true;
+            if b.records() {
+                let bead = if t < 0.5 { k } else { (k + 1) % n };
+                b.touch(c, Hit { kind: TOUCH_RING, id: ring.key, normal: nrm, other: bead as i32, other_uid: -1, tip: TIP_SELF, speed, impulse: dl / h, point: q });
+            }
+            self.note_touch(ri, pen, speed);
         }
         // Beads against the creatures' outlines.
         let crads = std::mem::take(&mut self.crad);
@@ -521,13 +595,16 @@ impl Ghosts {
             self.worst = self.worst.max(pen);
             self.contacts += 1;
             let dl = pen / (ring.w + we);
+            if b.records() {
+                let ve = (b.pos[i] - b.prev[i]) * (1.0 - t) + (b.pos[j] - b.prev[j]) * t;
+                let speed = dot(ve / h - self.vel[gi], nrm);
+                let bead = gi - ring.g0 as usize;
+                b.touch(if t < 0.5 { i } else { j }, Hit { kind: TOUCH_RING, id: ring.key, normal: -nrm, other: bead as i32, other_uid: -1, tip: 0, speed, impulse: dl / h, point: q });
+            }
             self.pos[gi] = q + nrm * (dl * ring.w);
             b.pos[i] -= nrm * (dl * (1.0 - t) * wi);
             b.pos[j] -= nrm * (dl * t * wj);
             b.contact = true;
-            if b.records() {
-                b.touch(if t < 0.5 { i } else { j }, crate::cells::TOUCH_RING, ring.key, -nrm);
-            }
             let vc = b.vel[i] * (1.0 - t) + b.vel[j] * t;
             let vg = self.vel[gi];
             self.note_touch(ri, pen, dot(vc - vg, nrm));

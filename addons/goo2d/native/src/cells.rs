@@ -141,11 +141,20 @@ pub struct TypeParams {
     pub color: [f32; 4],
     /// Its cells' share of the swim drive (× their mass; 1 a plain cell, 0 none).
     pub swim: f32,
+    /// A thruster's maximum thrust as an acceleration of the cell's own mass (px/s²): a
+    /// thrust level (`Body::thrust`, −1..1) pushes the cell along its facing with level ×
+    /// this × its mass. NaN (the default here): the level is a raw force, unclamped (the
+    /// exploration's tools); 0: never thrusts.
+    pub thrust: f32,
+    /// A spike's tip: a disc of `tip_rad` × the cell's radius at `tip_len` × its radius out
+    /// from its centre along its facing, rigidly held by the cell (0: no tip).
+    pub tip_len: f32,
+    pub tip_rad: f32,
 }
 
 impl Default for TypeParams {
     fn default() -> Self {
-        TypeParams { stretch: 1.0, bend: 1.0, brk: 1.0, self_collide: false, join_mask: 0xffff, pad: 0.0, body: BODY_DEFAULT, collide: true, walls: true, color: [0.35, 0.75, 0.45, 1.0], swim: 1.0 }
+        TypeParams { stretch: 1.0, bend: 1.0, brk: 1.0, self_collide: false, join_mask: 0xffff, pad: 0.0, body: BODY_DEFAULT, collide: true, walls: true, color: [0.35, 0.75, 0.45, 1.0], swim: 1.0, thrust: f32::NAN, tip_len: 0.0, tip_rad: 0.0 }
     }
 }
 
@@ -153,6 +162,18 @@ impl TypeParams {
     #[inline]
     pub fn mode(&self, opt_mode: u8) -> u8 {
         if self.body == BODY_DEFAULT { opt_mode } else { self.body }
+    }
+
+    /// Whether its cells carry a tip.
+    #[inline]
+    pub fn has_tip(&self) -> bool {
+        self.tip_len > 0.0 && self.tip_rad > 0.0
+    }
+
+    /// Whether its cells are thrusters (a finite, non-zero maximum thrust).
+    #[inline]
+    pub fn thruster(&self) -> bool {
+        self.thrust.is_finite() && self.thrust != 0.0
     }
 }
 
@@ -210,6 +231,8 @@ pub struct Opt {
     pub types: [TypeParams; TYPES],
     /// Bumped when a type's body mode changes: creatures rebuild their regions.
     pub types_version: u32,
+    /// Some type carries a tip (set by the step from `types`): the tips' passes run.
+    pub any_tip: bool,
     /// The break test leaves out the creature's own share of each link's load (muscles,
     /// thrust, drag): a link breaks when its load passes break_force over the envelope of
     /// the loads it carried while the creature touched nothing (see `Link::env`).
@@ -257,6 +280,7 @@ impl Default for Opt {
             ease_from: 0.3,
             types: [TypeParams::default(); TYPES],
             types_version: 0,
+            any_tip: false,
             break_excess: false,
             break_envelope_time: 2.0,
             break_envelope_scale: 1.0,
@@ -360,7 +384,14 @@ pub const TOUCH_CREATURE: u8 = 3;
 
 /// One contact of a cell in the last step: the cell (index and uid), what it touched (a
 /// TOUCH_* kind and its id: the static shape's id, the ring's kernel key, the other
-/// creature's slot) and the unit normal pushing the cell out (from the other toward it).
+/// creature's slot), the unit normal pushing the cell out (from the other toward it), and
+/// for damage: the other side's cell (another creature's cell index and uid, a ring's bead
+/// index and −1; −1 for a wall or an obstacle), whether this side's tip made it (TIP_SELF)
+/// and the other side's (TIP_OTHER), the closing speed along the normal at the step's first
+/// touch (px/s, before it was resolved; negative: parting), the impulse the cell (with its
+/// tip's cluster) took over the step along the normals (the cells' mass units × px/s) and
+/// the contact point (on the other thing's surface: a ring's bead chain, the wall's face,
+/// the other cell's or tip's disc).
 #[derive(Clone, Copy, Debug)]
 pub struct Touch {
     pub cell: u32,
@@ -368,6 +399,38 @@ pub struct Touch {
     pub kind: u8,
     pub id: i64,
     pub normal: Vector2,
+    pub other: i32,
+    pub other_uid: i64,
+    pub tip: u8,
+    pub speed: f32,
+    pub impulse: f32,
+    pub point: Vector2,
+}
+
+/// Touch::tip: this side's tip made the contact, the other side's did.
+pub const TIP_SELF: u8 = 1;
+pub const TIP_OTHER: u8 = 2;
+
+/// A contact as a solver pass notes it (Body::touch()): what Touch adds to the cell.
+#[derive(Clone, Copy, Debug)]
+pub struct Hit {
+    pub kind: u8,
+    pub id: i64,
+    pub normal: Vector2,
+    pub other: i32,
+    pub other_uid: i64,
+    pub tip: u8,
+    pub speed: f32,
+    pub impulse: f32,
+    pub point: Vector2,
+}
+
+impl Hit {
+    /// A contact with no other cell (a wall, an obstacle).
+    #[inline]
+    pub fn thing(kind: u8, id: i64, normal: Vector2, speed: f32, impulse: f32, point: Vector2) -> Hit {
+        Hit { kind, id, normal, other: -1, other_uid: -1, tip: 0, speed, impulse, point }
+    }
 }
 
 /// How fast the spin servo's contact yield lets go once its cells leave the contact (s):
@@ -420,6 +483,8 @@ pub struct Cross {
     pub b: u32,
     pub bi: u32,
     pub edge: bool,
+    /// Bit 0: a's cell meets with its tip; bit 1: b's (TIP_SELF / TIP_OTHER from a's side).
+    pub tips: u8,
 }
 
 #[derive(Default, Clone)]
@@ -536,9 +601,23 @@ pub struct Body {
     pub track: bool,
     /// This substep's contacts (cell, normal), what the servo's next substep yields to.
     pub sub_c: Vec<(u32, Vector2)>,
-    /// The last step's contacts, one per cell and thing touched (the last normal), sorted
-    /// by cell, kind and id (`Touch`).
+    /// The last step's contacts, one per cell, thing touched and whether its tip made it
+    /// (the last substep's normal, point and other cell; the first's speed; the impulses
+    /// summed), sorted by cell, kind, id and tip (`Touch`).
     pub touches: Vec<Touch>,
+    /// Bumped at every topology change (cell indices moved; a split part keeps counting).
+    pub topo_version: u32,
+    /// This frame: the cells whose type carries a tip, the tips near walls (cell, wall) and
+    /// near moving obstacles (cell, wall), and a bound on any tip's speed.
+    pub tips: Vec<u32>,
+    pub tip_wall_c: Vec<(u32, u32)>,
+    pub tip_dyn_c: Vec<(u32, u32)>,
+    pub tip_vmax: f32,
+    /// This frame: each cell's thrust force (its level × its type's maximum × its mass, or
+    /// the raw level), applied along its facing as it turns, every substep; `thrusting`:
+    /// any is not zero.
+    pub thrust_f: Vec<f32>,
+    pub thrusting: bool,
 }
 
 pub struct Cells {
@@ -815,9 +894,10 @@ impl Body {
                     kept.push(Touch { cell: by_uid[k].1, ..*t });
                 }
             }
-            kept.sort_by(|a, b| (a.cell, a.kind, a.id).cmp(&(b.cell, b.kind, b.id)));
+            kept.sort_by(|a, b| (a.cell, a.kind, a.id, a.tip & TIP_SELF).cmp(&(b.cell, b.kind, b.id, b.tip & TIP_SELF)));
             self.touches = kept;
         }
+        self.topo_version = self.topo_version.wrapping_add(1);
     }
 
     /// Regions (cells of one type and group joined by links), which cells are shape
@@ -1283,9 +1363,28 @@ impl Body {
             hi = Vector2::new(hi.x.max(p.x + r), hi.y.max(p.y + r));
             vmax = vmax.max(lsq(self.vel[i]));
         }
+        self.vmax = vmax.sqrt();
+        // Tips: which cells carry one, the box grown to hold them, their speed bound.
+        self.tips.clear();
+        self.tip_wall_c.clear();
+        self.tip_vmax = 0.0;
+        if opt.any_tip {
+            let mut om_max = 0.0f32;
+            for i in 0..n {
+                let tp = &opt.types[self.typ[i] as usize];
+                if !tp.has_tip() {
+                    continue;
+                }
+                self.tips.push(i as u32);
+                let (q, rt) = self.tip(tp, i, false);
+                lo = Vector2::new(lo.x.min(q.x - rt), lo.y.min(q.y - rt));
+                hi = Vector2::new(hi.x.max(q.x + rt), hi.y.max(q.y + rt));
+                om_max = om_max.max(self.om[i].abs() * tp.tip_len * self.r[i]);
+            }
+            self.tip_vmax = self.vmax + om_max;
+        }
         self.lo = lo;
         self.hi = hi;
-        self.vmax = vmax.sqrt();
         // Frame forces (and the one-step ones, used up here).
         let once = self.force_once.len() == n;
         for i in 0..n {
@@ -1296,11 +1395,25 @@ impl Body {
             if f != Vector2::ZERO {
                 self.contact = true;
             }
-            if self.thrust[i] != 0.0 {
-                let a = self.th[i] + self.thrust_angle[i];
-                f += Vector2::new(a.cos(), a.sin()) * self.thrust[i];
-            }
             self.force[i] = f;
+        }
+        // Thrust: its force now, its direction every substep (predict()).
+        self.thrusting = false;
+        if self.thrust_f.len() != n {
+            self.thrust_f.clear();
+            self.thrust_f.resize(n, 0.0);
+        }
+        for i in 0..n {
+            let level = self.thrust[i];
+            let mut f = 0.0;
+            if level != 0.0 {
+                let tp = &opt.types[self.typ[i] as usize];
+                f = if tp.thrust.is_nan() { level } else { level.clamp(-1.0, 1.0) * tp.thrust * self.mass[i] };
+                if f != 0.0 {
+                    self.thrusting = true;
+                }
+            }
+            self.thrust_f[i] = f;
         }
         self.force_once.clear();
         if self.swim.acc != 0.0 {
@@ -1389,6 +1502,33 @@ impl Body {
                 }
                 if w.gap(p, self.r[c as usize], margin).is_some() {
                     self.wall_c.push((c, wi as u32));
+                }
+            }
+        }
+        if !self.tips.is_empty() {
+            let margin = opt.margin + self.tip_vmax * dt;
+            for (wi, w) in walls.iter().enumerate() {
+                if w.dynamic {
+                    continue;
+                }
+                let (wlo, whi) = (w.aabb.pos, w.aabb.pos + w.aabb.size);
+                if whi.x < lo.x - margin || wlo.x > hi.x + margin || whi.y < lo.y - margin || wlo.y > hi.y + margin {
+                    continue;
+                }
+                for k in 0..self.tips.len() {
+                    let c = self.tips[k] as usize;
+                    let tp = &opt.types[self.typ[c] as usize];
+                    if !tp.walls {
+                        continue;
+                    }
+                    let (q, rt) = self.tip(tp, c, false);
+                    let r = rt + margin;
+                    if q.x + r < wlo.x || q.x - r > whi.x || q.y + r < wlo.y || q.y - r > whi.y {
+                        continue;
+                    }
+                    if w.gap(q, rt, margin).is_some() {
+                        self.tip_wall_c.push((c as u32, wi as u32));
+                    }
                 }
             }
         }
@@ -1506,34 +1646,98 @@ impl Body {
         }
     }
 
+    /// Cell i's facing (unit): its frame's angle plus its design angle.
+    #[inline]
+    pub fn facing(&self, i: usize) -> Vector2 {
+        let a = self.th[i] + self.thrust_angle[i];
+        Vector2::new(a.cos(), a.sin())
+    }
+
+    /// Cell i's tip now (`prev`: at the substep's start): its centre and radius.
+    #[inline]
+    pub fn tip(&self, tp: &TypeParams, i: usize, prev: bool) -> (Vector2, f32) {
+        let r = self.r[i];
+        let (p, a) = if prev { (self.prev[i], self.th_prev[i]) } else { (self.pos[i], self.th[i]) };
+        let a = a + self.thrust_angle[i];
+        (p + Vector2::new(a.cos(), a.sin()) * (tp.tip_len * r), tp.tip_rad * r)
+    }
+
+    /// The rigid cluster a push on cell i's tip moves: the cell and its linked neighbours
+    /// (mass, centre, moment about it with the discs' own).
+    #[inline]
+    fn cluster(&self, i: usize) -> (f32, Vector2, f32) {
+        let (s, e) = if self.nb_start.len() == self.n + 1 { (self.nb_start[i] as usize, self.nb_start[i + 1] as usize) } else { (0, 0) };
+        let mut m = self.mass[i];
+        let mut c = self.pos[i] * self.mass[i];
+        for q in s..e {
+            let j = self.nb[q].0 as usize;
+            m += self.mass[j];
+            c += self.pos[j] * self.mass[j];
+        }
+        let c = c / m;
+        let mut inertia = self.mass[i] * (lsq(self.pos[i] - c) + 0.5 * self.r[i] * self.r[i]);
+        for q in s..e {
+            let j = self.nb[q].0 as usize;
+            inertia += self.mass[j] * (lsq(self.pos[j] - c) + 0.5 * self.r[j] * self.r[j]);
+        }
+        (m, c, inertia.max(1e-9))
+    }
+
+    /// The inverse mass a push along unit `n` at `point` (cell i's tip) meets: the cell and
+    /// its linked neighbours as one rigid piece (translation and turn).
+    #[inline]
+    pub fn tip_w(&self, i: usize, point: Vector2, n: Vector2) -> f32 {
+        let (m, c, inertia) = self.cluster(i);
+        let arm = cross(point - c, n);
+        1.0 / m + arm * arm / inertia
+    }
+
+    /// Moves cell i's rigid cluster so its point `point` goes `lam` × tip_w along unit `n`
+    /// (`lam`: mass × px, the contact's correction): a push on a tip pushes and turns the
+    /// cell and its neighbours; the cells' frames turn with it.
+    pub fn push_at(&mut self, i: usize, point: Vector2, n: Vector2, lam: f32) {
+        let (m, c, inertia) = self.cluster(i);
+        let dc = n * (lam / m);
+        let dth = lam * cross(point - c, n) / inertia;
+        let (s, e) = if self.nb_start.len() == self.n + 1 { (self.nb_start[i] as usize, self.nb_start[i + 1] as usize) } else { (0, 0) };
+        for q in s..=e {
+            let k = if q == e { i } else { self.nb[q].0 as usize };
+            let p = self.pos[k];
+            self.pos[k] = p + dc + perp(p - c) * dth;
+            self.th[k] += dth;
+        }
+    }
+
     /// Contacts are recorded this step (the game tracks them, or the servo yields to them).
     #[inline]
     pub fn records(&self) -> bool {
         self.track || self.servo.on
     }
 
-    /// Records cell `i`'s contact with a thing of `kind` and `id`, `normal` pushing it out
-    /// (only while records()).
+    /// Records cell `i`'s contact `h` (only while records()).
     #[inline]
-    pub(crate) fn touch(&mut self, i: usize, kind: u8, id: i64, normal: Vector2) {
-        self.sub_c.push((i as u32, normal));
-        self.touches.push(Touch { cell: i as u32, uid: self.uid[i], kind, id, normal });
+    pub(crate) fn touch(&mut self, i: usize, h: Hit) {
+        self.sub_c.push((i as u32, h.normal));
+        self.touches.push(Touch { cell: i as u32, uid: self.uid[i], kind: h.kind, id: h.id, normal: h.normal, other: h.other, other_uid: h.other_uid, tip: h.tip, speed: h.speed, impulse: h.impulse, point: h.point });
     }
 
-    /// The step's contacts sorted by cell, kind and id, one each (the last substep's normal).
+    /// The step's contacts sorted by cell, kind, id and this side's tip, one each: the
+    /// first substep's closing speed, the impulses summed, the last substep's normal, point
+    /// and other cell, the other side's tip if any substep's was.
     fn settle_touches(&mut self) {
         if self.touches.len() < 2 {
             return;
         }
-        // A stable sort keeps the substeps' order among equal keys: the last one wins.
-        self.touches.sort_by(|a, b| (a.cell, a.kind, a.id).cmp(&(b.cell, b.kind, b.id)));
+        let key = |t: &Touch| (t.cell, t.kind, t.id, t.tip & TIP_SELF);
+        // A stable sort keeps the substeps' order among equal keys.
+        self.touches.sort_by(|a, b| key(a).cmp(&key(b)));
         let mut w = 0usize;
         for k in 0..self.touches.len() {
             let t = self.touches[k];
             if w > 0 {
                 let last = self.touches[w - 1];
-                if (last.cell, last.kind, last.id) == (t.cell, t.kind, t.id) {
-                    self.touches[w - 1] = t;
+                if key(&last) == key(&t) {
+                    self.touches[w - 1] = Touch { speed: last.speed, impulse: last.impulse + t.impulse, tip: last.tip | t.tip, ..t };
                     continue;
                 }
             }
@@ -1843,8 +2047,14 @@ impl Body {
         }
         self.sub_c.clear();
         let g = opt.gravity + self.push_frame;
+        let thrusting = self.thrusting && self.thrust_f.len() == self.n;
         for i in 0..self.n {
-            let v = self.vel[i] + (g + (self.force[i] + self.drag_f[i]) * self.w[i]) * h;
+            let mut f = self.force[i] + self.drag_f[i];
+            if thrusting && self.thrust_f[i] != 0.0 {
+                let a = self.th[i] + self.thrust_angle[i];
+                f += Vector2::new(a.cos(), a.sin()) * self.thrust_f[i];
+            }
+            let v = self.vel[i] + (g + f * self.w[i]) * h;
             self.vel[i] = v;
             self.prev[i] = self.pos[i];
             self.pos[i] += v * h;
@@ -2014,10 +2224,41 @@ impl Body {
             if p != self.pos[c] {
                 if rec {
                     let d = p - self.pos[c];
-                    self.touch(c, TOUCH_WALL, w.id, d / lsq(d).sqrt());
+                    let dl = lsq(d).sqrt();
+                    let n = d / dl;
+                    let speed = -dot(self.pos[c] - self.prev[c], n) / h;
+                    self.touch(c, Hit::thing(TOUCH_WALL, w.id, n, speed, self.mass[c] * dl / h, p - n * self.r[c]));
                 }
                 self.pos[c] = p;
                 self.contact = true;
+            }
+        }
+        // Tips against the walls: swept from where the tip was at the substep's start, so a
+        // spinning spike is not tunnelled through a thin wall; the push moves the cell and
+        // its neighbours as one rigid piece (it turns them).
+        for k in 0..self.tip_wall_c.len() {
+            let (c, wi) = self.tip_wall_c[k];
+            let c = c as usize;
+            let w = &walls[wi as usize];
+            let tp = &opt.types[self.typ[c] as usize];
+            let (at, rt) = self.tip(tp, c, false);
+            let (from, _) = self.tip(tp, c, true);
+            let p = push_out_of_wall(w, from, at, rt);
+            if p == at {
+                continue;
+            }
+            let d = p - at;
+            let dl = lsq(d).sqrt();
+            if dl < 1e-9 {
+                continue;
+            }
+            let n = d / dl;
+            let lam = dl / self.tip_w(c, at, n);
+            self.push_at(c, at, n, lam);
+            self.contact = true;
+            if rec {
+                let speed = -dot(at - from, n) / h;
+                self.touch(c, Hit { tip: TIP_SELF, ..Hit::thing(TOUCH_WALL, w.id, n, speed, lam / h, p - n * rt) });
             }
         }
         for &(a, b) in &self.self_c {
@@ -2099,7 +2340,9 @@ fn solve_cross(bodies: &mut [Body], cr: &[Cross], opt: &Opt, h: f32) {
     for x in cr {
         let (a, b) = two_mut(bodies, x.a as usize, x.b as usize);
         let ai = x.ai as usize;
-        if !x.edge {
+        if x.tips != 0 {
+            solve_tip_pair(a, b, x, opt, kc, h);
+        } else if !x.edge {
             let bi = x.bi as usize;
             let d = b.pos[bi] - a.pos[ai];
             let l2 = lsq(d);
@@ -2110,16 +2353,22 @@ fn solve_cross(bodies: &mut [Body], cr: &[Cross], opt: &Opt, h: f32) {
             let l = l2.sqrt();
             let pen = reach - l;
             let ws = a.w[ai] + b.w[bi];
-            let p = d * (pen / (l * ws * (1.0 + kc)));
+            let dl = pen / (ws * (1.0 + kc));
+            let p = d * (dl / l);
+            let (ra, rb) = (a.records(), b.records());
+            let n = d / l;
+            let speed = if ra || rb { dot((a.pos[ai] - a.prev[ai]) - (b.pos[bi] - b.prev[bi]), n) / h } else { 0.0 };
             a.pos[ai] -= p * a.w[ai];
             b.pos[bi] += p * b.w[bi];
             a.contact = true;
             b.contact = true;
-            if a.records() {
-                a.touch(ai, TOUCH_CREATURE, x.b as i64, -d / l);
+            if ra {
+                let rbi = contact_radius(b, bi, opt);
+                a.touch(ai, Hit { kind: TOUCH_CREATURE, id: x.b as i64, normal: -n, other: bi as i32, other_uid: b.uid[bi] as i64, tip: 0, speed, impulse: dl / h, point: b.pos[bi] - n * rbi });
             }
-            if b.records() {
-                b.touch(bi, TOUCH_CREATURE, x.a as i64, d / l);
+            if rb {
+                let rai = contact_radius(a, ai, opt);
+                b.touch(bi, Hit { kind: TOUCH_CREATURE, id: x.a as i64, normal: n, other: ai as i32, other_uid: a.uid[ai] as i64, tip: 0, speed, impulse: dl / h, point: a.pos[ai] + n * rai });
             }
         } else {
             let m = b.outline.len();
@@ -2141,19 +2390,108 @@ fn solve_cross(bodies: &mut [Body], cr: &[Cross], opt: &Opt, h: f32) {
             let pen = reach - l;
             let we = (1.0 - t) * (1.0 - t) * b.w[p] + t * t * b.w[q];
             let dl = pen / ((a.w[ai] + we) * (1.0 + kc));
+            let (ra, rb) = (a.records(), b.records());
+            let speed = if ra || rb {
+                let ve = (b.pos[p] - b.prev[p]) * (1.0 - t) + (b.pos[q] - b.prev[q]) * t;
+                -dot((a.pos[ai] - a.prev[ai]) - ve, nrm) / h
+            } else {
+                0.0
+            };
             a.pos[ai] += nrm * (dl * a.w[ai]);
             b.pos[p] -= nrm * (dl * (1.0 - t) * b.w[p]);
             b.pos[q] -= nrm * (dl * t * b.w[q]);
             a.contact = true;
             b.contact = true;
-            if a.records() {
-                a.touch(ai, TOUCH_CREATURE, x.b as i64, nrm);
+            // The edge's nearer end.
+            let near = if t < 0.5 { p } else { q };
+            if ra {
+                a.touch(ai, Hit { kind: TOUCH_CREATURE, id: x.b as i64, normal: nrm, other: near as i32, other_uid: b.uid[near] as i64, tip: 0, speed, impulse: dl / h, point: cpt + nrm * rr });
             }
-            if b.records() {
-                // The edge's nearer end.
-                b.touch(if t < 0.5 { p } else { q }, TOUCH_CREATURE, x.a as i64, -nrm);
+            if rb {
+                b.touch(near, Hit { kind: TOUCH_CREATURE, id: x.a as i64, normal: -nrm, other: ai as i32, other_uid: a.uid[ai] as i64, tip: 0, speed, impulse: dl / h, point: cpt + nrm * rr });
             }
         }
+    }
+}
+
+/// One side of a contact between creatures: a cell's disc or its tip's, now and at the
+/// substep's start.
+#[inline]
+fn contact_disc(b: &Body, i: usize, tip: bool, opt: &Opt) -> (Vector2, Vector2, f32) {
+    if tip {
+        let tp = &opt.types[b.typ[i] as usize];
+        let (p, r) = b.tip(tp, i, false);
+        let (q, _) = b.tip(tp, i, true);
+        (p, q, r)
+    } else {
+        (b.pos[i], b.prev[i], contact_radius(b, i, opt))
+    }
+}
+
+/// A contact between creatures in which a tip takes part (Cross::tips): the two discs
+/// (a cell's or a tip's) swept over the substep, so a fast tip does not pass through a cell
+/// or another tip within it; a tip's side moves as its cell and neighbours, rigidly (the
+/// push turns them).
+fn solve_tip_pair(a: &mut Body, b: &mut Body, x: &Cross, opt: &Opt, kc: f32, h: f32) {
+    let (ai, bi) = (x.ai as usize, x.bi as usize);
+    let (ta, tb) = (x.tips & TIP_SELF != 0, x.tips & TIP_OTHER != 0);
+    let (pa, qa, ra) = contact_disc(a, ai, ta, opt);
+    let (pb, qb, rb) = contact_disc(b, bi, tb, opt);
+    let reach = ra + rb;
+    let d1 = pb - pa;
+    let l1 = lsq(d1);
+    let (n, pen) = if l1 < reach * reach {
+        if l1 < 1e-12 {
+            return;
+        }
+        let l = l1.sqrt();
+        (d1 / l, reach - l)
+    } else {
+        // Closest approach within the substep: passed through it?
+        let d0 = qb - qa;
+        let e = d1 - d0;
+        let ee = lsq(e);
+        if ee < 1e-12 {
+            return;
+        }
+        let t = (-dot(d0, e) / ee).clamp(0.0, 1.0);
+        let dc = d0 + e * t;
+        let lc = lsq(dc);
+        if t >= 1.0 || lc >= reach * reach {
+            return;
+        }
+        let n = if lc > 1e-12 { dc / lc.sqrt() } else if lsq(d0) > 1e-12 { d0 / lsq(d0).sqrt() } else { return };
+        (n, reach - dot(d1, n))
+    };
+    if pen <= 0.0 {
+        return;
+    }
+    let wa = if ta { a.tip_w(ai, pa, n) } else { a.w[ai] };
+    let wb = if tb { b.tip_w(bi, pb, n) } else { b.w[bi] };
+    if wa + wb <= 0.0 {
+        return;
+    }
+    let dl = pen / ((wa + wb) * (1.0 + kc));
+    let (reca, recb) = (a.records(), b.records());
+    let speed = dot((pa - qa) - (pb - qb), n) / h;
+    if ta {
+        a.push_at(ai, pa, -n, dl);
+    } else {
+        a.pos[ai] -= n * (dl * wa);
+    }
+    if tb {
+        b.push_at(bi, pb, n, dl);
+    } else {
+        b.pos[bi] += n * (dl * wb);
+    }
+    a.contact = true;
+    b.contact = true;
+    let (fa, fb) = ((ta as u8) | ((tb as u8) << 1), (tb as u8) | ((ta as u8) << 1));
+    if reca {
+        a.touch(ai, Hit { kind: TOUCH_CREATURE, id: x.b as i64, normal: -n, other: bi as i32, other_uid: b.uid[bi] as i64, tip: fa, speed, impulse: dl / h, point: pb - n * rb });
+    }
+    if recb {
+        b.touch(bi, Hit { kind: TOUCH_CREATURE, id: x.a as i64, normal: n, other: ai as i32, other_uid: a.uid[ai] as i64, tip: fb, speed, impulse: dl / h, point: pa + n * ra });
     }
 }
 
@@ -2164,7 +2502,7 @@ impl Body {
         for (k, &c) in cells.iter().enumerate() {
             map[c] = k as u32;
         }
-        let mut b = Body { alive: true, n: cells.len(), wave: self.wave, time: self.time, swim: self.swim, damp_lin: self.damp_lin, damp_ang: self.damp_ang, servo: self.servo, track: self.track, ..Default::default() };
+        let mut b = Body { alive: true, n: cells.len(), wave: self.wave, time: self.time, swim: self.swim, damp_lin: self.damp_lin, damp_ang: self.damp_ang, servo: self.servo, track: self.track, topo_version: self.topo_version, ..Default::default() };
         macro_rules! take {
             ($f:ident) => {
                 b.$f = cells.iter().map(|&c| self.$f[c]).collect();
@@ -2402,6 +2740,7 @@ impl Cells {
 
     pub fn step(&mut self, dt: f32) {
         let t0 = Instant::now();
+        self.opt.any_tip = self.opt.types.iter().any(|t| t.has_tip());
         if self.opt.threads == 0 {
             let live = self.bodies.iter().filter(|b| b.alive);
             let (cells, creatures) = live.fold((0, 0), |(c, k), b| (c + b.n, k + 1));
@@ -2415,6 +2754,7 @@ impl Cells {
             par_bodies(&self.pool, &mut self.bodies, |b| {
                 b.prepare(&opt, dt, walls, cell);
                 b.prepare_dynamic(&opt, dt, walls);
+                b.prepare_tips_dynamic(&opt, dt, walls);
             });
         }
         let t1 = Instant::now();
@@ -2469,7 +2809,7 @@ impl Cells {
                             let rr = y.r[q0].max(y.r[q1]);
                             let reach = rc + rr + m;
                             if lsq(p - (pp + ab * t)) < reach * reach {
-                                out.push(Cross { a: sa, ai: c, b: sb, bi: e, edge: true });
+                                out.push(Cross { a: sa, ai: c, b: sb, bi: e, edge: true, tips: 0 });
                             }
                         }
                     } else {
@@ -2482,7 +2822,55 @@ impl Cells {
                             }
                             let reach = rc + y.r[d as usize] * pad + m;
                             if lsq(y.pos[d as usize] - p) < reach * reach {
-                                out.push(Cross { a: sa, ai: c, b: sb, bi: d, edge: false });
+                                out.push(Cross { a: sa, ai: c, b: sb, bi: d, edge: false, tips: 0 });
+                            }
+                        }
+                    }
+                }
+            }
+            if opt.any_tip {
+                // Tips against the other creature's colliders, both ways, and tips against
+                // tips (a's against b's).
+                let (x, y) = (&bodies[a as usize], &bodies[b as usize]);
+                for (sa, sb, x, y) in [(a, b, x, y), (b, a, y, x)] {
+                    if x.tips.is_empty() {
+                        continue;
+                    }
+                    let mt = opt.margin + (x.tip_vmax + y.vmax.max(y.tip_vmax)) * dt;
+                    for &c in &x.tips {
+                        let tp = &opt.types[x.typ[c as usize] as usize];
+                        if !tp.collide {
+                            continue;
+                        }
+                        let (p, rt) = x.tip(tp, c as usize, false);
+                        if p.x + rt + mt < y.lo.x || p.x - rt - mt > y.hi.x || p.y + rt + mt < y.lo.y || p.y - rt - mt > y.hi.y {
+                            continue;
+                        }
+                        near.clear();
+                        grid_query(&y.grid, key(p.x, p.y, cell), &mut near);
+                        near.sort_unstable();
+                        for &o in &near {
+                            let d = y.colliders[o as usize];
+                            if !opt.types[y.typ[d as usize] as usize].collide {
+                                continue;
+                            }
+                            let reach = rt + y.r[d as usize] * pad + mt;
+                            if lsq(y.pos[d as usize] - p) < reach * reach {
+                                out.push(Cross { a: sa, ai: c, b: sb, bi: d, edge: false, tips: TIP_SELF });
+                            }
+                        }
+                        if sa != a {
+                            continue;
+                        }
+                        for &d in &y.tips {
+                            let tq = &opt.types[y.typ[d as usize] as usize];
+                            if !tq.collide {
+                                continue;
+                            }
+                            let (q, rq) = y.tip(tq, d as usize, false);
+                            let reach = rt + rq + mt;
+                            if lsq(q - p) < reach * reach {
+                                out.push(Cross { a: sa, ai: c, b: sb, bi: d, edge: false, tips: TIP_SELF | TIP_OTHER });
                             }
                         }
                     }
@@ -2515,6 +2903,7 @@ impl Cells {
                     b.predict(&opt, h, s == 0);
                     b.solve(&opt, walls, h);
                     b.solve_dynamic(walls, h);
+                    b.solve_tips_dynamic(&opt, walls, h);
                 });
             }
             let tb = Instant::now();
@@ -4049,5 +4438,270 @@ mod mesh_bench {
         for _ in 0..1000 { std::hint::black_box(crate::cells_draw::outline_distances(b, &skin)); }
         let od = t.elapsed().as_micros() as f64 / 1000.0;
         println!("cells {} walk {:.1} us, mesh {:.1} us, {} vertices; goo mesh {:.1} us ({:.1} of it distances), {} vertices", b.n, w, m, v, g, od, vg);
+    }
+}
+
+#[cfg(test)]
+mod thrust_tip_tests {
+    use super::*;
+
+    const DT: f32 = 1.0 / 60.0;
+
+    fn blob(cl: &mut Cells, types: &dyn Fn(usize, Vector2) -> u8, at: Vector2, r: f32) -> usize {
+        let d = hex_design(3, r, at);
+        let t: Vec<u8> = d.iter().enumerate().map(|(i, &p)| types(i, p - at)).collect();
+        cl.add_creature(&d, &vec![r; d.len()], &t)
+    }
+
+    fn quiet() -> Cells {
+        let mut cl = Cells::default();
+        cl.opt.drag.enabled = false;
+        cl.opt.bend_mode = BEND_SHAPE;
+        cl.opt.stretch_hz = 60.0;
+        cl.opt.bend_hz = 40.0;
+        cl
+    }
+
+    /// A level × the type's maximum × the cell's mass along its facing; clamped to ±1; the
+    /// facing turned by its design angle; a raw force on a type without a maximum.
+    #[test]
+    fn thrust_levels_push_along_the_facing() {
+        let run = |level: f32, angle: f32, max: f32| {
+            let mut cl = quiet();
+            cl.opt.types[1].thrust = max;
+            let c = blob(&mut cl, &|_, _| 1, Vector2::ZERO, 7.0);
+            let b = &mut cl.bodies[c];
+            for i in 0..b.n {
+                b.thrust[i] = level;
+                b.thrust_angle[i] = angle;
+            }
+            for _ in 0..30 {
+                cl.step(DT);
+            }
+            cl.bodies[c].velocity()
+        };
+        let v = run(1.0, 0.0, 100.0);
+        println!("full thrust of 100 px/s² for 0.5 s: {:?}", v);
+        assert!((v.x - 50.0).abs() < 0.5 && v.y.abs() < 0.5);
+        let v2 = run(2.0, 0.0, 100.0);
+        assert!((v2.x - v.x).abs() < 1e-3, "clamped to 1");
+        let v3 = run(-0.5, 0.0, 100.0);
+        assert!((v3.x + 25.0).abs() < 0.5);
+        let v4 = run(1.0, std::f32::consts::FRAC_PI_2, 100.0);
+        assert!(v4.x.abs() < 0.5 && (v4.y - 50.0).abs() < 0.5, "along +y (clockwise on screen): {:?}", v4);
+        let v5 = run(1.0, 0.0, 0.0);
+        assert!(v5.length() < 1e-4, "a type of maximum 0 never thrusts");
+        // A raw force (NaN), unclamped: 3000 per cell of mass π 49 for 0.5 s.
+        let v6 = run(3000.0, 0.0, f32::NAN);
+        println!("a raw force of 3000 per cell: {:?}", v6);
+        assert!((v6.x - 1500.0 / (std::f32::consts::PI * 49.0)).abs() < 0.1);
+    }
+
+    /// Thrusters on one side spin the creature; thrust is its own share (no contact).
+    #[test]
+    fn off_centre_thrust_turns_and_is_the_creatures_own_share() {
+        let mut cl = quiet();
+        cl.opt.types[1].thrust = 200.0;
+        let c = blob(&mut cl, &|_, p| if p.y < -20.0 { 1 } else { 0 }, Vector2::ZERO, 7.0);
+        for i in 0..cl.bodies[c].n {
+            cl.bodies[c].thrust[i] = 1.0;
+        }
+        let mut contact = false;
+        for _ in 0..30 {
+            cl.step(DT);
+            contact |= cl.bodies[c].contact;
+        }
+        let s = cl.bodies[c].spin();
+        println!("thrust along +x on the top rows: spin {:.3} rad/s, v {:?}", s, cl.bodies[c].velocity());
+        // Pushing +x above the centre (up is −y on screen) turns it clockwise on screen:
+        // positive.
+        assert!(s > 0.1);
+        assert!(!contact);
+    }
+
+    fn spike_types(cl: &mut Cells, len: f32, rad: f32) {
+        cl.opt.types[2].tip_len = len;
+        cl.opt.types[2].tip_rad = rad;
+    }
+
+    /// A worm spun with a spike at its head never passes its tip through a thin bar only
+    /// the tip reaches, at a tip speed past 1400 px/s (6 substeps of 1/60 s).
+    #[test]
+    fn a_spinning_tip_never_tunnels_a_thin_wall() {
+        for (width, threads) in [(2.0f32, 1usize), (6.0, 4)] {
+            let mut cl = quiet();
+            cl.set_threads(threads);
+            spike_types(&mut cl, 1.5, 0.3);
+            let d = worm_design(24, 3, 14.0, Vector2::ZERO);
+            let head = (0..d.len()).max_by(|&a, &b| d[a].x.partial_cmp(&d[b].x).unwrap()).unwrap();
+            let t: Vec<u8> = (0..d.len()).map(|i| if i == head { 2 } else { 0 }).collect();
+            let c = cl.add_creature(&d, &vec![14.0; d.len()], &t);
+            let reach_body = d.iter().map(|p| p.length() + 14.0).fold(0.0, f32::max);
+            let tip_r = d[head].length() + 1.5 * 14.0;
+            // A radial bar at 90° (straight down on screen) from just past the body's reach.
+            let (r0, r1) = (reach_body + 2.0, tip_r + 30.0);
+            cl.add_static_shape(7, Transform2D::IDENTITY, vec![Vector2::new(-width * 0.5, r0), Vector2::new(width * 0.5, r0), Vector2::new(width * 0.5, r1), Vector2::new(-width * 0.5, r1)], 0.0, 0.0, false);
+            cl.bodies[c].servo = SpinServo { on: true, target: 4.5, max_acc: 60.0, ..Default::default() };
+            cl.bodies[c].track = true;
+            let mut fastest = 0.0f32;
+            let mut worst = 0.0f32;
+            let mut crossed = false;
+            let mut hit_speed = 0.0f32;
+            let mut last: Option<Vector2> = None;
+            for _ in 0..90 {
+                cl.step(DT);
+                let b = &cl.bodies[c];
+                let (tp, rt) = b.tip(&cl.opt.types[2], head, false);
+                if let Some(l) = last {
+                    fastest = fastest.max((tp - l).length() / DT);
+                }
+                last = Some(tp);
+                let (dist, _) = wall_distance(&cl.statics[0], tp);
+                worst = worst.max(rt - dist);
+                // Past the bar: the tip's angle about the creature's centre beyond 90°.
+                let rel = tp - b.center();
+                if rel.y > 0.0 && rel.x < -width && rel.y > r0 {
+                    crossed = true;
+                }
+                for t in &b.touches {
+                    if t.kind == TOUCH_WALL && t.tip & TIP_SELF != 0 {
+                        hit_speed = hit_speed.max(t.speed);
+                    }
+                }
+            }
+            println!("bar {} px, {} threads: tip up to {:.0} px/s, hit at {:.0} px/s, worst overlap {:.2} px, crossed {}", width, threads, fastest, hit_speed, worst, crossed);
+            assert!(fastest > 1400.0, "the tip swung fast enough: {}", fastest);
+            assert!(hit_speed > 1000.0);
+            assert!(!crossed);
+            assert!(worst < 4.2 * 0.75, "never deep in the bar");
+        }
+    }
+
+    /// Two lone spikes flying at each other tip first at 1400 px/s each (7.8 px a substep
+    /// against tips 5.6 px apart at touching): the tips meet and never pass, momentum is kept;
+    /// two flying past with only their tips in line knock each other turning.
+    #[test]
+    fn tips_meet_tips_and_cells_without_passing() {
+        let mut cl = quiet();
+        spike_types(&mut cl, 1.5, 0.2);
+        let r = 14.0;
+        let a = cl.add_creature(&[Vector2::new(-100.0, 0.0)], &[r], &[2]);
+        let b = cl.add_creature(&[Vector2::new(100.0, 0.0)], &[r], &[2]);
+        cl.bodies[b].thrust_angle[0] = std::f32::consts::PI;
+        cl.bodies[a].vel[0] = Vector2::new(1400.0, 0.0);
+        cl.bodies[b].vel[0] = Vector2::new(-1400.0, 0.0);
+        cl.bodies[a].track = true;
+        let p0 = cl.momentum();
+        let mut met = 0.0f32;
+        let mut gap = f32::INFINITY;
+        for _ in 0..12 {
+            cl.step(DT);
+            for t in &cl.bodies[a].touches {
+                if t.tip == TIP_SELF | TIP_OTHER && t.other_uid == cl.bodies[b].uid[0] as i64 {
+                    met = met.max(t.speed);
+                }
+            }
+            let ta = cl.bodies[a].tip(&cl.opt.types[2], 0, false).0;
+            let tb = cl.bodies[b].tip(&cl.opt.types[2], 0, false).0;
+            gap = gap.min(tb.x - ta.x);
+            assert!(ta.x < tb.x, "the tips passed: {:?} {:?}", ta, tb);
+        }
+        let p1 = cl.momentum();
+        println!("head on: tips met at {:.0} px/s, closest {:.2} px apart (5.6 touching), a {:?}, b {:?}; momentum {:?} -> {:?}", met, gap, cl.bodies[a].vel[0], cl.bodies[b].vel[0], p0, p1);
+        assert!(met > 2000.0);
+        assert!(cl.bodies[a].vel[0].x < 100.0, "the hit stopped it");
+        let unit = 1400.0 * std::f64::consts::PI * 196.0;
+        assert!((p1[0] - p0[0]).abs() / unit < 1e-3 && (p1[1] - p0[1]).abs() / unit < 1e-3);
+
+        // Flying past, only the tips in line: a glancing knock that turns both.
+        let mut cl = quiet();
+        spike_types(&mut cl, 1.5, 0.2);
+        let a = cl.add_creature(&[Vector2::new(-100.0, 0.0)], &[r], &[2]);
+        let b = cl.add_creature(&[Vector2::new(100.0, 3.0 * r)], &[r], &[2]);
+        cl.bodies[a].thrust_angle[0] = std::f32::consts::FRAC_PI_2;
+        cl.bodies[b].thrust_angle[0] = -std::f32::consts::FRAC_PI_2;
+        cl.bodies[a].vel[0] = Vector2::new(1400.0, 0.0);
+        cl.bodies[b].vel[0] = Vector2::new(-1400.0, 0.0);
+        cl.bodies[a].track = true;
+        let mut met = false;
+        let mut closest = f32::INFINITY;
+        for _ in 0..12 {
+            cl.step(DT);
+            met |= cl.bodies[a].touches.iter().any(|t| t.tip == TIP_SELF | TIP_OTHER);
+            let ta = cl.bodies[a].tip(&cl.opt.types[2], 0, false).0;
+            let tb = cl.bodies[b].tip(&cl.opt.types[2], 0, false).0;
+            closest = closest.min((ta - tb).length());
+        }
+        println!("glancing: met {}, closest {:.2} px between frames, a spins {:.1} rad/s, b {:.1}", met, closest, cl.bodies[a].om[0], cl.bodies[b].om[0]);
+        assert!(met);
+        assert!(closest > 2.8, "never half into each other at a frame's end");
+        assert!(cl.bodies[a].om[0].abs() > 1.0 && cl.bodies[b].om[0].abs() > 1.0, "the knock turned them");
+
+        // A spike thrown tip first into a blob's side: the tip stops at the blob's cells.
+        let mut cl = quiet();
+        spike_types(&mut cl, 1.5, 0.2);
+        let target = blob(&mut cl, &|_, _| 0, Vector2::new(200.0, 0.0), 7.0);
+        let s = cl.add_creature(&[Vector2::new(0.0, 0.0)], &[7.0], &[2]);
+        cl.bodies[s].vel[0] = Vector2::new(1400.0, 0.0);
+        cl.bodies[s].track = true;
+        let mut deepest = 0.0f32;
+        let mut speed = 0.0f32;
+        for _ in 0..20 {
+            cl.step(DT);
+            let (tp, rt) = cl.bodies[s].tip(&cl.opt.types[2], 0, false);
+            let y = &cl.bodies[target];
+            for i in 0..y.n {
+                deepest = deepest.max(rt + y.r[i] - (y.pos[i] - tp).length());
+            }
+            for t in &cl.bodies[s].touches {
+                if t.kind == TOUCH_CREATURE && t.tip == TIP_SELF {
+                    speed = speed.max(t.speed);
+                }
+            }
+        }
+        println!("a spike into a blob at 1400 px/s: hit at {:.0} px/s, the tip at most {:.2} px into a cell", speed, deepest);
+        assert!(speed > 1000.0);
+        assert!(deepest < 7.0, "the tip never reached a cell's centre");
+    }
+
+    #[test]
+    fn threaded_equals_serial_with_thrust_and_tips() {
+        let run = |threads: usize| {
+            let mut cl = super::tests::crash_world(threads);
+            cl.opt.types[1].thrust = 300.0;
+            spike_types(&mut cl, 1.4, 0.3);
+            for (k, b) in cl.bodies.iter_mut().enumerate() {
+                for i in 0..b.n {
+                    if i % 5 == 0 {
+                        b.typ[i] = 1;
+                        b.thrust[i] = if k % 2 == 0 { 1.0 } else { -0.5 };
+                        b.thrust_angle[i] = i as f32 * 0.3;
+                    } else if i % 7 == 0 {
+                        b.typ[i] = 2;
+                        b.thrust_angle[i] = i as f32;
+                    }
+                }
+                b.track = true;
+            }
+            cl.add_static_shape(3, Transform2D::IDENTITY, vec![Vector2::new(-300.0, 330.0), Vector2::new(800.0, 330.0), Vector2::new(800.0, 390.0), Vector2::new(-300.0, 390.0)], 0.0, 0.0, false);
+            let mut h = 0i64;
+            for f in 0..120 {
+                cl.step(DT);
+                if f == 50 {
+                    cl.remove_cell(0, 3);
+                }
+                for b in cl.bodies.iter().filter(|b| b.alive) {
+                    for t in &b.touches {
+                        h = h.wrapping_mul(31).wrapping_add((t.cell as i64) ^ (t.id << 8) ^ ((t.speed.to_bits() as i64) << 20) ^ ((t.impulse.to_bits() as i64) << 3) ^ t.other_uid ^ ((t.tip as i64) << 40));
+                    }
+                }
+            }
+            (cl.state_hash(), h)
+        };
+        let a = run(1);
+        assert!(a.1 != 0);
+        assert_eq!(a, run(4));
+        assert_eq!(a, run(0));
+        assert_eq!(a, run(1), "a replay");
     }
 }

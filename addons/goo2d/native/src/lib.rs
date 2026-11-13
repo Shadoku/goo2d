@@ -1975,6 +1975,10 @@ impl GooCells {
     const TOUCH_RING: i64 = cells::TOUCH_RING as i64;
     #[constant]
     const TOUCH_CREATURE: i64 = cells::TOUCH_CREATURE as i64;
+    #[constant]
+    const TIP_SELF: i64 = cells::TIP_SELF as i64;
+    #[constant]
+    const TIP_OTHER: i64 = cells::TIP_OTHER as i64;
 
     /// threads, substeps, stretch_hz, bend_hz, bend_mode, shape_k, link_damp, bend_damp,
     /// collide_all, capsules, contact_hz, contact_pad, self_mode, margin, drag (bool),
@@ -2063,7 +2067,11 @@ impl GooCells {
     /// A type's factors: stretch, bend, break (× the options), self_collide (bool),
     /// join_mask (bits of the types it may join), pad (px added to its contact radius),
     /// body (BEND_NONE / BEND_LINK / BEND_SHAPE / BODY_DEFAULT), collide (with other
-    /// creatures), walls (with walls), color (the skin's), swim (its share of the swim drive).
+    /// creatures), walls (with walls), color (the skin's), swim (its share of the swim drive),
+    /// thrust (a thruster's maximum, px/s² of its cell's own mass: a level × this × the mass
+    /// is its force; NaN, the default, takes the level as a raw force; 0 never), tip_len and
+    /// tip_rad (a tip's distance out along the cell's facing and its radius, × the cell's
+    /// radius; 0: none).
     #[func]
     fn set_type(&mut self, t: i64, params: VarDictionary) {
         let tp = &mut self.c.opt.types[(t as usize).min(cells::TYPES - 1)];
@@ -2088,6 +2096,9 @@ impl GooCells {
                 "join_mask" => tp.join_mask = x as u16,
                 "pad" => tp.pad = x as f32,
                 "swim" => tp.swim = x as f32,
+                "thrust" => tp.thrust = x as f32,
+                "tip_len" => tp.tip_len = (x as f32).max(0.0),
+                "tip_rad" => tp.tip_rad = (x as f32).max(0.0),
                 other => godot_error!("GooCells: unknown type parameter {}", other),
             }
         }
@@ -2258,13 +2269,122 @@ impl GooCells {
         PackedFloat32Array::from_iter(self.c.bodies[c as usize].links.iter().map(|l| l.env))
     }
 
-    /// One cell's thrust (force along its heading turned by its thrust angle).
+    /// One cell's thrust level (−1..1 × its type's maximum along its facing; a type without
+    /// a maximum (NaN) takes it as a force), kept until set again.
     #[func]
     fn set_thrust_one(&mut self, c: i64, i: i64, thrust: f64) {
         let b = &mut self.c.bodies[c as usize];
         if let Some(t) = b.thrust.get_mut(i as usize) {
             *t = thrust as f32;
         }
+    }
+
+    /// Every cell's thrust level at once, by index (as set_thrust_one()), kept until set
+    /// again. Refused (false, nothing changed) unless there is exactly one per cell: an
+    /// array built before a topology change would push the wrong cells.
+    #[func]
+    fn set_thrust_levels(&mut self, c: i64, levels: PackedFloat32Array) -> bool {
+        let b = &mut self.c.bodies[c as usize];
+        if levels.len() != b.n {
+            return false;
+        }
+        b.thrust.copy_from_slice(levels.as_slice());
+        true
+    }
+
+    /// Thrust levels of the cells of `uids` (the others' kept); returns how many were found.
+    #[func]
+    fn set_thrust_levels_by_uid(&mut self, c: i64, uids: PackedInt32Array, levels: PackedFloat32Array) -> i64 {
+        let b = &mut self.c.bodies[c as usize];
+        let mut by_uid: Vec<(u32, u32)> = (0..b.n).map(|i| (b.uid[i], i as u32)).collect();
+        by_uid.sort_unstable();
+        let mut found = 0;
+        for (&u, &l) in uids.as_slice().iter().zip(levels.as_slice()) {
+            if let Ok(k) = by_uid.binary_search_by(|e| e.0.cmp(&(u as u32))) {
+                b.thrust[by_uid[k].1 as usize] = l;
+                found += 1;
+            }
+        }
+        found
+    }
+
+    /// Creature c's thrusters (cells whose type has a finite, non-zero maximum) for an
+    /// allocator, in one call: [indices, uids (PackedInt32Array), offsets from its centre of
+    /// mass, facings (unit, world; PackedVector2Array), maximum forces (the type's maximum ×
+    /// the cell's mass), levels (PackedFloat32Array), [mass, moment of inertia about the
+    /// centre of mass (Σ m |p − c|², the cells' orbits), centre x, centre y]
+    /// (PackedFloat64Array)].
+    #[func]
+    fn thrusters(&self, c: i64) -> VarArray {
+        let b = &self.c.bodies[c as usize];
+        let types = &self.c.opt.types;
+        let centre = b.center();
+        let (mut idx, mut uid, mut off, mut fac, mut fmax, mut lev) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let (mut m, mut inertia) = (0.0f64, 0.0f64);
+        for i in 0..b.n {
+            m += b.mass[i] as f64;
+            inertia += (b.mass[i] * (b.pos[i] - centre).length_squared()) as f64;
+            let tp = &types[b.typ[i] as usize];
+            if !tp.thruster() {
+                continue;
+            }
+            idx.push(i as i32);
+            uid.push(b.uid[i] as i32);
+            off.push(b.pos[i] - centre);
+            fac.push(b.facing(i));
+            fmax.push(tp.thrust * b.mass[i]);
+            lev.push(b.thrust[i]);
+        }
+        let mut a = VarArray::new();
+        a.push(&PackedInt32Array::from(idx.as_slice()).to_variant());
+        a.push(&PackedInt32Array::from(uid.as_slice()).to_variant());
+        a.push(&PackedVector2Array::from(off.as_slice()).to_variant());
+        a.push(&PackedVector2Array::from(fac.as_slice()).to_variant());
+        a.push(&PackedFloat32Array::from(fmax.as_slice()).to_variant());
+        a.push(&PackedFloat32Array::from(lev.as_slice()).to_variant());
+        a.push(&PackedFloat64Array::from(&[m, inertia, centre.x as f64, centre.y as f64][..]).to_variant());
+        a
+    }
+
+    /// Creature c's tips now: [indices, uids (PackedInt32Array), centres, facings (unit;
+    /// PackedVector2Array), radii (PackedFloat32Array)].
+    #[func]
+    fn tips(&self, c: i64) -> VarArray {
+        let b = &self.c.bodies[c as usize];
+        let types = &self.c.opt.types;
+        let (mut idx, mut uid, mut at, mut fac, mut rad) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for i in 0..b.n {
+            let tp = &types[b.typ[i] as usize];
+            if !tp.has_tip() {
+                continue;
+            }
+            let (p, r) = b.tip(tp, i, false);
+            idx.push(i as i32);
+            uid.push(b.uid[i] as i32);
+            at.push(p);
+            fac.push(b.facing(i));
+            rad.push(r);
+        }
+        let mut a = VarArray::new();
+        a.push(&PackedInt32Array::from(idx.as_slice()).to_variant());
+        a.push(&PackedInt32Array::from(uid.as_slice()).to_variant());
+        a.push(&PackedVector2Array::from(at.as_slice()).to_variant());
+        a.push(&PackedVector2Array::from(fac.as_slice()).to_variant());
+        a.push(&PackedFloat32Array::from(rad.as_slice()).to_variant());
+        a
+    }
+
+    /// Every cell's facing (unit, world): its frame's angle plus its design angle.
+    #[func]
+    fn facings(&self, c: i64) -> PackedVector2Array {
+        let b = &self.c.bodies[c as usize];
+        PackedVector2Array::from_iter((0..b.n).map(|i| b.facing(i)))
+    }
+
+    /// Bumped at every topology change of creature c (cell indices moved).
+    #[func]
+    fn topology_version(&self, c: i64) -> i64 {
+        self.c.bodies[c as usize].topo_version as i64
     }
 
     /// Each cell's thrust angle (rad, in its own frame).
@@ -2376,6 +2496,7 @@ impl GooCells {
         g.begin(0.0);
         g.cell_pairs.clear();
         g.bead_pairs.clear();
+        g.tip_pairs.clear();
     }
 
     /// The last step's coupling: rings (gathered), active (near a creature), touched,
@@ -2533,12 +2654,29 @@ impl GooCells {
     /// out)].
     #[func]
     fn creature_contacts(&self, c: i64) -> VarArray {
+        self.creature_hits(c, f64::NEG_INFINITY)
+    }
+
+    /// creature_contacts() with only the contacts whose closing speed is at least
+    /// `min_speed` (px/s): [PackedInt64Array of cell, uid, kind, id, other cell (−1: none),
+    /// other uid (−1: none), tip (TIP_SELF | TIP_OTHER) seven per contact,
+    /// PackedVector2Array of normals, PackedVector2Array of points, PackedFloat32Array of
+    /// closing speed (px/s at the step's first touch) and impulse (over the step) two per
+    /// contact].
+    #[func]
+    fn creature_hits(&self, c: i64, min_speed: f64) -> VarArray {
         let b = &self.c.bodies[c as usize];
-        let ints = PackedInt64Array::from_iter(b.touches.iter().flat_map(|t| [t.cell as i64, t.uid as i64, t.kind as i64, t.id]));
-        let normals = PackedVector2Array::from_iter(b.touches.iter().map(|t| t.normal));
+        let min = min_speed as f32;
+        let sel: Vec<&cells::Touch> = b.touches.iter().filter(|t| !(t.speed < min)).collect();
+        let ints = PackedInt64Array::from_iter(sel.iter().flat_map(|t| [t.cell as i64, t.uid as i64, t.kind as i64, t.id, t.other as i64, t.other_uid, t.tip as i64]));
+        let normals = PackedVector2Array::from_iter(sel.iter().map(|t| t.normal));
+        let points = PackedVector2Array::from_iter(sel.iter().map(|t| t.point));
+        let floats = PackedFloat32Array::from_iter(sel.iter().flat_map(|t| [t.speed, t.impulse]));
         let mut a = VarArray::new();
         a.push(&ints.to_variant());
         a.push(&normals.to_variant());
+        a.push(&points.to_variant());
+        a.push(&floats.to_variant());
         a
     }
 

@@ -10,7 +10,7 @@
 //! GDScript applies to a RigidBody2D after it. Walls (shapes never given a target) are
 //! untouched by any of this.
 
-use crate::cells::{push_out_of_wall, Body, Cells, Opt};
+use crate::cells::{push_out_of_wall, Body, Cells, Hit, Opt};
 use crate::geom::*;
 use crate::kernel::Kernel;
 use crate::statics::StaticShape;
@@ -275,12 +275,83 @@ impl Body {
             // (pos − pred) / h): along n it is set to the contact's impulse through pred.
             let excess = dot(delta, n) * inv_h - jn * self.w[c];
             self.pred[c] += n * (excess * h);
+            if self.records() {
+                let speed = -dot((self.pos[c] - self.prev[c]) * inv_h - w.velocity_at(point, inv_h), n);
+                self.touch(c, Hit::thing(crate::cells::TOUCH_OBSTACLE, w.id, n, speed, jn, point));
+            }
             self.pos[c] = p;
             self.contact = true;
-            if self.records() {
-                self.touch(c, crate::cells::TOUCH_OBSTACLE, w.id, n);
-            }
             self.dyn_sub.push((wi as u32, point, j));
+        }
+    }
+
+    /// The tips near a moving obstacle this step (`tip_dyn_c`: cell, wall index).
+    pub(crate) fn prepare_tips_dynamic(&mut self, opt: &Opt, dt: f32, walls: &[StaticShape]) {
+        self.tip_dyn_c.clear();
+        if self.tips.is_empty() {
+            return;
+        }
+        let margin = opt.margin + self.tip_vmax * dt;
+        for (wi, w) in walls.iter().enumerate() {
+            if !w.dynamic {
+                continue;
+            }
+            let (wlo, whi) = (w.swept.pos, w.swept.pos + w.swept.size);
+            if whi.x < self.lo.x - margin || wlo.x > self.hi.x + margin || whi.y < self.lo.y - margin || wlo.y > self.hi.y + margin {
+                continue;
+            }
+            for k in 0..self.tips.len() {
+                let c = self.tips[k] as usize;
+                let tp = &opt.types[self.typ[c] as usize];
+                if !tp.walls {
+                    continue;
+                }
+                let (q, rt) = self.tip(tp, c, false);
+                let r = rt + margin;
+                if q.x + r < wlo.x || q.x - r > whi.x || q.y + r < wlo.y || q.y - r > whi.y {
+                    continue;
+                }
+                self.tip_dyn_c.push((c as u32, wi as u32));
+            }
+        }
+    }
+
+    /// One substep of its tips against the moving obstacles: out through the face the tip
+    /// entered by on its motion relative to the obstacle; the push moves the cell and its
+    /// neighbours rigidly (it turns them), and the obstacle takes the momentum the push
+    /// gives them (the push over h).
+    pub(crate) fn solve_tips_dynamic(&mut self, opt: &Opt, walls: &[StaticShape], h: f32) {
+        if self.tip_dyn_c.is_empty() || h <= 0.0 {
+            return;
+        }
+        let inv_h = 1.0 / h;
+        for k in 0..self.tip_dyn_c.len() {
+            let (c, wi) = self.tip_dyn_c[k];
+            let (c, wi) = (c as usize, wi as usize);
+            let w = &walls[wi];
+            let tp = &opt.types[self.typ[c] as usize];
+            let (at, rt) = self.tip(tp, c, false);
+            let (from, _) = self.tip(tp, c, true);
+            let start = w.motion * from;
+            let p = push_out_of_wall(w, start, at, rt);
+            if p == at {
+                continue;
+            }
+            let d = p - at;
+            let dl = len(d);
+            if dl < 1e-9 {
+                continue;
+            }
+            let n = d / dl;
+            let lam = dl / self.tip_w(c, at, n);
+            let point = p - n * rt;
+            let speed = -dot((at - from) * inv_h - w.velocity_at(point, inv_h), n);
+            self.push_at(c, at, n, lam);
+            self.contact = true;
+            if self.records() {
+                self.touch(c, Hit { tip: crate::cells::TIP_SELF, ..Hit::thing(crate::cells::TOUCH_OBSTACLE, w.id, n, speed, lam * inv_h, point) });
+            }
+            self.dyn_sub.push((wi as u32, point, n * (lam * inv_h)));
         }
     }
 }
