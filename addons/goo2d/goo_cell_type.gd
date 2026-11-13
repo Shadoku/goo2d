@@ -48,6 +48,10 @@ enum Body {
 @export_range(0.0, 4.0, 0.01, "or_greater") var stretch: float = 1.0
 ## The links' bending stiffness × this (oriented links and joints).
 @export_range(0.0, 4.0, 0.01, "or_greater") var bend: float = 1.0
+## The world's elasticity (GooCellWorld2D.elasticity, or a creature's own) × this for its
+## cells: below 1 stiffer (a spine row 0.5 keeps a worm's back while its flanks give), 0 as
+## stiff as without elasticity, above 1 softer (clamped at 1 in all).
+@export_range(0.0, 4.0, 0.01, "or_greater") var elasticity: float = 1.0
 ## The break force × this (a link takes the smaller of its two cells').
 @export_range(0.0, 10.0, 0.01, "or_greater") var break_factor: float = 1.0
 ## How its cells hold their shape.
@@ -99,6 +103,7 @@ func kernel_params() -> Dictionary:
 		"pad": contact_pad * GooTuning.unit, "body": modes[body], "collide": collides,
 		"walls": collides_walls, "color": color, "swim": swim_weight,
 		"thrust": max_thrust * GooTuning.unit, "tip_len": tip_length, "tip_rad": tip_radius if tip_length > 0.0 else 0.0,
+		"elastic": elasticity,
 	}
 
 ## The look table's row of this type (goo_honeycomb.gdshader's type_look): wall_strength,

@@ -314,6 +314,26 @@ func remove_cell(uid: int) -> void:
 func set_spin_servo(target_spin: float, max_angular_acceleration: float, max_tip_speed: float = INF, contact_yield: float = 1.0) -> void:
 	_c().set_spin_servo(id, target_spin, max_angular_acceleration, max_tip_speed, contact_yield)
 
+## Head-led turning (docs/cells.md, "Head-led turning"): the spin servo's turn given to the
+## head first, the rest following through the body's elasticity and the water. `lead` 0..1:
+## 0 (the default) the rigid turn; 1 only the front half driven. The change of velocity
+## each cell gets is weighted (1 − lead) + lead × h, h 0 over the back half of the design
+## along its forward (`axis`) and rising smoothly to 1 at the nose; its net force is taken
+## back evenly from every cell (no net force: a couple) and it is scaled so the creature's
+## angular momentum changes exactly as the rigid turn's, so the servo's target spin,
+## acceleration, tip cap and contact yield keep their meaning. A compact design has no
+## head to lead: the lead is scaled by its aspect (length along its forward over width),
+## × 0 at 1.25 or less (a round blob turns as before), × 1 from 2. A stiff body (the
+## world's elasticity 0) barely bends whatever the lead: give it elasticity 0.5 or more.
+## Kept until set again, across set_spin_servo() and stop_spin_servo().
+func set_turn_lead(lead: float) -> void:
+	_c().set_spin_lead(id, lead, axis)
+
+## The creature's own elasticity in place of the world's (0..1; below 0: the world's
+## again). See GooCellWorld2D.elasticity.
+func set_elasticity(value: float) -> void:
+	_c().set_creature_elasticity(id, value)
+
 ## The spin servo's target alone (rad/s), cheap enough every frame; nothing while it is off.
 func set_spin_target(target_spin: float) -> void:
 	_c().set_spin_target(id, target_spin)
@@ -324,10 +344,11 @@ func stop_spin_servo() -> void:
 
 ## The spin servo as its last substep left it: on, target, max_acceleration, max_tip_speed,
 ## contact_yield, spin (measured), capped (the target after the tip cap), scale (what the
-## yield left of its change: 1 none), hold (the contact share it yields to, 0..1).
+## yield left of its change: 1 none), hold (the contact share it yields to, 0..1), lead
+## (set_turn_lead()'s), lead_used (the lead after the design's aspect, as last used).
 func spin_servo() -> Dictionary:
 	var s := _c().spin_servo_state(id)
-	return { "on": s[0] != 0.0, "target": s[1], "max_acceleration": s[2], "max_tip_speed": s[3], "contact_yield": s[4], "spin": s[5], "capped": s[6], "scale": s[7], "hold": s[8] }
+	return { "on": s[0] != 0.0, "target": s[1], "max_acceleration": s[2], "max_tip_speed": s[3], "contact_yield": s[4], "spin": s[5], "capped": s[6], "scale": s[7], "hold": s[8], "lead": s[9], "lead_used": s[10] }
 
 ## The spin that turns through `angle_error` (rad, clockwise positive) fastest without
 ## overshoot at `max_angular_acceleration`: sign × min(max_spin, sqrt(2 a |error|)), the

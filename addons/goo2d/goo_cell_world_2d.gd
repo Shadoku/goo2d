@@ -88,6 +88,24 @@ const GRAB_REACH: float = 3.0
 	set(value):
 		shape_stiffness = value
 		_send_options()
+## Elastic bodies (docs/cells.md, "Elastic bodies"): 0 (the default) keeps creatures as
+## stiff as ever; above it a creature dents where it is struck, bends when hit amidships or
+## run nose first into a wall, and springs back, keeping its area. Every stiffness that holds
+## its shape (shape matching's pull, the links' stretch and bending) × 0.01^elasticity
+## (log-interpolated: 0.5 ×0.1, 0.75 ×0.03, 1 ×0.01). 0.5 springy, 0.6-0.75 soft (the
+## recommended range for swimming creatures), 1 jelly. × a type's `elasticity` per cell;
+## a creature may have its own (GooCellCreature.set_elasticity()).
+@export_range(0.0, 1.0, 0.01) var elasticity: float = 0.0:
+	set(value):
+		elasticity = value
+		_send_options()
+## Elastic bodies' dashpot along every link (1/s at elasticity 1, × a link's elasticity):
+## extra damping of a dent's spring-back. 0 (the default): the solver's own damping and the
+## water's, which already let a dent ring out within one overshoot (docs/cells.md).
+@export_range(0.0, 200.0, 0.1, "or_greater") var elastic_damping: float = 0.0:
+	set(value):
+		elastic_damping = value
+		_send_options()
 ## Which of a creature's own cells collide.
 @export var self_collision: SelfCollision = SelfCollision.FAR:
 	set(value):
@@ -327,6 +345,7 @@ func _send_options() -> void:
 		"drag_linear_normal": drag_linear_normal, "drag_ratio": drag_ratio, "drag_density": drag_density,
 		"current": current, "break_force": break_force if break_force > 0.0 else INF,
 		"break_excess": break_leaves_out_own_share,
+		"elastic": elasticity, "elastic_damping": elastic_damping,
 	}
 	if drag_linear_tangent >= 0.0:
 		options["drag_linear_tangent"] = drag_linear_tangent

@@ -68,6 +68,11 @@ pub const AUTO_THREADS: [(usize, usize); 3] = [(0, 1), (800, 2), (1600, 4)];
 /// A type's body mode: the options' bend_mode (TypeParams.body's default).
 pub const BODY_DEFAULT: u8 = 255;
 
+/// Elastic bodies: every stiffness × this at elasticity 1 (`Opt::el_soft`), and the share of
+/// the area error taken back a substep (`Opt::el_area`).
+pub const ELASTIC_SOFT: f32 = 0.01;
+pub const ELASTIC_AREA: f32 = 0.3;
+
 #[inline]
 fn rot(v: Vector2, c: f32, s: f32) -> Vector2 {
     Vector2::new(c * v.x - s * v.y, s * v.x + c * v.y)
@@ -150,11 +155,13 @@ pub struct TypeParams {
     /// from its centre along its facing, rigidly held by the cell (0: no tip).
     pub tip_len: f32,
     pub tip_rad: f32,
+    /// The world's elasticity × this for its cells (0: as stiff as without elasticity).
+    pub elastic: f32,
 }
 
 impl Default for TypeParams {
     fn default() -> Self {
-        TypeParams { stretch: 1.0, bend: 1.0, brk: 1.0, self_collide: false, join_mask: 0xffff, pad: 0.0, body: BODY_DEFAULT, collide: true, walls: true, color: [0.35, 0.75, 0.45, 1.0], swim: 1.0, thrust: f32::NAN, tip_len: 0.0, tip_rad: 0.0 }
+        TypeParams { stretch: 1.0, bend: 1.0, brk: 1.0, self_collide: false, join_mask: 0xffff, pad: 0.0, body: BODY_DEFAULT, collide: true, walls: true, color: [0.35, 0.75, 0.45, 1.0], swim: 1.0, thrust: f32::NAN, tip_len: 0.0, tip_rad: 0.0, elastic: 1.0 }
     }
 }
 
@@ -241,6 +248,20 @@ pub struct Opt {
     pub break_envelope_time: f32,
     /// The envelope counts × this (> 1: a margin over the creature's own peaks).
     pub break_envelope_scale: f32,
+    /// Elastic bodies (0: off, exactly the bodies without it): the world's elasticity 0..1
+    /// (a creature's own when set, `Body::el_own`) × a type's `elastic` factor per cell.
+    /// A cell of elasticity e has its shape matching's fraction, and its links' stretch and
+    /// bend stiffness, × el_soft^e (log-interpolated: e = 1 multiplies every stiffness by
+    /// el_soft, e = 0.5 by its square root), so a creature dents and bends where it is hit
+    /// and springs back.
+    pub elastic: f32,
+    pub el_soft: f32,
+    /// The links' dashpot at elasticity 1 (1/s): each link's relative velocity along it
+    /// decays by exp(−rate × e × h) a substep (0: none).
+    pub el_damp: f32,
+    /// An elastic creature keeps its area: its outline's area pulled toward the design's by
+    /// this share a substep × its mean elasticity (0: not kept).
+    pub el_area: f32,
 }
 
 impl Default for Opt {
@@ -284,6 +305,10 @@ impl Default for Opt {
             break_excess: false,
             break_envelope_time: 2.0,
             break_envelope_scale: 1.0,
+            elastic: 0.0,
+            el_soft: ELASTIC_SOFT,
+            el_damp: 0.0,
+            el_area: ELASTIC_AREA,
         }
     }
 }
@@ -468,11 +493,25 @@ pub struct SpinServo {
     pub spin: f32,
     pub capped: f32,
     pub scale: f32,
+    /// Head-led turning (0: the rigid turn above, exactly): the turn's change of velocity
+    /// weighted toward the head, w = (1 − lead) + lead × h (h 0 over the back half of the
+    /// design along `axis`, rising to 1 at the nose), the lead scaled down for a compact
+    /// design (`lead_used`: × 0 at an aspect of LEAD_ASPECT_MIN, × 1 from LEAD_ASPECT_FULL),
+    /// its net force taken back evenly and its size set so the creature's angular momentum
+    /// changes as the rigid turn's would; the rest follows through the body.
+    pub lead: f32,
+    pub axis: Vector2,
+    pub lead_used: f32,
 }
+
+/// Head-led turning: the design's aspect (length along its forward over its width) below
+/// which it has no head to lead (the lead × 0), and from which the lead counts in full.
+pub const LEAD_ASPECT_MIN: f32 = 1.25;
+pub const LEAD_ASPECT_FULL: f32 = 2.0;
 
 impl Default for SpinServo {
     fn default() -> Self {
-        SpinServo { on: false, target: 0.0, max_acc: 0.0, max_tip: f32::INFINITY, yield_: 1.0, hold: 0.0, hold_sign: 0.0, spin: 0.0, capped: 0.0, scale: 1.0 }
+        SpinServo { on: false, target: 0.0, max_acc: 0.0, max_tip: f32::INFINITY, yield_: 1.0, hold: 0.0, hold_sign: 0.0, spin: 0.0, capped: 0.0, scale: 1.0, lead: 0.0, axis: Vector2::new(1.0, 0.0), lead_used: 0.0 }
     }
 }
 
@@ -618,6 +657,21 @@ pub struct Body {
     /// any is not zero.
     pub thrust_f: Vec<f32>,
     pub thrusting: bool,
+    /// Elastic bodies (Opt::elastic > 0), this frame: each cell's elasticity (0..1) and its
+    /// cluster's shape-matching fraction a substep; empty while the world has none.
+    pub elast: Vec<f32>,
+    pub el_kk: Vec<f32>,
+    /// The outline's area in the design (cell centres; 0: not measured yet) and the mean
+    /// elasticity this frame.
+    pub el_area0: f32,
+    pub el_mean: f32,
+    /// The creature's own elasticity in place of the world's, while `el_own_set`.
+    pub el_own: f32,
+    pub el_own_set: bool,
+    /// The spin servo's head-led turning, kept across set_spin_servo() and stops (the
+    /// servo's own copy is what runs).
+    pub lead: f32,
+    pub lead_axis: Vector2,
 }
 
 pub struct Cells {
@@ -1299,6 +1353,38 @@ impl Body {
             self.rscale[i] = if pose { 1.0 } else { self.muscle[i] };
             self.r[i] = self.r0[i] * self.scale[i];
         }
+        // Elasticity per cell (none while the world's, or the creature's own, is 0: then
+        // nothing below changes).
+        let base = if self.el_own_set { self.el_own } else { opt.elastic };
+        if base > 0.0 {
+            self.elast.clear();
+            self.el_kk.clear();
+            let soft = opt.el_soft.clamp(1e-4, 1.0).ln();
+            for i in 0..n {
+                let e = (base * opt.types[self.typ[i] as usize].elastic).clamp(0.0, 1.0);
+                self.elast.push(e);
+                self.el_kk.push(if e > 0.0 { opt.shape_k * (soft * e).exp() } else { opt.shape_k });
+            }
+        } else if !self.elast.is_empty() {
+            self.elast.clear();
+            self.el_kk.clear();
+        }
+        let elastic = self.elast.len() == n && n > 0;
+        if elastic {
+            self.el_mean = self.elast.iter().sum::<f32>() / n as f32;
+            if self.rest_local.len() == n {
+                let m = self.outline.len();
+                let mut a = 0.0f32;
+                let mut sc = 0.0f32;
+                for k in 0..m {
+                    let (i, j) = (self.outline[k] as usize, self.outline[(k + 1) % m] as usize);
+                    a += cross(self.rest_local[i], self.rest_local[j]);
+                    sc += self.rscale[i];
+                }
+                let sc = if m > 0 { sc / m as f32 } else { 1.0 };
+                self.el_area0 = 0.5 * a * sc * sc;
+            }
+        }
         // Rest values, plasticity, compliances.
         let tw = std::f32::consts::TAU;
         let h2 = h * h;
@@ -1351,6 +1437,14 @@ impl Body {
             l.alpha = ws / (ks * (ti.stretch * tj.stretch).sqrt()).max(1e-12);
             let w0 = ws / (l.rest * l.rest).max(1e-6) + 0.5 * (self.iw[i] + self.iw[j]);
             l.alpha_ang = w0 / (kb * (ti.bend * tj.bend).sqrt()).max(1e-12);
+            if elastic {
+                let e = 0.5 * (self.elast[i] + self.elast[j]);
+                if e > 0.0 {
+                    let f = (e * opt.el_soft.clamp(1e-4, 1.0).ln()).exp();
+                    l.alpha /= f;
+                    l.alpha_ang /= f;
+                }
+            }
         }
         // Box and speed.
         let mut lo = Vector2::new(f32::INFINITY, f32::INFINITY);
@@ -1834,9 +1928,68 @@ impl Body {
         if dw == 0.0 {
             return;
         }
+        if sv.lead > 0.0 && self.rest_local.len() == n {
+            self.lead_turn(c, dw, inertia);
+            return;
+        }
         for i in 0..n {
             self.vel[i] += perp(self.pos[i] - c) * dw;
             self.om[i] += dw;
+        }
+    }
+
+    /// The head-led turn (see `SpinServo::lead`): the change dw of the creature's spin
+    /// given as velocity changes weighted toward the head, their net force removed (an even
+    /// share off every cell), scaled so its angular momentum about c changes by I × dw.
+    fn lead_turn(&mut self, c: Vector2, dw: f32, inertia: f32) {
+        let n = self.n;
+        let ax = self.servo.axis;
+        let ax = if lsq(ax) > 1e-12 { ax.normalized() } else { Vector2::new(1.0, 0.0) };
+        let side = perp(ax);
+        let (mut umin, mut umax, mut vmin, mut vmax) = (f32::INFINITY, f32::NEG_INFINITY, f32::INFINITY, f32::NEG_INFINITY);
+        for i in 0..n {
+            let q = self.rest_local[i];
+            let (u, v) = (dot(q, ax), dot(q, side));
+            umin = umin.min(u - self.r0[i]);
+            umax = umax.max(u + self.r0[i]);
+            vmin = vmin.min(v - self.r0[i]);
+            vmax = vmax.max(v + self.r0[i]);
+        }
+        let span = (umax - umin).max(1e-3);
+        let aspect = span / (vmax - vmin).max(1e-3);
+        let lead = self.servo.lead.clamp(0.0, 1.0) * ((aspect - LEAD_ASPECT_MIN) / (LEAD_ASPECT_FULL - LEAD_ASPECT_MIN)).clamp(0.0, 1.0);
+        self.servo.lead_used = lead;
+        if lead <= 0.0 {
+            for i in 0..n {
+                self.vel[i] += perp(self.pos[i] - c) * dw;
+                self.om[i] += dw;
+            }
+            return;
+        }
+        if self.cs.len() < n {
+            self.cs.resize(n, (0.0, 0.0));
+        }
+        // Weights (in cs.0): 1 − lead behind the middle, rising smoothly to 1 at the nose.
+        let (mut iw, mut m, mut f) = (0.0f32, 0.0f32, Vector2::ZERO);
+        for i in 0..n {
+            let t = ((dot(self.rest_local[i], ax) - umin) / span * 2.0 - 1.0).clamp(0.0, 1.0);
+            let hd = t * t * (3.0 - 2.0 * t);
+            let w = (1.0 - lead) + lead * hd;
+            self.cs[i].0 = w;
+            let p = self.pos[i] - c;
+            iw += self.mass[i] * w * lsq(p);
+            m += self.mass[i];
+            f += perp(p) * (self.mass[i] * w);
+        }
+        if iw <= 1e-9 || m <= 0.0 {
+            return;
+        }
+        let dh = dw * inertia / iw;
+        let shift = f * (dh / m);
+        for i in 0..n {
+            let w = self.cs[i].0;
+            self.vel[i] += perp(self.pos[i] - c) * (w * dh) - shift;
+            self.om[i] += w * dh;
         }
     }
 
@@ -2052,6 +2205,9 @@ impl Body {
         if self.servo.on {
             self.spin_servo(h);
         }
+        if opt.el_damp > 0.0 && self.elast.len() == self.n {
+            self.elastic_damp(opt.el_damp, h);
+        }
         self.sub_c.clear();
         let g = opt.gravity + self.push_frame;
         let thrusting = self.thrusting && self.thrust_f.len() == self.n;
@@ -2068,6 +2224,66 @@ impl Body {
             self.pred[i] = self.pos[i];
             self.th_prev[i] = self.th[i];
             self.th[i] += self.om[i] * h;
+        }
+    }
+
+    /// Elastic bodies: the outline's area (its cells' centres) pulled toward the design's by
+    /// the share `k` of the error (a position correction of the outline cells along the
+    /// area's gradient, by their inverse masses: no net force).
+    fn keep_area(&mut self, k: f32) {
+        let m = self.outline.len();
+        if m < 3 {
+            return;
+        }
+        let mut a = 0.0f32;
+        for e in 0..m {
+            let (i, j) = (self.outline[e] as usize, self.outline[(e + 1) % m] as usize);
+            a += cross(self.pos[i], self.pos[j]);
+        }
+        let a = 0.5 * a;
+        let c = a - self.el_area0;
+        let mut den = 0.0f32;
+        if self.surf.len() < m {
+            self.surf.resize(m, Vector2::ZERO);
+        }
+        for e in 0..m {
+            let (p, q) = (self.pos[self.outline[(e + m - 1) % m] as usize], self.pos[self.outline[(e + 1) % m] as usize]);
+            let gk = Vector2::new(q.y - p.y, p.x - q.x) * 0.5;
+            self.surf[e] = gk;
+            den += self.w[self.outline[e] as usize] * lsq(gk);
+        }
+        if den < 1e-9 {
+            return;
+        }
+        let lam = -k * c / den;
+        for e in 0..m {
+            let i = self.outline[e] as usize;
+            let d = self.surf[e] * (lam * self.w[i]);
+            self.pos[i] += d;
+        }
+    }
+
+    /// Elastic bodies' dashpots: each link's relative velocity along it decays by
+    /// exp(−rate × e × h) (e the link's elasticity), as an impulse between its two cells: no
+    /// net force, no torque (along the link), a rigid turn untouched.
+    fn elastic_damp(&mut self, rate: f32, h: f32) {
+        for k in 0..self.links.len() {
+            let (i, j) = (self.links[k].i as usize, self.links[k].j as usize);
+            let e = 0.5 * (self.elast[i] + self.elast[j]);
+            if e <= 0.0 {
+                continue;
+            }
+            let d = self.pos[j] - self.pos[i];
+            let l2 = lsq(d);
+            if l2 < 1e-10 {
+                continue;
+            }
+            let u = d / l2.sqrt();
+            let rv = dot(self.vel[j] - self.vel[i], u);
+            let ws = self.w[i] + self.w[j];
+            let imp = rv * (1.0 - (-rate * e * h).exp()) / ws;
+            self.vel[i] += u * (imp * self.w[i]);
+            self.vel[j] -= u * (imp * self.w[j]);
         }
     }
 
@@ -2166,7 +2382,7 @@ impl Body {
             }
         }
         if any_shape {
-            let kk = opt.shape_k;
+            let elastic = self.elast.len() == n;
             let posed = self.wave.mode == WAVE_POSE && self.bent.len() == n;
             let mut goal: [Vector2; 32] = [Vector2::ZERO; 32];
             for ci in 0..n {
@@ -2176,6 +2392,7 @@ impl Body {
                     continue;
                 }
                 let centre = self.sm[s] as usize;
+                let kk = if elastic { self.el_kk[centre] } else { opt.shape_k };
                 // Positions relative to the cluster's own cell: in world coordinates the
                 // fit's rounding (f32, sums of mass × position) drags a moving creature
                 // (a blob lost a quarter of its speed in 10 s).
@@ -2221,6 +2438,9 @@ impl Body {
                     self.pos[c] += (gp - here) * kk;
                 }
             }
+        }
+        if opt.el_area > 0.0 && self.elast.len() == n && self.el_mean > 0.0 && self.el_area0 != 0.0 {
+            self.keep_area(opt.el_area * self.el_mean);
         }
         let rec = self.records();
         for k in 0..self.wall_c.len() {
@@ -2506,7 +2726,7 @@ impl Body {
         for (k, &c) in cells.iter().enumerate() {
             map[c] = k as u32;
         }
-        let mut b = Body { alive: true, n: cells.len(), wave: self.wave, time: self.time, swim: self.swim, damp_lin: self.damp_lin, damp_ang: self.damp_ang, servo: self.servo, track: self.track, topo_version: self.topo_version, ..Default::default() };
+        let mut b = Body { alive: true, n: cells.len(), wave: self.wave, time: self.time, swim: self.swim, damp_lin: self.damp_lin, damp_ang: self.damp_ang, servo: self.servo, track: self.track, topo_version: self.topo_version, el_own: self.el_own, el_own_set: self.el_own_set, lead: self.lead, lead_axis: self.lead_axis, ..Default::default() };
         macro_rules! take {
             ($f:ident) => {
                 b.$f = cells.iter().map(|&c| self.$f[c]).collect();

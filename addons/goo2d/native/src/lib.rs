@@ -16,6 +16,7 @@
 
 mod cells;
 mod cells_draw;
+mod cells_lab;
 mod colony;
 mod consts;
 mod couple;
@@ -1985,7 +1986,9 @@ impl GooCells {
     /// drag_normal, drag_tangent, drag_linear_normal, drag_linear_tangent, drag_density,
     /// drag_facing, drag_substep, current (Vector2), tension, gravity (Vector2),
     /// plastic_yield, plastic_rate, plastic_recover, break_force, break_torque, break_smooth,
-    /// link_tol, max_speed, density, ease_time, ease_from.
+    /// link_tol, max_speed, density, ease_time, ease_from; elastic bodies (cells.rs'
+    /// `Opt::elastic`): elastic (0..1, 0 off), elastic_soft (every stiffness × this at
+    /// elasticity 1), elastic_damping (1/s), elastic_area (the share of the area kept).
     #[func]
     fn set_options(&mut self, options: VarDictionary) {
         let mut colliders = false;
@@ -2045,6 +2048,10 @@ impl GooCells {
                 "break_envelope_time" => o.break_envelope_time = x as f32,
                 "break_envelope_scale" => o.break_envelope_scale = x as f32,
                 "drag_ratio" => ratio = Some(x as f32),
+                "elastic" => o.elastic = (x as f32).clamp(0.0, 1.0),
+                "elastic_soft" => o.el_soft = (x as f32).clamp(1e-4, 1.0),
+                "elastic_damping" => o.el_damp = (x as f32).max(0.0),
+                "elastic_area" => o.el_area = (x as f32).clamp(0.0, 1.0),
                 _ => godot_error!("GooCells: unknown option {}", name),
             }
         }
@@ -2071,7 +2078,7 @@ impl GooCells {
     /// thrust (a thruster's maximum, px/s² of its cell's own mass: a level × this × the mass
     /// is its force; NaN, the default, takes the level as a raw force; 0 never), tip_len and
     /// tip_rad (a tip's distance out along the cell's facing and its radius, × the cell's
-    /// radius; 0: none).
+    /// radius; 0: none), elastic (the world's elasticity × this for its cells).
     #[func]
     fn set_type(&mut self, t: i64, params: VarDictionary) {
         let tp = &mut self.c.opt.types[(t as usize).min(cells::TYPES - 1)];
@@ -2099,6 +2106,7 @@ impl GooCells {
                 "thrust" => tp.thrust = x as f32,
                 "tip_len" => tp.tip_len = (x as f32).max(0.0),
                 "tip_rad" => tp.tip_rad = (x as f32).max(0.0),
+                "elastic" => tp.elastic = (x as f32).max(0.0),
                 other => godot_error!("GooCells: unknown type parameter {}", other),
             }
         }
@@ -2610,7 +2618,27 @@ impl GooCells {
         let b = &mut self.c.bodies[c as usize];
         let tip = if max_tip_speed < 0.0 || !max_tip_speed.is_finite() { f32::INFINITY } else { max_tip_speed as f32 };
         let keep = b.servo;
-        b.servo = cells::SpinServo { on: true, target: target as f32, max_acc: (max_acceleration as f32).max(0.0), max_tip: tip, yield_: (contact_yield as f32).clamp(0.0, 1.0), hold: if keep.on { keep.hold } else { 0.0 }, hold_sign: if keep.on { keep.hold_sign } else { 0.0 }, ..Default::default() };
+        b.servo = cells::SpinServo { on: true, target: target as f32, max_acc: (max_acceleration as f32).max(0.0), max_tip: tip, yield_: (contact_yield as f32).clamp(0.0, 1.0), hold: if keep.on { keep.hold } else { 0.0 }, hold_sign: if keep.on { keep.hold_sign } else { 0.0 }, lead: b.lead, axis: b.lead_axis, ..Default::default() };
+    }
+
+    /// The spin servo's head-led turning (cells.rs' `SpinServo::lead`): `lead` 0..1 (0: the
+    /// rigid turn), `axis` the creature's forward in its design's frame at spawn. Kept by
+    /// set_spin_servo() and across stops until set again.
+    #[func]
+    fn set_spin_lead(&mut self, c: i64, lead: f64, axis: Vector2) {
+        let b = &mut self.c.bodies[c as usize];
+        b.servo.lead = (lead as f32).clamp(0.0, 1.0);
+        b.servo.axis = if axis.length_squared() > 0.0 { axis.normalized() } else { Vector2::new(1.0, 0.0) };
+        b.lead = b.servo.lead;
+        b.lead_axis = b.servo.axis;
+    }
+
+    /// Creature c's own elasticity in place of the world's (0..1; below 0: the world's).
+    #[func]
+    fn set_creature_elasticity(&mut self, c: i64, elasticity: f64) {
+        let b = &mut self.c.bodies[c as usize];
+        b.el_own_set = elasticity >= 0.0;
+        b.el_own = (elasticity as f32).clamp(0.0, 1.0);
     }
 
     /// The spin servo's target alone (rad/s; nothing while the servo is off).
@@ -2623,16 +2651,18 @@ impl GooCells {
     /// Stops creature c's spin servo (its spin is left as it is).
     #[func]
     fn stop_spin_servo(&mut self, c: i64) {
-        self.c.bodies[c as usize].servo = cells::SpinServo::default();
+        let b = &mut self.c.bodies[c as usize];
+        b.servo = cells::SpinServo { lead: b.lead, axis: b.lead_axis, ..Default::default() };
     }
 
     /// Creature c's spin servo as its last substep left it: [on (0/1), target, max
     /// acceleration, max tip speed, yield, spin measured, target after the tip cap, the
-    /// scale the yield gave its change (1: none), the contact share held].
+    /// scale the yield gave its change (1: none), the contact share held, the lead set, the
+    /// lead used (scaled down for a compact design)].
     #[func]
     fn spin_servo_state(&self, c: i64) -> PackedFloat32Array {
         let s = self.c.bodies[c as usize].servo;
-        PackedFloat32Array::from(&[s.on as i32 as f32, s.target, s.max_acc, s.max_tip, s.yield_, s.spin, s.capped, s.scale, s.hold][..])
+        PackedFloat32Array::from(&[s.on as i32 as f32, s.target, s.max_acc, s.max_tip, s.yield_, s.spin, s.capped, s.scale, s.hold, s.lead, s.lead_used][..])
     }
 
     /// Whether creature c's contacts are recorded every step (creature_contacts()); the spin
