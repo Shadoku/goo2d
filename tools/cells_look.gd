@@ -5,7 +5,7 @@ extends SceneTree
 ##   xvfb-run -a -s "-screen 0 1920x1080x24" godot --path . --rendering-driver opengl3
 ##     --audio-driver Dummy --fixed-fps 60 -s tools/cells_look.gd -- OUT_DIR
 ##     [--preset=faint|cellular|membrane|all] [--set=uniform=value,uniform=value]
-##     [--scene=example|strip|swim|all] [--tag=NAME]
+##     [--scene=example|strip|water|swim|all] [--tag=NAME]
 ## Writes <TAG>_<scene>.png per preset (TAG the preset's letter, A faint, B cellular,
 ## C membrane, or --tag): example (examples/cells after 3 s of motion), strip_14px and
 ## strip_7px (on dark blue water with a pattern: a ring body of goo.gdshader with its
@@ -16,6 +16,10 @@ extends SceneTree
 ## (the blob's patch), and swim_a / swim_b (a swimming worm 6 frames apart, cropped about
 ## the same cell and turned with the worm: its material should not move). --set overrides
 ## uniforms on top of the preset (numbers, or x;y;z for a vec3), so feedback is numbers.
+## water: the same strips (water_strip_<size>, water_zoom_*) on a stand-in for the fluid
+## game's water (a dark blue field with slow depth patches and a soft caustic network, no
+## dots: the dotted pattern's dots read as nuclei inside the cells). --preset=membrane+
+## is MEMBRANE with PLUS on top: a notch more definition and cell light.
 
 const LAYOUT := Vector2i(1920, 1080)
 const WATER_TOP := Color(0.05, 0.13, 0.24)
@@ -31,6 +35,58 @@ var presets: Array[int] = []
 var overrides: Dictionary = {}
 var scenes: Array[String] = []
 var tag := ""
+var plus: Array[bool] = []
+
+## membrane+: MEMBRANE a notch further (more definition, more cell light).
+const PLUS: Dictionary = {
+	"wall_strength": 0.26, "membrane_strength": 0.95, "cell_light": 0.3, "corner_radius": 3.0,
+	"brightness": 0.22, "cloud": 0.4,
+}
+
+# The fluid game's water, a stand-in (still water: no flow texture): deep and shallow
+# patches and a soft caustic network where two octaves of gradient noise sum to zero.
+const WATER_SHADER := """
+shader_type canvas_item;
+uniform vec3 deep_color = vec3(0.025, 0.085, 0.15);
+uniform vec3 shallow_color = vec3(0.05, 0.16, 0.25);
+uniform vec3 caustic_color = vec3(0.42, 0.72, 0.86);
+uniform float caustic_strength = 0.2;
+uniform float pattern_scale = 120.0;
+uniform float sharpness = 6.0;
+uniform float depth_scale = 560.0;
+uniform float depth_strength = 0.6;
+uniform float edge_shade = 0.4;
+uniform float edge_width = 160.0;
+uniform vec2 size = vec2(1920.0, 1080.0);
+varying vec2 world_pos;
+void vertex() { world_pos = VERTEX; }
+vec2 gradient(vec2 cell) {
+	vec2 h = vec2(dot(cell, vec2(127.1, 311.7)), dot(cell, vec2(269.5, 183.3)));
+	return -1.0 + 2.0 * fract(sin(h) * 43758.5453);
+}
+float noise(vec2 p) {
+	vec2 i = floor(p);
+	vec2 f = fract(p);
+	vec2 u = f * f * (3.0 - 2.0 * f);
+	float a = dot(gradient(i), f);
+	float b = dot(gradient(i + vec2(1.0, 0.0)), f - vec2(1.0, 0.0));
+	float c = dot(gradient(i + vec2(0.0, 1.0)), f - vec2(0.0, 1.0));
+	float d = dot(gradient(i + vec2(1.0, 1.0)), f - vec2(1.0, 1.0));
+	return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+}
+void fragment() {
+	vec2 q = world_pos / pattern_scale;
+	float n = noise(q) + 0.5 * noise(q * 1.9 + 17.3);
+	float c = pow(clamp(1.0 - abs(n) * 1.7, 0.0, 1.0), sharpness);
+	vec2 d = world_pos / depth_scale;
+	float depth = clamp(0.5 + noise(d) + 0.5 * noise(d * 2.3 + 5.1), 0.0, 1.0);
+	vec3 col = mix(deep_color, shallow_color, mix(0.5, depth, depth_strength));
+	col += caustic_color * c * caustic_strength;
+	vec2 to_edge = min(world_pos, size - world_pos);
+	col *= mix(1.0 - edge_shade, 1.0, smoothstep(0.0, edge_width, min(to_edge.x, to_edge.y)));
+	COLOR = vec4(col, 1.0);
+}
+"""
 
 func _initialize() -> void:
 	var args := OS.get_cmdline_user_args()
@@ -54,14 +110,18 @@ func _initialize() -> void:
 		presets = [GooCellLook.Preset.FAINT, GooCellLook.Preset.CELLULAR, GooCellLook.Preset.MEMBRANE]
 	else:
 		for p: String in preset_arg.split(",", false):
-			var k := GooCellLook.preset_named(p)
+			var is_plus := p.ends_with("+")
+			var k := GooCellLook.preset_named(p.trim_suffix("+"))
 			if k < 0:
 				push_error("cells_look: no preset %s" % p)
 				quit(1)
 				return
 			presets.append(k)
+			plus.append(is_plus)
+	for i: int in presets.size() - plus.size():
+		plus.append(false)
 	if scene_arg == "all":
-		scenes = ["example", "strip", "swim"]
+		scenes = ["example", "strip", "water", "swim"]
 	else:
 		for s: String in scene_arg.split(",", false):
 			scenes.append(s)
@@ -81,7 +141,9 @@ func _letter(preset: int) -> String:
 	return ["A", "B", "C", "X"][preset]
 
 func _run() -> void:
-	for preset: int in presets:
+	for pi: int in presets.size():
+		var preset: int = presets[pi]
+		_plus = plus[pi]
 		for s: String in scenes:
 			match s:
 				"example":
@@ -89,6 +151,9 @@ func _run() -> void:
 				"strip":
 					await _strip(preset, 1.0)
 					await _strip(preset, 0.5)
+				"water":
+					await _strip(preset, 1.0, true)
+					await _strip(preset, 0.5, true)
 				"swim":
 					await _swim(preset)
 	quit(0)
@@ -106,9 +171,13 @@ func _save(image: Image, scene_name: String, preset: int) -> void:
 	image.save_png(path)
 	print("cells_look: saved ", path)
 
+var _plus := false
+
 func _look(world: GooCellWorld2D, preset: int) -> void:
 	world.skin_preset = preset as GooCellLook.Preset
-	GooCellLook.apply(world.current_skin_material(), preset as GooCellLook.Preset, overrides)
+	var o: Dictionary = PLUS.duplicate() if _plus else {}
+	o.merge(overrides, true)
+	GooCellLook.apply(world.current_skin_material(), preset as GooCellLook.Preset, o)
 
 # --- examples/cells -----------------------------------------------------------------------
 
@@ -132,8 +201,17 @@ func _example(preset: int) -> void:
 
 # --- The comparison strip -------------------------------------------------------------------
 
-func _water(parent: Node) -> void:
+func _water(parent: Node, caustic: bool = false) -> void:
 	var back := ColorRect.new()
+	if caustic:
+		back.size = Vector2(LAYOUT)
+		var wm := ShaderMaterial.new()
+		var sh := Shader.new()
+		sh.code = WATER_SHADER
+		wm.shader = sh
+		back.material = wm
+		parent.add_child(back)
+		return
 	back.size = Vector2(LAYOUT)
 	var m := ShaderMaterial.new()
 	m.shader = load("res://assets/shaders/backdrop.gdshader")
@@ -154,12 +232,13 @@ func _type(type_name: StringName, colour: Color) -> GooCellType:
 	t.color = colour
 	return t
 
-func _strip(preset: int, unit: float) -> void:
+func _strip(preset: int, unit: float, caustic: bool = false) -> void:
 	GooTuning.unit = unit
 	var radius := 14.0 * unit
+	var prefix := "water_" if caustic else ""
 	var root2 := Node2D.new()
 	root.add_child(root2)
-	_water(root2)
+	_water(root2, caustic)
 	var rings := GooWorld2D.new()
 	rings.gravity_scale = 0.0
 	root2.add_child(rings)
@@ -203,12 +282,12 @@ func _strip(preset: int, unit: float) -> void:
 	var size_name := "%dpx" % int(round(radius))
 	if unit < 1.0:
 		var box := Rect2i(centre.x - 520 * unit - 300, centre.y - 200, 1040 * unit + 600, 400)
-		_save(image.get_region(box), "strip_" + size_name, preset)
+		_save(image.get_region(box), prefix + "strip_" + size_name, preset)
 	else:
-		_save(image, "strip_" + size_name, preset)
-	_save(_crop(image, _border_point(worm, 1), Vector2i(110, 80), 4), "zoom_border_" + size_name, preset)
-	_save(_crop(image, _outline_point(worm), Vector2i(110, 80), 4), "zoom_outline_" + size_name, preset)
-	_save(_crop(image, _border_point(blob, 1), Vector2i(110, 80), 4), "zoom_patch_" + size_name, preset)
+		_save(image, prefix + "strip_" + size_name, preset)
+	_save(_crop(image, _border_point(worm, 1), Vector2i(110, 80), 4), prefix + "zoom_border_" + size_name, preset)
+	_save(_crop(image, _outline_point(worm), Vector2i(110, 80), 4), prefix + "zoom_outline_" + size_name, preset)
+	_save(_crop(image, _border_point(blob, 1), Vector2i(110, 80), 4), prefix + "zoom_patch_" + size_name, preset)
 	root2.queue_free()
 	await process_frame
 	GooTuning.unit = 1.0
