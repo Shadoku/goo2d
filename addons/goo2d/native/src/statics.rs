@@ -20,6 +20,23 @@ pub struct StaticShape {
     pub friction: f32,
     pub bounce: f32,
     pub grip: bool,
+    /// A moving obstacle (a Godot body the goo is pushed by, `set_target()`): its pose
+    /// eased from `from` to `to` over a step's substeps, the beads' and cells' contacts
+    /// judged on their motion relative to it (`motion`, the pose change of the current
+    /// substep), the impulse they took from it summed for the step (bridge.rs). False:
+    /// a wall, as before.
+    pub dynamic: bool,
+    pub from: Transform2D,
+    pub to: Transform2D,
+    pub motion: Transform2D,
+    /// The farthest a point of its outline moves from `from` to `to`, and the box both
+    /// poses cover.
+    pub sweep: f32,
+    pub swept: Rect,
+    /// The impulse the goo gave it this step (the reaction of every push it made: −m Δ/h
+    /// per push), and that impulse's moment about the global origin (Σ p × J).
+    pub impulse: Vector2,
+    pub moment: f32,
 }
 
 impl StaticShape {
@@ -33,9 +50,66 @@ impl StaticShape {
             friction,
             bounce,
             grip,
+            dynamic: false,
+            from: xform,
+            to: xform,
+            motion: Transform2D::IDENTITY,
+            sweep: 0.0,
+            swept: Rect::default(),
+            impulse: Vector2::ZERO,
+            moment: 0.0,
         };
         s.set_transform(xform);
+        s.swept = s.aabb;
         s
+    }
+
+    /// Makes the shape a moving obstacle and gives it the pose `xform` it reaches at the
+    /// end of the next step, from the one it reached at the end of the last (its first
+    /// target: from where it was registered). Until the step it stays at `from`.
+    pub fn set_target(&mut self, xform: Transform2D) {
+        self.dynamic = true;
+        self.from = self.to;
+        self.to = xform;
+        self.motion = Transform2D::IDENTITY;
+        let mut sweep = 0.0f32;
+        let mut ends: Vec<Vector2> = Vec::with_capacity(self.local.len() * 2);
+        for &p in &self.local {
+            let (a, b) = (self.from * p, self.to * p);
+            sweep = sweep.max(dist(a, b));
+            ends.push(a);
+            ends.push(b);
+        }
+        self.sweep = sweep;
+        self.swept = Rect::of_points(&ends);
+        let from = self.from;
+        self.set_transform(from);
+    }
+
+    /// Puts a moving obstacle where it is `t1` of the way through the step, `motion` the
+    /// change from where it was at `t0`.
+    pub fn substep_to(&mut self, t0: f32, t1: f32) {
+        let a = self.from.interpolate_with(&self.to, t0);
+        let b = self.from.interpolate_with(&self.to, t1);
+        self.motion = b * a.affine_inverse();
+        self.set_transform(b);
+    }
+
+    /// The step is over: the obstacle at its target, no motion left to replay.
+    pub fn end_step(&mut self) {
+        let to = self.to;
+        self.from = to;
+        self.motion = Transform2D::IDENTITY;
+        self.set_transform(to);
+        self.sweep = 0.0;
+        self.swept = self.aabb;
+    }
+
+    /// The goo took `j` at `point` from this obstacle: its reaction, −j, is summed.
+    #[inline]
+    pub fn add_reaction(&mut self, point: Vector2, j: Vector2) {
+        self.impulse -= j;
+        self.moment -= cross(point, j);
     }
 
     /// Moves the shape: its polygon is `xform` of the registered one.

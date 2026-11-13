@@ -464,6 +464,11 @@ pub struct Body {
     pub contact: bool,
     /// The link graph's faces for the skin (cells_draw.rs), walked by after_topology().
     pub faces: std::sync::Arc<crate::cells_draw::Faces>,
+    /// Cells near a moving obstacle this step (cell, wall index) and the momentum the
+    /// step's pushes gave them per obstacle (wall index, impulse, its moment about the
+    /// origin): bridge.rs.
+    pub dyn_c: Vec<(u32, u32)>,
+    pub dyn_j: Vec<(u32, Vector2, f32)>,
 }
 
 pub struct Cells {
@@ -579,7 +584,7 @@ pub fn entry_face(w: &StaticShape, a: Vector2, b: Vector2) -> Option<usize> {
 /// One cell against one wall: out through the face its centre entered by this substep, or
 /// out of any overlap along the nearest direction.
 #[inline]
-fn push_out_of_wall(w: &StaticShape, prev: Vector2, p: Vector2, r: f32) -> Vector2 {
+pub(crate) fn push_out_of_wall(w: &StaticShape, prev: Vector2, p: Vector2, r: f32) -> Vector2 {
     if let Some(k) = entry_face(w, prev, p) {
         let s = dot(w.normals[k], p - w.world[k]);
         return p + w.normals[k] * (r - s);
@@ -1278,6 +1283,9 @@ impl Body {
         let margin = opt.margin + self.vmax * dt;
         self.wall_c.clear();
         for (wi, w) in walls.iter().enumerate() {
+            if w.dynamic {
+                continue;
+            }
             let (wlo, whi) = (w.aabb.pos, w.aabb.pos + w.aabb.size);
             if whi.x < lo.x - margin || wlo.x > hi.x + margin || whi.y < lo.y - margin || wlo.y > hi.y + margin {
                 continue;
@@ -2167,7 +2175,10 @@ impl Cells {
         let cell = self.grid_cell;
         {
             let walls = &self.statics;
-            par_bodies(&self.pool, &mut self.bodies, |b| b.prepare(&opt, dt, walls, cell));
+            par_bodies(&self.pool, &mut self.bodies, |b| {
+                b.prepare(&opt, dt, walls, cell);
+                b.prepare_dynamic(&opt, dt, walls);
+            });
         }
         let t1 = Instant::now();
         let nb = self.bodies.len();
@@ -2254,13 +2265,16 @@ impl Cells {
         let h = dt / opt.substeps as f32;
         let mut solve_us = 0u64;
         let mut serial_us = 0u64;
+        self.begin_dynamic();
         for s in 0..opt.substeps {
             let ta = Instant::now();
+            self.move_dynamic(s, opt.substeps);
             {
                 let walls = &self.statics;
                 par_bodies(&self.pool, &mut self.bodies, |b| {
                     b.predict(&opt, h, s == 0);
                     b.solve(&opt, walls, h);
+                    b.solve_dynamic(walls, h);
                 });
             }
             let tb = Instant::now();
@@ -2270,6 +2284,7 @@ impl Cells {
             solve_us += (tb - ta).as_micros() as u64;
             serial_us += tb.elapsed().as_micros() as u64;
         }
+        self.end_dynamic();
         let t3 = Instant::now();
         self.for_each(|b| b.finish(&opt, h, dt));
         let t4 = Instant::now();

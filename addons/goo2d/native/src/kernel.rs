@@ -935,8 +935,10 @@ impl Kernel {
         }
         mark(1, &mut lap);
         // 3. The solver.
+        self.begin_dynamic();
         let stepped: Vec<bool> = self.rings.iter().map(|r| !r.settled).collect();
         self.integrate(delta as f32);
+        self.end_dynamic();
         mark(2, &mut lap);
         // 4. Rings: views and touching first (the calm groups read every ring's), then
         // the per-ring logic.
@@ -1176,7 +1178,8 @@ impl Kernel {
         self.vel_frame.extend_from_slice(&self.ps.vel);
         self.frame_forces();
         self.build_pairs(delta);
-        for _ in 0..n {
+        for k in 0..n {
+            self.move_dynamic(k, n);
             self.substep(h);
         }
     }
@@ -1259,6 +1262,7 @@ impl Kernel {
         self.touch_pairs.clear();
         self.to_wake.clear();
         self.collide_statics();
+        self.collide_dynamic(h);
         self.collide_particles();
         // Velocities from positions, then the contacts' restitution and friction.
         {
@@ -1347,7 +1351,7 @@ impl Kernel {
                     let mut at = q;
                     let mut hit = false;
                     for s in &self.statics {
-                        if !s.aabb.grow(rad + slop).has_point(at) {
+                        if s.dynamic || !s.aabb.grow(rad + slop).has_point(at) {
                             continue;
                         }
                         let Some((gap, dir)) = s.gap(at, rad, slop) else { continue };
