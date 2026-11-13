@@ -1,0 +1,78 @@
+[gd_scene format=3]
+
+[ext_resource type="Script" path="res://examples/cells/cells.gd" id="1_scene"]
+[ext_resource type="Script" path="res://addons/goo2d/goo_cell_world_2d.gd" id="2_world"]
+[ext_resource type="Shader" path="res://assets/shaders/backdrop.gdshader" id="3_backdrop"]
+
+[sub_resource type="ShaderMaterial" id="ShaderMaterial_backdrop"]
+shader = ExtResource("3_backdrop")
+
+[sub_resource type="RectangleShape2D" id="RectangleShape2D_horizontal"]
+size = Vector2(1520, 40)
+
+[sub_resource type="RectangleShape2D" id="RectangleShape2D_vertical"]
+size = Vector2(40, 900)
+
+[node name="Cells" type="Node2D"]
+script = ExtResource("1_scene")
+
+[node name="Backdrop" type="ColorRect" parent="."]
+top_level = true
+z_index = -1
+material = SubResource("ShaderMaterial_backdrop")
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+mouse_filter = 2
+color = Color(0.05, 0.08, 0.1, 1)
+
+[node name="Walls" type="StaticBody2D" parent="."]
+collision_mask = 0
+
+[node name="Top" type="CollisionShape2D" parent="Walls"]
+position = Vector2(960, 120)
+shape = SubResource("RectangleShape2D_horizontal")
+
+[node name="Bottom" type="CollisionShape2D" parent="Walls"]
+position = Vector2(960, 1040)
+shape = SubResource("RectangleShape2D_horizontal")
+
+[node name="Left" type="CollisionShape2D" parent="Walls"]
+position = Vector2(220, 580)
+shape = SubResource("RectangleShape2D_vertical")
+
+[node name="Right" type="CollisionShape2D" parent="Walls"]
+position = Vector2(1700, 580)
+shape = SubResource("RectangleShape2D_vertical")
+
+[node name="Rock" type="CollisionPolygon2D" parent="Walls"]
+position = Vector2(960, 580)
+polygon = PackedVector2Array(-150, -110, -60, -140, 40, -120, 120, -60, 150, 30, 110, 120, 30, 140, 60, 70, 50, 0, 0, -50, -70, -60, -120, -20, -160, -60)
+
+[node name="Visual" type="Polygon2D" parent="Walls"]
+color = Color(0.25, 0.3, 0.34, 1)
+polygon = PackedVector2Array(200, 100, 1720, 100, 1720, 1060, 200, 1060, 200, 140, 240, 140, 240, 1020, 1680, 1020, 1680, 140, 200, 140)
+
+[node name="RockVisual" type="Polygon2D" parent="Walls"]
+position = Vector2(960, 580)
+color = Color(0.3, 0.33, 0.38, 1)
+polygon = PackedVector2Array(-150, -110, -60, -140, 40, -120, 120, -60, 150, 30, 110, 120, 30, 140, 60, 70, 50, 0, 0, -50, -70, -60, -120, -20, -160, -60)
+
+[node name="World" type="Node2D" parent="."]
+script = ExtResource("2_world")
+gravity_scale = 0.0
+
+[node name="UI" type="CanvasLayer" parent="."]
+
+[node name="Label" type="Label" parent="UI"]
+offset_left = 24.0
+offset_top = 16.0
+offset_right = 1896.0
+offset_bottom = 80.0
+theme_override_colors/font_color = Color(0.92, 0.92, 0.97, 1)
+theme_override_colors/font_outline_color = Color(0.03, 0.03, 0.06, 1)
+theme_override_constants/outline_size = 6
+theme_override_font_sizes/font_size = 22
+text = "Cells"

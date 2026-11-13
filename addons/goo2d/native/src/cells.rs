@@ -2946,8 +2946,8 @@ mod tests {
         assert_eq!(faces.len(), 24);
         assert!(faces.iter().all(|f| f.len() == 3));
         let m = crate::cells_draw::creature_mesh(&cl.bodies[c], &cl.opt.types, true);
-        // 24 face triangles and 6 per outline cell, no borders in one type.
-        assert_eq!(m.points.len(), 3 * (24 + 6 * 12));
+        // 24 faces of 4 triangles and 6 per outline cell, no borders in one type.
+        assert_eq!(m.points.len(), 3 * (4 * 24 + 6 * 12));
         assert!(m.lines.is_empty());
         // Mixed types: borders, and the area kept.
         let mut cl2 = Cells::default();

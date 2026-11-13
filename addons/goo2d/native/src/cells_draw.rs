@@ -169,14 +169,23 @@ pub fn creature_mesh(b: &Body, types: &[TypeParams; TYPES], border: bool) -> Mes
                 continue;
             }
         }
+        // Every link is split at its midpoint wherever it is drawn (faces of one type, of
+        // mixed types, the rim), so neighbouring triangles share whole edges: no T-junction,
+        // no pinholes along the links.
         let t0 = b.typ[f[0] as usize];
         if f.iter().all(|&c| b.typ[c as usize] == t0) {
             let col = color_of(types, t0);
+            let t = tv(f[0] as usize);
+            let mids: Vec<Vector2> = (0..k).map(|q| (b.pos[f[q] as usize] + b.pos[f[(q + 1) % k] as usize]) * 0.5).collect();
             if k == 3 {
-                m.tri(b.pos[f[0] as usize], b.pos[f[1] as usize], b.pos[f[2] as usize], 1.0, 1.0, 1.0, col, tv(f[0] as usize));
+                for q in 0..3 {
+                    m.tri(b.pos[f[q] as usize], mids[q], mids[(q + 2) % 3], 1.0, 1.0, 1.0, col, t);
+                }
+                m.tri(mids[0], mids[1], mids[2], 1.0, 1.0, 1.0, col, t);
             } else {
                 for q in 0..k {
-                    m.tri(g, b.pos[f[q] as usize], b.pos[f[(q + 1) % k] as usize], 1.0, 1.0, 1.0, col, tv(f[0] as usize));
+                    m.tri(g, b.pos[f[q] as usize], mids[q], 1.0, 1.0, 1.0, col, t);
+                    m.tri(g, mids[q], b.pos[f[(q + 1) % k] as usize], 1.0, 1.0, 1.0, col, t);
                 }
             }
             continue;
