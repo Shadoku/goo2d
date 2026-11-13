@@ -73,10 +73,11 @@ static func bend(cr: GooCellCreature, rest: PackedVector2Array) -> float:
 
 ## One turn of `angle` (rad, clockwise) by creature `name` at `lead` and elasticity `e`,
 ## from rest or swimming: [time to face within 5° (INF: not in 3 s), overshoot (rad), peak
-## bend (rad, signed into the turn: positive is the head ahead of the turn), the bend at the
-## first tenth of the turn time, the tail's swing (px off the line it lay on), the centre's
-## path off its line (px), the speed while turning (px/s, swimming), the error 1 s after
-## facing (rad), lead used, worst strain].
+## bend into the turn (rad: the head ahead of the turn), the bend at the first tenth of the
+## turn time, the tail's fastest speed about the centre (px/s), the centre's farthest from
+## where it began (px), the speed while turning (px/s, swimming), the error 1 s after facing
+## (rad), lead used, worst strain, the follow-through (the bend the other way at most, rad),
+## the time after facing until the bend is under 3°].
 func _turn(name: String, angle: float, lead: float, e: float, swim: bool) -> Array:
 	var d: GooCellDesign = designs()[name]
 	var w := GooCellWorld2D.new()
@@ -111,8 +112,6 @@ func _turn(name: String, angle: float, lead: float, e: float, swim: bool) -> Arr
 	var turned := 0.0
 	var last := start
 	var from := cr.center()
-	var way := Vector2.RIGHT.rotated(start)
-	var tail0 := (cr.positions()[tail] - from).dot(way.orthogonal())
 	var reached := INF
 	var over := 0.0
 	var peak := 0.0
@@ -122,6 +121,8 @@ func _turn(name: String, angle: float, lead: float, e: float, swim: bool) -> Arr
 	var after := 0.0
 	var strain := 0.0
 	var dist := 0.0
+	var follow := 0.0
+	var settled := INF
 	var t := 0.0
 	var prev := from
 	for f: int in 180:
@@ -133,14 +134,13 @@ func _turn(name: String, angle: float, lead: float, e: float, swim: bool) -> Arr
 		last = cr.turn()
 		err = goal - (start + turned)
 		var b := bend(cr, rest) * signf(angle)
-		if absf(b) > absf(peak):
-			peak = b
+		peak = maxf(peak, b)
+		follow = maxf(follow, -b)
 		if t <= 0.1 * prof.x + 0.001:
 			early = b
-		var tp := cr.positions()[tail] - from
-		swing = maxf(swing, absf(tp.dot(way.orthogonal()) - tail0))
-		var cp := cr.center() - from
-		path = maxf(path, absf(cp.dot(way.orthogonal())))
+		swing = maxf(swing, (cr.velocities()[tail] - cr.velocity()).length())
+		if not swim:
+			path = maxf(path, cr.center().distance_to(from))
 		strain = maxf(strain, w.cells().health()[3])
 		if reached == INF:
 			dist += cr.center().distance_to(prev)
@@ -151,11 +151,13 @@ func _turn(name: String, angle: float, lead: float, e: float, swim: bool) -> Arr
 			over = maxf(over, -err * signf(angle))
 			if t <= reached + 1.0:
 				after = err
+			if settled == INF and absf(b) < deg_to_rad(3.0) and t > reached + 0.05:
+				settled = t - reached
 	var lead_used: float = cr.spin_servo()["lead_used"]
 	w.queue_free()
 	await _frames(2)
 	var speed := dist / reached if reached < INF else 0.0
-	return [reached, over, peak, early, swing, path, speed, after, lead_used, strain]
+	return [reached, over, peak, early, swing, path, speed, after, lead_used, strain, follow, settled]
 
 func test_half_and_quarter_turns_led_by_the_head() -> void:
 	var rows: Array[String] = []
@@ -168,7 +170,7 @@ func test_half_and_quarter_turns_led_by_the_head() -> void:
 				for setting: Vector2 in [Vector2(0.0, 0.0), Vector2(ELASTIC, 0.0), Vector2(ELASTIC, 0.5), Vector2(ELASTIC, 1.0)]:
 					var r := await _turn(name, angle, setting.y, setting.x, swim)
 					got[[name, swim, angle, setting]] = r
-					rows.append("  %s %s, elasticity %.2f lead %.1f (used %.2f): faces in %s, overshoot %.1f°, bend %+.1f° at most (%+.1f° at a tenth of the turn time), tail swings %.0f px, centre %.0f px off its line%s, 1 s later %.2f°, strain %.3f" % ["half" if angle > 2.0 else "quarter", "swimming" if swim else "from rest", setting.x, setting.y, r[8], ("%.2f s" % r[0]) if r[0] < INF else "never", rad_to_deg(r[1]), rad_to_deg(r[2]), rad_to_deg(r[3]), r[4], r[5], (", %.0f px/s through the turn" % r[6]) if swim else "", rad_to_deg(r[7]), r[9]])
+					rows.append("  %s %s, elasticity %.2f lead %.1f (used %.2f): faces in %s, overshoot %.1f°; bent into the turn %.1f° at most (%.1f° at a tenth of the turn time), the other way after %.1f°, under 3° %s after facing; tail at up to %.0f px/s about the centre; %s; 1 s later %.2f° off; strain %.3f" % ["half" if angle > 2.0 else "quarter", "swimming" if swim else "from rest", setting.x, setting.y, r[8], ("%.2f s" % r[0]) if r[0] < INF else "never", rad_to_deg(r[1]), rad_to_deg(r[2]), rad_to_deg(r[3]), rad_to_deg(r[10]), ("%.2f s" % r[11]) if r[11] < INF else "not within 2 s", r[4], ("%.0f px/s through the turn" % r[6]) if swim else ("the centre moved %.0f px" % r[5]), rad_to_deg(r[7]), r[9]])
 					assert_lt(r[0], 3.0, "%s faces its heading" % name)
 					assert_lt(absf(r[7]), deg_to_rad(5.0), "%s holds it" % name)
 	for r: String in rows:
