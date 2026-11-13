@@ -202,6 +202,5 @@ func _update_label() -> void:
 	var cells := 0
 	for c: GooCellCreature in _world.creatures():
 		cells += c.cell_count()
-	_label.text = "Cells: creatures of one disc particle per cell (GooCellWorld2D)      Creatures: %d      Cells: %d\n" % [_world.creatures().size(), cells] \
-		+ "A worm swimming by its pose wave      A blob with thrusters      A mixed-size creature (mixed.tres)      " \
-		+ "A crawler of three jointed segments      The water swirls      Drag a creature      R: rebuild"
+	_label.text = "Cells: creatures of one disc particle per cell (GooCellWorld2D)    Creatures: %d    Cells: %d\n" % [_world.creatures().size(), cells] \
+		+ "Worm: pose wave    Blob: thrusters    Mixed sizes: mixed.tres    Crawler: three jointed segments    The water swirls    Drag a creature    R: rebuild"
