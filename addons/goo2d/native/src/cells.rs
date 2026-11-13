@@ -4929,3 +4929,148 @@ mod thrust_tip_tests {
         assert_eq!(a, run(1), "a replay");
     }
 }
+
+#[cfg(test)]
+mod elastic_tests {
+    use super::tests::crash_world;
+    use super::*;
+
+    const DT: f32 = 1.0 / 60.0;
+
+    fn game_like() -> Cells {
+        let mut cl = Cells::default();
+        cl.opt.bend_mode = BEND_SHAPE;
+        cl.opt.stretch_hz = 60.0;
+        cl.opt.bend_hz = 40.0;
+        cl.opt.self_mode = SELF_FAR;
+        cl
+    }
+
+    fn worm(cl: &mut Cells, long: i32, at: Vector2) -> usize {
+        let d = worm_design(long, 5, 7.0, at);
+        cl.add_creature(&d, &vec![7.0; d.len()], &vec![0; d.len()])
+    }
+
+    /// Every cell's elasticity 0 (the world's on, every type's factor 0) is exactly the
+    /// world without it, and so is a world whose elasticity is 0 with its other knobs set.
+    #[test]
+    fn elasticity_zero_is_the_body_without_it() {
+        let run = |e: f32, factor: f32| {
+            let mut cl = crash_world(1);
+            cl.opt.elastic = e;
+            cl.opt.el_damp = 30.0;
+            for t in cl.opt.types.iter_mut() {
+                t.elastic = factor;
+            }
+            for _ in 0..90 {
+                cl.step(DT);
+            }
+            cl.state_hash()
+        };
+        let base = run(0.0, 1.0);
+        assert_eq!(base, run(0.8, 0.0));
+        assert_ne!(base, run(0.8, 1.0), "elasticity changes something");
+    }
+
+    /// An elastic crash keeps the momentum (the area pass and the dashpots are internal),
+    /// stays sound, and an elastic blob dents far more than a stiff one, then rounds out.
+    #[test]
+    fn an_elastic_crash_keeps_momentum_dents_and_rounds_out() {
+        let run = |e: f32| {
+            let mut cl = game_like();
+            cl.opt.drag.enabled = false;
+            cl.opt.elastic = e;
+            cl.opt.el_damp = 10.0;
+            let a = cl.add_creature(&hex_design(3, 7.0, Vector2::new(-60.0, 0.0)), &vec![7.0; 37], &vec![0; 37]);
+            let b = cl.add_creature(&hex_design(3, 7.0, Vector2::new(60.0, 5.0)), &vec![7.0; 37], &vec![0; 37]);
+            for i in 0..37 {
+                cl.bodies[a].vel[i] = Vector2::new(600.0, 0.0);
+                cl.bodies[b].vel[i] = Vector2::new(-600.0, 0.0);
+            }
+            let m0 = cl.momentum();
+            let side = cl.bodies[a].velocity().x as f64 * cl.bodies[a].total_mass() as f64;
+            let mut peak = 0.0f32;
+            let mut inside = 0.0f32;
+            for _ in 0..90 {
+                cl.step(DT);
+                peak = peak.max(cl.bodies[a].shape_error());
+                inside = inside.max(cl.health()[1]);
+            }
+            let m1 = cl.momentum();
+            for _ in 0..90 {
+                cl.step(DT);
+            }
+            (peak, cl.bodies[a].shape_error(), ((m1[0] - m0[0]).abs() + (m1[1] - m0[1]).abs()) / side, inside, cl.health()[7])
+        };
+        let stiff = run(0.0);
+        let soft = run(0.75);
+        println!("stiff: peak shape error {:.3}, after {:.4}, momentum drift {:.2e}; elastic 0.75: {:.3}, {:.4}, momentum drift {:.2e} of one side's, inside {}", stiff.0, stiff.1, stiff.2, soft.0, soft.1, soft.2, soft.3);
+        assert!(soft.0 > 3.0 * stiff.0, "the elastic blob deforms more");
+        assert!(soft.1 < 0.02, "and rounds out: {}", soft.1);
+        assert!(soft.2 < 1e-4, "momentum kept: {}", soft.2);
+        assert_eq!(soft.3, 0.0, "no cell inside the other");
+        assert_eq!(soft.4, 0.0, "finite");
+    }
+
+    /// The head-led turn: no net force, the angular momentum (and so the spin) driven to
+    /// the target as the rigid turn's, a long body bent into the turn, a round one not led.
+    #[test]
+    fn a_head_led_turn_is_a_couple_that_bends_a_long_body() {
+        let run = |lead: f32, long: i32| {
+            let mut cl = game_like();
+            cl.opt.drag.enabled = false;
+            cl.opt.elastic = 0.6;
+            let c = if long > 0 { worm(&mut cl, long, Vector2::ZERO) } else { cl.add_creature(&hex_design(3, 7.0, Vector2::ZERO), &vec![7.0; 37], &vec![0; 37]) };
+            let b = &mut cl.bodies[c];
+            b.servo = SpinServo { on: true, target: 3.0, max_acc: 40.0, lead, ..Default::default() };
+            let m0 = b.velocity();
+            let mut bend = 0.0f32;
+            for _ in 0..20 {
+                cl.step(DT);
+                bend = bend.max(cl.bodies[c].shape_error());
+            }
+            let b = &cl.bodies[c];
+            (b.velocity() - m0, b.spin(), bend, b.servo.lead_used)
+        };
+        let rigid = run(0.0, 24);
+        let led = run(1.0, 24);
+        let blob = run(1.0, 0);
+        println!("worm rigid: spin {:.3} shape {:.3}; led: spin {:.3} shape {:.3} lead {:.2}, v {:?}; blob lead {:.2}", rigid.1, rigid.2, led.1, led.2, led.3, led.0, blob.3);
+        assert!(led.0.length() < 0.05, "no net force: {:?}", led.0);
+        assert!((led.1 - 3.0).abs() < 0.15 && (rigid.1 - 3.0).abs() < 0.15, "both reach the target spin");
+        assert!(led.2 > 3.0 * rigid.2, "the led worm bends");
+        assert!((led.3 - 1.0).abs() < 1e-6);
+        assert_eq!(blob.3, 0.0, "a round blob has no head to lead");
+    }
+
+    #[test]
+    fn threaded_equals_serial_with_elasticity_and_a_head_led_turn() {
+        let run = |threads: usize| {
+            let mut cl = crash_world(threads);
+            cl.opt.drag.enabled = true;
+            cl.opt.elastic = 0.7;
+            cl.opt.el_damp = 20.0;
+            cl.opt.types[0].elastic = 1.0;
+            for (k, b) in cl.bodies.iter_mut().enumerate() {
+                b.servo = SpinServo { on: true, target: if k % 2 == 0 { 3.0 } else { -2.0 }, max_acc: 30.0, lead: 0.2 * k as f32, axis: Vector2::new(1.0, 0.3), ..Default::default() };
+                if k == 2 {
+                    b.el_own_set = true;
+                    b.el_own = 0.3;
+                }
+            }
+            let w = worm(&mut cl, 16, Vector2::new(200.0, -300.0));
+            cl.bodies[w].servo = SpinServo { on: true, target: 2.0, max_acc: 20.0, lead: 1.0, ..Default::default() };
+            for f in 0..120 {
+                cl.step(DT);
+                if f == 60 {
+                    cl.add_cell(0, cl.bodies[0].pos[0] + Vector2::new(-14.0, 0.0), 7.0, 0);
+                }
+            }
+            cl.state_hash()
+        };
+        let a = run(1);
+        assert_eq!(a, run(4));
+        assert_eq!(a, run(0));
+        assert_eq!(a, run(1), "a replay");
+    }
+}
