@@ -72,6 +72,14 @@ pub const BODY_DEFAULT: u8 = 255;
 /// the area error taken back a substep (`Opt::el_area`).
 pub const ELASTIC_SOFT: f32 = 0.01;
 pub const ELASTIC_AREA: f32 = 0.3;
+/// Elastic bodies: how far an elastic cell's links may be stretched (`Opt::el_limit`): little,
+/// so a spun or pulled creature is not drawn out (a worm spun at 7 rad/s stretched 30-60 %
+/// without it) ...
+pub const ELASTIC_LIMIT: f32 = 0.08;
+/// ... and squeezed (`Opt::el_squeeze`): more, so a dent can press cells together.
+pub const ELASTIC_SQUEEZE: f32 = 0.15;
+/// ... up to this elasticity; beyond it both bounds widen toward jelly.
+pub const ELASTIC_JELLY: f32 = 0.7;
 
 #[inline]
 fn rot(v: Vector2, c: f32, s: f32) -> Vector2 {
@@ -262,6 +270,10 @@ pub struct Opt {
     /// An elastic creature keeps its area: its outline's area pulled toward the design's by
     /// this share a substep × its mean elasticity (0: not kept).
     pub el_area: f32,
+    /// An elastic cell's links never stretch past `el_limit` of their rest length nor
+    /// squeeze past `el_squeeze` (soft within, stiff beyond; 0: no limit that way).
+    pub el_limit: f32,
+    pub el_squeeze: f32,
 }
 
 impl Default for Opt {
@@ -309,6 +321,8 @@ impl Default for Opt {
             el_soft: ELASTIC_SOFT,
             el_damp: 0.0,
             el_area: ELASTIC_AREA,
+            el_limit: ELASTIC_LIMIT,
+            el_squeeze: ELASTIC_SQUEEZE,
         }
     }
 }
@@ -1928,7 +1942,9 @@ impl Body {
         if dw == 0.0 {
             return;
         }
-        if sv.lead > 0.0 && self.rest_local.len() == n {
+        // Head-led only while the turn speeds up toward its target; braking (and holding)
+        // is the rigid turn's, so the head is not stopped while the tail still swings on.
+        if sv.lead > 0.0 && self.rest_local.len() == n && dw * target > 0.0 && dw * spin >= 0.0 {
             self.lead_turn(c, dw, inertia);
             return;
         }
@@ -2263,6 +2279,41 @@ impl Body {
         }
     }
 
+    /// Elastic bodies' strain limit: a link of an elastic cell stretched past `lim` of its
+    /// rest length, or squeezed past `squeeze`, is put back to that bound at once (a hard correction by the
+    /// two cells' inverse masses, counted in its load): soft within it, stiff beyond, so a
+    /// creature bends and dents but is not drawn out by a spin or a pull.
+    fn limit_strain(&mut self, lim: f32, squeeze: f32, inv_s: f32) {
+        for k in 0..self.links.len() {
+            let l = self.links[k];
+            let (i, j) = (l.i as usize, l.j as usize);
+            let e = 0.5 * (self.elast[i] + self.elast[j]);
+            if e <= 0.0 {
+                continue;
+            }
+            let d = self.pos[j] - self.pos[i];
+            let len = d.length();
+            if len < 1e-7 {
+                continue;
+            }
+            // Past ELASTIC_JELLY the bounds widen (the stretch to 4 ×, the squeeze to 2 × at
+            // elasticity 1): a jelly that can squeeze through a gap, and is drawn out by a spin.
+            let f = 1.0 + 3.0 * ((e - ELASTIC_JELLY) / (1.0 - ELASTIC_JELLY)).clamp(0.0, 1.0);
+            let lo = if squeeze > 0.0 { l.rest * (1.0 - (squeeze * f.min(2.0)).min(0.9)) } else { 0.0 };
+            let hi = if lim > 0.0 { l.rest * (1.0 + lim * f) } else { f32::INFINITY };
+            let to = len.clamp(lo, hi);
+            if to == len {
+                continue;
+            }
+            let ws = self.w[i] + self.w[j];
+            let dl = (to - len) / ws;
+            let p = d * (dl / len);
+            self.pos[j] += p * self.w[j];
+            self.pos[i] -= p * self.w[i];
+            self.links[k].f_frame += dl.abs() * inv_s;
+        }
+    }
+
     /// Elastic bodies' dashpots: each link's relative velocity along it decays by
     /// exp(−rate × e × h) (e the link's elasticity), as an impulse between its two cells: no
     /// net force, no torque (along the link), a rigid turn untouched.
@@ -2278,12 +2329,13 @@ impl Body {
             if l2 < 1e-10 {
                 continue;
             }
-            let u = d / l2.sqrt();
-            let rv = dot(self.vel[j] - self.vel[i], u);
+            // The relative velocity less what the pair's turn (its cells' spins, which a
+            // shape-matched cell takes from its neighbourhood's fit) gives it.
+            let rv = self.vel[j] - self.vel[i] - perp(d) * (0.5 * (self.om[i] + self.om[j]));
             let ws = self.w[i] + self.w[j];
-            let imp = rv * (1.0 - (-rate * e * h).exp()) / ws;
-            self.vel[i] += u * (imp * self.w[i]);
-            self.vel[j] -= u * (imp * self.w[j]);
+            let imp = rv * ((1.0 - (-rate * e * h).exp()) / ws);
+            self.vel[i] += imp * self.w[i];
+            self.vel[j] -= imp * self.w[j];
         }
     }
 
@@ -2437,6 +2489,13 @@ impl Body {
                     let here = self.pos[c] - base;
                     self.pos[c] += (gp - here) * kk;
                 }
+            }
+        }
+        if (opt.el_limit > 0.0 || opt.el_squeeze > 0.0) && self.elast.len() == n && self.el_mean > 0.0 {
+            // Two passes: a long chain pulled by its ends (a spin) passes a correction on
+            // slowly; the second takes its worst strain from 17 % to 14 % in a spun worm.
+            for _ in 0..2 {
+                self.limit_strain(opt.el_limit, opt.el_squeeze, inv_s);
             }
         }
         if opt.el_area > 0.0 && self.elast.len() == n && self.el_mean > 0.0 && self.el_area0 != 0.0 {
@@ -5005,7 +5064,7 @@ mod elastic_tests {
         let stiff = run(0.0);
         let soft = run(0.75);
         println!("stiff: peak shape error {:.3}, after {:.4}, momentum drift {:.2e}; elastic 0.75: {:.3}, {:.4}, momentum drift {:.2e} of one side's, inside {}", stiff.0, stiff.1, stiff.2, soft.0, soft.1, soft.2, soft.3);
-        assert!(soft.0 > 3.0 * stiff.0, "the elastic blob deforms more");
+        assert!(soft.0 > 2.0 * stiff.0, "the elastic blob deforms more");
         assert!(soft.1 < 0.02, "and rounds out: {}", soft.1);
         assert!(soft.2 < 1e-4, "momentum kept: {}", soft.2);
         assert_eq!(soft.3, 0.0, "no cell inside the other");

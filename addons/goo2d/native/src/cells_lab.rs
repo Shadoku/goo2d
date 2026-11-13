@@ -109,12 +109,13 @@ fn cfgs() -> Vec<(String, Cfg)> {
     let mut v: Vec<(String, Cfg)> = Vec::new();
     for part in spec.split(';') {
         let x: Vec<f32> = part.split(',').map(|t| t.trim().parse().unwrap()).collect();
-        let name = format!("e{} k{} b{} s{} d{} a{}", x[0], x[1], x[2], x[3], x[4], x.get(5).copied().unwrap_or(0.0));
+        let name = format!("e{} lim{:?}", x[0], &x[6.min(x.len())..]);
         v.push((name, Box::new(move |c: &mut Cells| {
             c.opt.elastic = x[0];
             c.opt.el_soft = x[1];
             c.opt.el_damp = x[4];
             c.opt.el_area = x.get(5).copied().unwrap_or(ELASTIC_AREA);
+            c.opt.el_limit = x.get(6).copied().unwrap_or(ELASTIC_LIMIT);
         })));
     }
     v
@@ -329,6 +330,8 @@ fn lab_turn() {
             for &(angle, swim) in &[(std::f32::consts::PI, 0.0f32), (std::f32::consts::PI, 1.0), (std::f32::consts::FRAC_PI_2, 1.0)] {
                 let mut cl = game();
                 cl.opt.elastic = x[0];
+                cl.opt.el_limit = x.get(2).copied().unwrap_or(ELASTIC_LIMIT);
+                cl.opt.el_damp = x.get(5).copied().unwrap_or(0.0);
 
                 let c = if rings > 0 { blob_at(&mut cl, Vector2::ZERO, rings, r, 0) } else { worm_at(&mut cl, Vector2::ZERO, long, wide, r) };
                 let size = { let b = &cl.bodies[c]; extent(b, Vector2::new(1.0, 0.0)) };
@@ -351,6 +354,8 @@ fn lab_turn() {
                 let (mut t_face, mut over, mut bmax, mut dev) = (-1.0f32, 0.0f32, 0.0f32, 0.0f32);
                 let mut head_first = 0.0f32;
                 let mut late = 0.0f32;
+                let mut smax = 0.0f32;
+                let mut whip = 0.0f32;
                 for k in 0..150 {
                     let b = &mut cl.bodies[c];
                     let tr = b.turn_against_rest();
@@ -367,6 +372,8 @@ fn lab_turn() {
                     if t_face >= 0.0 { over = over.max(-e2 * angle.signum()); }
                     let bd = bend(b);
                     bmax = bmax.max(bd.abs());
+                    whip = whip.min(bd * angle.signum());
+                    smax = smax.max(cl.health()[3]);
                     if k < 10 { head_first = head_first.max(bd * angle.signum()); }
                     // The centre's path off the straight line it was on.
                     let p = b.center() - c0;
@@ -374,8 +381,82 @@ fn lab_turn() {
                     dev = dev.max(cross(vn, p).abs());
                 }
                 let lu = cl.bodies[c].servo.lead_used;
-                println!("e{} lead{} {:6} {:3.0}° swim{} T{:.2}: face {:.2}s over {:4.1}° end err {:5.2}° bend max {:5.1}° early {:+5.1}° path off {:5.1}px lead_used {:.2} {}", x[0], x[1], name, angle.to_degrees(), swim, tt, t_face, over.to_degrees(), late.to_degrees(), bmax.to_degrees(), head_first.to_degrees(), dev, lu, soundness(&cl));
+                println!("e{} lead{} {:6} {:3.0}° swim{} T{:.2}: face {:.2}s over {:4.1}° end err {:5.2}° bend max {:5.1}° whip {:5.1}° early {:+5.1}° path off {:5.1}px strain {:.3} lead_used {:.2} {}", x[0], x[1], name, angle.to_degrees(), swim, tt, t_face, over.to_degrees(), late.to_degrees(), bmax.to_degrees(), whip.to_degrees(), head_first.to_degrees(), dev, smax, lu, soundness(&cl));
             }
         }
     }
+}
+
+/// Where the worst strain is in a worm's servo turn at elasticity 0.65.
+#[test]
+#[ignore]
+fn lab_turn_strain() {
+    for &(e, passes) in &[(0.0f32, 1usize), (0.65, 2)] {
+        let mut cl = game();
+        cl.opt.elastic = e;
+        let c = worm_at(&mut cl, Vector2::ZERO, 24, 5, 7.0);
+        let b = &mut cl.bodies[c];
+        b.servo = SpinServo { on: true, target: 7.2, max_acc: 217.0, ..Default::default() };
+        let mut worst = (0.0f32, 0usize, 0usize, 0usize);
+        for k in 0..30 {
+            cl.step(DT);
+            let b = &cl.bodies[c];
+            for l in &b.links {
+                let s = (b.pos[l.j as usize] - b.pos[l.i as usize]).length() / l.rest - 1.0;
+                if s.abs() > worst.0.abs() {
+                    worst = (s, l.i as usize, l.j as usize, k);
+                }
+            }
+        }
+        let b = &cl.bodies[c];
+        let mut hist = [0usize; 6];
+        for l in &b.links {
+            let s = ((b.pos[l.j as usize] - b.pos[l.i as usize]).length() / l.rest - 1.0).abs();
+            let k = if s < 0.01 { 0 } else if s < 0.03 { 1 } else if s < 0.1 { 2 } else if s < 0.3 { 3 } else if s < 0.6 { 4 } else { 5 };
+            hist[k] += 1;
+        }
+        println!("passes {} e{} worst strain {:.3} link {}-{} (rest {:?} {:?}, boundary {} {}) frame {}; spinning at end: strain histogram <1%,<3%,<10%,<30%,<60%,more {:?}; rest of that link {:.2} design {:.2}", passes, e, worst.0, worst.1, worst.2, b.rest_local[worst.1], b.rest_local[worst.2], b.boundary[worst.1], b.boundary[worst.2], worst.3, hist, b.links.iter().find(|l| l.i as usize == worst.1 && l.j as usize == worst.2).map(|l| l.rest).unwrap_or(0.0), b.links.iter().find(|l| l.i as usize == worst.1 && l.j as usize == worst.2).map(|l| l.d_design).unwrap_or(0.0));
+    }
+}
+
+#[test]
+#[ignore]
+fn lab_turn_series() {
+    let mut cl = game();
+    cl.opt.elastic = 0.65;
+    cl.opt.el_limit = 0.06;
+    let c = worm_at(&mut cl, Vector2::ZERO, 24, 5, 7.0);
+    cl.opt.el_damp = std::env::var("DAMP").map(|s| s.parse().unwrap()).unwrap_or(0.0);
+    let lead: f32 = std::env::var("LEAD").map(|s| s.parse().unwrap()).unwrap_or(1.0);
+    cl.bodies[c].servo = SpinServo { on: true, target: 0.0, max_acc: 217.0, lead, ..Default::default() };
+    let goal = std::f32::consts::PI;
+    let mut cont = 0.0f32;
+    for k in 0..60 {
+        let b = &mut cl.bodies[c];
+        let tr = if std::env::var("HEAD").is_ok() { head_turn(b) } else { b.turn_against_rest() };
+        let mut d = tr - cont;
+        while d > std::f32::consts::PI { d -= std::f32::consts::TAU; }
+        while d < -std::f32::consts::PI { d += std::f32::consts::TAU; }
+        cont += d;
+        b.servo.target = spin_toward(goal - cont, 7.2, 0.8 * 217.0, DT);
+        if std::env::var("FREE").is_ok() && k >= 28 { b.servo.on = false; b.servo.target = 0.0; if k == 28 { let c0 = b.center(); let v0 = b.velocity(); let w = b.spin(); for i in 0..b.n { let p = b.pos[i] - c0; b.vel[i] -= Vector2::new(-p.y, p.x) * w; let _ = v0; } } }
+        cl.step(DT);
+        let b = &cl.bodies[c];
+        if k % 2 == 0 {
+            println!("t {:.3} turn {:6.1}° spin {:5.2} target {:5.2} bend {:6.1}°", (k + 1) as f32 * DT, cont.to_degrees(), b.spin(), b.servo.target, bend(b).to_degrees());
+        }
+    }
+}
+
+/// The best-fit turn of the front half (design x above the middle) against the design.
+pub fn head_turn(b: &Body) -> f32 {
+    let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+    for i in 0..b.n { lo = lo.min(b.rest_local[i].x); hi = hi.max(b.rest_local[i].x); }
+    let mid = 0.5 * (lo + hi);
+    let (mut c, mut q0, mut m) = (Vector2::ZERO, Vector2::ZERO, 0.0f32);
+    for i in 0..b.n { if b.rest_local[i].x > mid { c += b.pos[i]; q0 += b.rest_local[i]; m += 1.0; } }
+    c /= m; q0 /= m;
+    let (mut sc, mut ss) = (0.0f32, 0.0f32);
+    for i in 0..b.n { if b.rest_local[i].x > mid { let p = b.pos[i] - c; let q = b.rest_local[i] - q0; sc += dot(q, p); ss += cross(q, p); } }
+    ss.atan2(sc)
 }

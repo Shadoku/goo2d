@@ -1988,7 +1988,8 @@ impl GooCells {
     /// plastic_yield, plastic_rate, plastic_recover, break_force, break_torque, break_smooth,
     /// link_tol, max_speed, density, ease_time, ease_from; elastic bodies (cells.rs'
     /// `Opt::elastic`): elastic (0..1, 0 off), elastic_soft (every stiffness × this at
-    /// elasticity 1), elastic_damping (1/s), elastic_area (the share of the area kept).
+    /// elasticity 1), elastic_damping (1/s), elastic_area (the share of the area kept),
+    /// elastic_stretch_limit and elastic_squeeze_limit (the links' strain bounds).
     #[func]
     fn set_options(&mut self, options: VarDictionary) {
         let mut colliders = false;
@@ -2052,6 +2053,8 @@ impl GooCells {
                 "elastic_soft" => o.el_soft = (x as f32).clamp(1e-4, 1.0),
                 "elastic_damping" => o.el_damp = (x as f32).max(0.0),
                 "elastic_area" => o.el_area = (x as f32).clamp(0.0, 1.0),
+                "elastic_stretch_limit" => o.el_limit = (x as f32).max(0.0),
+                "elastic_squeeze_limit" => o.el_squeeze = (x as f32).clamp(0.0, 0.9),
                 _ => godot_error!("GooCells: unknown option {}", name),
             }
         }
