@@ -317,8 +317,8 @@ func set_spin_servo(target_spin: float, max_angular_acceleration: float, max_tip
 ## Head-led turning (docs/cells.md, "Head-led turning"): the spin servo's turn given to the
 ## head first, the rest following through the body's elasticity and the water. `lead` 0..1:
 ## 0 (the default) the rigid turn; 1 only the front half driven. The change of velocity
-## each cell gets is weighted (1 − lead) + lead × h, h 0 over the back half of the design
-## along its forward (`axis`) and rising smoothly to 1 at the nose; its net force is taken
+## each cell gets is weighted (1 − lead) + lead × t², t 0 at the design's tail along its
+## forward (`axis`) and 1 at its nose, so it arcs nose to tail; its net force is taken
 ## back evenly from every cell (no net force: a couple) and it is scaled so the creature's
 ## angular momentum changes exactly as the rigid turn's, so the servo's target spin,
 ## acceleration, tip cap and contact yield keep their meaning. A compact design has no

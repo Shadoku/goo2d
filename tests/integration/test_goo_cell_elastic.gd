@@ -467,3 +467,45 @@ func test_a_crash_at_600_px_s_each_stays_sound() -> void:
 		await _clear([w])
 	for r: String in rows:
 		print("    " + r)
+
+## A blob whose front rim is spikes, thrown at 600 px/s at a resting 37-cell blob: whether an
+## elastic body still carries the blow through its spikes (the closing speed of the first tip
+## hit, the target's speed after it, the spiked blob's own dent behind its spikes).
+func test_spike_hits_carry_through_an_elastic_body() -> void:
+	var rows: Array[String] = []
+	var knocked: Dictionary = {}
+	for e: float in LEVELS:
+		var w := _world(e)
+		var spike := GooCellType.new()
+		spike.tip_length = 2.0
+		spike.tip_radius = 0.3
+		var d := GooCellDesign.hex_blob(3, R)
+		d.types = [GooCellType.new(), spike]
+		d.angles.resize(d.cell_count())
+		for i: int in d.cell_count():
+			if d.positions[i].x > 2.5 * R and absf(d.positions[i].y) < 2.0 * R:
+				d.cell_types[i] = 1
+				d.angles[i] = 0.0
+		var a := w.spawn(d, Transform2D(0.0, Vector2(700, 500)))
+		var b := w.spawn(GooCellDesign.hex_blob(3, R), Transform2D(0.0, Vector2(930, 500)))
+		var rest := rest_of(a)
+		a.set_contact_tracking(true)
+		await _frames(1)
+		a.set_velocity(Vector2(600, 0))
+		var hit := -1.0
+		var fastest := 0.0
+		var deep := 0.0
+		for f: int in 60:
+			await get_tree().physics_frame
+			for c: Dictionary in a.contacts():
+				if c["tip"] and hit < 0.0:
+					hit = c["speed"]
+			fastest = maxf(fastest, b.velocity().x)
+			deep = maxf(deep, dent(a, rest).x)
+		knocked[e] = fastest
+		rows.append("elasticity %.2f: the spikes first hit at %.0f px/s closing, the target knocked to %.0f px/s, the spiked blob %.1f px off its design at most" % [e, hit, fastest, deep])
+		assert_gt(hit, 0.0, "a tip made the hit")
+		await _clear([w])
+	for r: String in rows:
+		print("    " + r)
+	assert_gt(knocked[0.65], 0.7 * knocked[0.0], "an elastic spiked body carries most of the blow")

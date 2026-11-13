@@ -30,6 +30,8 @@ extends SceneTree
 ## --servo=1: every creature turns toward its point by the spin servo (set_spin_servo(), a
 ## yield of 0.3 and a tip cap of 600 px/s, the target set every frame by spin_toward() of
 ## its heading error, at most 3 rad/s and 12 rad/s²), the swimmers' wave unbent.
+## --elastic=E: the world's elasticity (docs/cells.md "Elastic bodies"; 0 off, the default);
+## --lead=L: with --servo=1, head-led turning at that lead (set_turn_lead()).
 ## --thrust=F: every 1/F-th cell a thruster (max_thrust 600 px/s² at unit 1, facings spread
 ## round), their levels set every frame toward the creature's point (max(0, cos) of facing
 ## and way, one set_thrust_levels() per creature, outside the timing); --spikes=F: every
@@ -146,6 +148,7 @@ func _bench() -> void:
 	var m := int(o("cells", 150))
 	var swim := String(o("mode", "collide")) == "swim"
 	var servo := int(o("servo", 0)) != 0
+	w.elasticity = float(o("elastic", 0.0))
 	var rng := RandomNumberGenerator.new()
 	rng.seed = int(o("seed", 1))
 	var design := _design(swim, m)
@@ -245,6 +248,8 @@ func _bench() -> void:
 			if servo:
 				if f == 0:
 					cr.set_spin_servo(0.0, 12.0, 600.0, 0.3)
+					if float(o("lead", 0.0)) > 0.0:
+						cr.set_turn_lead(float(o("lead", 0.0)))
 				var err := wrapf(to.angle() - cr.heading().angle(), -PI, PI)
 				cr.set_spin_target(GooCellCreature.spin_toward(err, 3.0, 0.8 * 12.0, 1.0 / 60.0))
 			if float(o("thrust", 0.0)) > 0.0:
@@ -331,7 +336,7 @@ func _bench() -> void:
 		print("  %d rings, coupled %s: ring world step median %.2f ms, p95 %.2f; both worlds median %.2f ms, p95 %.2f; the coupling inside the cells' step median %.3f ms (broad phase %.3f), p95 %.3f; rings touched per frame %.1f, candidate pairs %.0f (beads %.0f)" % [
 			ring_count, w.coupled_world() != null, ring_times[cnt / 2], ring_times[cnt * 95 / 100], both[cnt / 2], both[cnt * 95 / 100], couple_us[cnt / 2], broad_us[cnt / 2], couple_us[cnt * 95 / 100], float(touched) / cnt, float(pairs) / cnt, float(bead_pairs) / cnt])
 		print("RINGS rings=%d coupled=%s ring_median=%.2f both_median=%.2f both_p95=%.2f couple_median=%.3f" % [ring_count, w.coupled_world() != null, ring_times[cnt / 2], both[cnt / 2], both[cnt * 95 / 100], couple_us[cnt / 2]])
-	print("RESULT n=%d m=%d mode=%s body=%s threads=%d proxies=%s servo=%d median=%.2f p95=%.2f inside=%d" % [n, design.cell_count(), "swim" if swim else "collide", String(o("body", "shape")), w.threads, proxies, int(servo), med, p95, int(worst[1])])
+	print("RESULT n=%d m=%d mode=%s body=%s threads=%d proxies=%s servo=%d elastic=%.2f median=%.2f p95=%.2f inside=%d" % [n, design.cell_count(), "swim" if swim else "collide", String(o("body", "shape")), w.threads, proxies, int(servo), w.elasticity, med, p95, int(worst[1])])
 
 func _swim_test() -> void:
 	var w := _world()

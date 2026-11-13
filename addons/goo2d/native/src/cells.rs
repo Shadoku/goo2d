@@ -508,8 +508,8 @@ pub struct SpinServo {
     pub capped: f32,
     pub scale: f32,
     /// Head-led turning (0: the rigid turn above, exactly): the turn's change of velocity
-    /// weighted toward the head, w = (1 − lead) + lead × h (h 0 over the back half of the
-    /// design along `axis`, rising to 1 at the nose), the lead scaled down for a compact
+    /// weighted toward the head, w = (1 − lead) + lead × t² (t 0 at the design's tail along
+    /// `axis`, 1 at its nose), the lead scaled down for a compact
     /// design (`lead_used`: × 0 at an aspect of LEAD_ASPECT_MIN, × 1 from LEAD_ASPECT_FULL),
     /// its net force taken back evenly and its size set so the creature's angular momentum
     /// changes as the rigid turn's would; the rest follows through the body.
@@ -1985,11 +1985,12 @@ impl Body {
         if self.cs.len() < n {
             self.cs.resize(n, (0.0, 0.0));
         }
-        // Weights (in cs.0): 1 − lead behind the middle, rising smoothly to 1 at the nose.
+        // Weights (in cs.0): (1 − lead) + lead × t², t 0 at the tail to 1 at the nose, so
+        // the body arcs from nose to tail rather than kinking at one place.
         let (mut iw, mut m, mut f) = (0.0f32, 0.0f32, Vector2::ZERO);
         for i in 0..n {
-            let t = ((dot(self.rest_local[i], ax) - umin) / span * 2.0 - 1.0).clamp(0.0, 1.0);
-            let hd = t * t * (3.0 - 2.0 * t);
+            let t = ((dot(self.rest_local[i], ax) - umin) / span).clamp(0.0, 1.0);
+            let hd = t * t;
             let w = (1.0 - lead) + lead * hd;
             self.cs[i].0 = w;
             let p = self.pos[i] - c;

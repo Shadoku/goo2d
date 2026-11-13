@@ -1,0 +1,84 @@
+[gd_scene format=3]
+
+[ext_resource type="Script" path="res://examples/elastic/elastic.gd" id="1_scene"]
+[ext_resource type="Script" path="res://addons/goo2d/goo_cell_world_2d.gd" id="2_world"]
+[ext_resource type="Shader" path="res://assets/shaders/backdrop.gdshader" id="3_backdrop"]
+
+[sub_resource type="ShaderMaterial" id="ShaderMaterial_backdrop"]
+shader = ExtResource("3_backdrop")
+
+[sub_resource type="RectangleShape2D" id="RectangleShape2D_horizontal"]
+size = Vector2(1840, 40)
+
+[sub_resource type="RectangleShape2D" id="RectangleShape2D_vertical"]
+size = Vector2(40, 1000)
+
+[sub_resource type="RectangleShape2D" id="RectangleShape2D_divider"]
+size = Vector2(1800, 20)
+
+[sub_resource type="RectangleShape2D" id="RectangleShape2D_centre"]
+size = Vector2(20, 960)
+
+[node name="Elastic" type="Node2D"]
+script = ExtResource("1_scene")
+
+[node name="Backdrop" type="ColorRect" parent="."]
+top_level = true
+z_index = -1
+material = SubResource("ShaderMaterial_backdrop")
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+mouse_filter = 2
+color = Color(0.05, 0.08, 0.12, 1)
+
+[node name="Walls" type="StaticBody2D" parent="."]
+collision_mask = 0
+
+[node name="Top" type="CollisionShape2D" parent="Walls"]
+position = Vector2(960, 40)
+shape = SubResource("RectangleShape2D_horizontal")
+
+[node name="Bottom" type="CollisionShape2D" parent="Walls"]
+position = Vector2(960, 1040)
+shape = SubResource("RectangleShape2D_horizontal")
+
+[node name="Left" type="CollisionShape2D" parent="Walls"]
+position = Vector2(40, 540)
+shape = SubResource("RectangleShape2D_vertical")
+
+[node name="Right" type="CollisionShape2D" parent="Walls"]
+position = Vector2(1880, 540)
+shape = SubResource("RectangleShape2D_vertical")
+
+[node name="Middle" type="CollisionShape2D" parent="Walls"]
+position = Vector2(960, 540)
+shape = SubResource("RectangleShape2D_divider")
+
+[node name="Centre" type="CollisionShape2D" parent="Walls"]
+position = Vector2(960, 540)
+shape = SubResource("RectangleShape2D_centre")
+
+[node name="Visual" type="Polygon2D" parent="Walls"]
+color = Color(0.2, 0.24, 0.3, 1)
+polygon = PackedVector2Array(0, 0, 1920, 0, 1920, 1080, 0, 1080, 0, 60, 60, 60, 60, 1020, 1860, 1020, 1860, 60, 0, 60)
+
+[node name="World" type="Node2D" parent="."]
+script = ExtResource("2_world")
+gravity_scale = 0.0
+
+[node name="Dividers" type="Polygon2D" parent="Walls"]
+color = Color(0.2, 0.24, 0.3, 1)
+polygon = PackedVector2Array(60, 530, 950, 530, 950, 60, 970, 60, 970, 530, 1860, 530, 1860, 550, 970, 550, 970, 1020, 950, 1020, 950, 550, 60, 550)
+
+[node name="UI" type="CanvasLayer" parent="."]
+
+[node name="Label" type="Label" parent="UI"]
+offset_left = 90.0
+offset_top = 70.0
+offset_right = 1830.0
+offset_bottom = 120.0
+theme_override_font_sizes/font_size = 18
+text = "Elastic bodies (elasticity 0.65): a blob dents on the wall · a worm bends round a blow · ships turning head-led (left) and as a stick (right) · jelly squeezing through a gap"
