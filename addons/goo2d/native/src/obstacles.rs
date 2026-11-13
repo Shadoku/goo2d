@@ -276,7 +276,7 @@ impl Body {
             let excess = dot(delta, n) * inv_h - jn * self.w[c];
             self.pred[c] += n * (excess * h);
             if self.records() {
-                let speed = -dot((self.pos[c] - self.prev[c]) * inv_h - w.velocity_at(point, inv_h), n);
+                let speed = -dot(self.vel[c] - w.velocity_at(point, inv_h), n);
                 self.touch(c, Hit::thing(crate::cells::TOUCH_OBSTACLE, w.id, n, speed, jn, point));
             }
             self.pos[c] = p;
@@ -345,7 +345,7 @@ impl Body {
             let n = d / dl;
             let lam = dl / self.tip_w(c, at, n);
             let point = p - n * rt;
-            let speed = -dot((at - from) * inv_h - w.velocity_at(point, inv_h), n);
+            let speed = -dot(self.point_vel(c, at) - w.velocity_at(point, inv_h), n);
             self.push_at(c, at, n, lam);
             self.contact = true;
             if self.records() {

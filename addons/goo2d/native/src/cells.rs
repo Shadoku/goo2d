@@ -1662,6 +1662,13 @@ impl Body {
         (p + Vector2::new(a.cos(), a.sin()) * (tp.tip_len * r), tp.tip_rad * r)
     }
 
+    /// The velocity of a point fixed in cell i (its tip) this substep before its contacts:
+    /// the cell's predicted velocity and its frame's spin.
+    #[inline]
+    pub fn point_vel(&self, i: usize, point: Vector2) -> Vector2 {
+        self.vel[i] + perp(point - self.pos[i]) * self.om[i]
+    }
+
     /// The rigid cluster a push on cell i's tip moves: the cell and its linked neighbours
     /// (mass, centre, moment about it with the discs' own).
     #[inline]
@@ -2226,7 +2233,7 @@ impl Body {
                     let d = p - self.pos[c];
                     let dl = lsq(d).sqrt();
                     let n = d / dl;
-                    let speed = -dot(self.pos[c] - self.prev[c], n) / h;
+                    let speed = -dot(self.vel[c], n);
                     self.touch(c, Hit::thing(TOUCH_WALL, w.id, n, speed, self.mass[c] * dl / h, p - n * self.r[c]));
                 }
                 self.pos[c] = p;
@@ -2254,10 +2261,10 @@ impl Body {
             }
             let n = d / dl;
             let lam = dl / self.tip_w(c, at, n);
+            let speed = -dot(self.point_vel(c, at), n);
             self.push_at(c, at, n, lam);
             self.contact = true;
             if rec {
-                let speed = -dot(at - from, n) / h;
                 self.touch(c, Hit { tip: TIP_SELF, ..Hit::thing(TOUCH_WALL, w.id, n, speed, lam / h, p - n * rt) });
             }
         }
@@ -2357,7 +2364,7 @@ fn solve_cross(bodies: &mut [Body], cr: &[Cross], opt: &Opt, h: f32) {
             let p = d * (dl / l);
             let (ra, rb) = (a.records(), b.records());
             let n = d / l;
-            let speed = if ra || rb { dot((a.pos[ai] - a.prev[ai]) - (b.pos[bi] - b.prev[bi]), n) / h } else { 0.0 };
+            let speed = dot(a.vel[ai] - b.vel[bi], n);
             a.pos[ai] -= p * a.w[ai];
             b.pos[bi] += p * b.w[bi];
             a.contact = true;
@@ -2391,12 +2398,7 @@ fn solve_cross(bodies: &mut [Body], cr: &[Cross], opt: &Opt, h: f32) {
             let we = (1.0 - t) * (1.0 - t) * b.w[p] + t * t * b.w[q];
             let dl = pen / ((a.w[ai] + we) * (1.0 + kc));
             let (ra, rb) = (a.records(), b.records());
-            let speed = if ra || rb {
-                let ve = (b.pos[p] - b.prev[p]) * (1.0 - t) + (b.pos[q] - b.prev[q]) * t;
-                -dot((a.pos[ai] - a.prev[ai]) - ve, nrm) / h
-            } else {
-                0.0
-            };
+            let speed = -dot(a.vel[ai] - (b.vel[p] * (1.0 - t) + b.vel[q] * t), nrm);
             a.pos[ai] += nrm * (dl * a.w[ai]);
             b.pos[p] -= nrm * (dl * (1.0 - t) * b.w[p]);
             b.pos[q] -= nrm * (dl * t * b.w[q]);
@@ -2473,7 +2475,9 @@ fn solve_tip_pair(a: &mut Body, b: &mut Body, x: &Cross, opt: &Opt, kc: f32, h: 
     }
     let dl = pen / ((wa + wb) * (1.0 + kc));
     let (reca, recb) = (a.records(), b.records());
-    let speed = dot((pa - qa) - (pb - qb), n) / h;
+    let va = if ta { a.point_vel(ai, pa) } else { a.vel[ai] };
+    let vb = if tb { b.point_vel(bi, pb) } else { b.vel[bi] };
+    let speed = dot(va - vb, n);
     if ta {
         a.push_at(ai, pa, -n, dl);
     } else {

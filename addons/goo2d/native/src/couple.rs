@@ -470,7 +470,7 @@ impl Ghosts {
             let dl = pen / (wc + we);
             let closing = dot(b.vel[c] - self.vel[ga], -nrm);
             if b.records() {
-                let speed = -dot((p - b.prev[c]) / h - self.vel[ga] * (1.0 - t) - self.vel[gb] * t, nrm);
+                let speed = -dot(b.vel[c] - self.vel[ga] * (1.0 - t) - self.vel[gb] * t, nrm);
                 let bead = if t < 0.5 { k } else { (k + 1) % n };
                 b.touch(c, Hit { kind: TOUCH_RING, id: ring.key, normal: nrm, other: bead as i32, other_uid: -1, tip: 0, speed, impulse: dl / h, point: q });
             }
@@ -490,7 +490,6 @@ impl Ghosts {
             let b = &mut bodies[bi];
             let tp = &opt.types[b.typ[c] as usize];
             let (p, rt) = b.tip(tp, c, false);
-            let (from, _) = b.tip(tp, c, true);
             let loop_pts = &self.pos[g0..g0 + n];
             let (k, t, q, d2, inside) = loop_nearest(loop_pts, p);
             self.tip_pairs[x].e0 = k as u32;
@@ -517,7 +516,7 @@ impl Ghosts {
             self.worst = self.worst.max(pen);
             self.contacts += 1;
             let dl = pen / (wc + we);
-            let speed = -dot((p - from) / h - self.vel[ga] * (1.0 - t) - self.vel[gb] * t, nrm);
+            let speed = -dot(b.point_vel(c, p) - self.vel[ga] * (1.0 - t) - self.vel[gb] * t, nrm);
             b.push_at(c, p, nrm, dl);
             self.pos[ga] -= nrm * (dl * (1.0 - t) * ring.w);
             self.pos[gb] -= nrm * (dl * t * ring.w);
@@ -596,8 +595,8 @@ impl Ghosts {
             self.contacts += 1;
             let dl = pen / (ring.w + we);
             if b.records() {
-                let ve = (b.pos[i] - b.prev[i]) * (1.0 - t) + (b.pos[j] - b.prev[j]) * t;
-                let speed = dot(ve / h - self.vel[gi], nrm);
+                let ve = b.vel[i] * (1.0 - t) + b.vel[j] * t;
+                let speed = dot(ve - self.vel[gi], nrm);
                 let bead = gi - ring.g0 as usize;
                 b.touch(if t < 0.5 { i } else { j }, Hit { kind: TOUCH_RING, id: ring.key, normal: -nrm, other: bead as i32, other_uid: -1, tip: 0, speed, impulse: dl / h, point: q });
             }
