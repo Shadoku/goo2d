@@ -16,7 +16,8 @@ shapes, mirrored by `GooStatics`):
   (`set_pose_wave()`, slope 0.3: the design bent by a curvature wave running head to tail, the
   visible stroke, with the drive rippling in step with it), and steered toward waypoints round the
   tank by the wave's curvature bias alone: the bent body steers itself;
-- a hex blob of four rings whose back rim is thruster cells (`set_cell_thrust()`), turned toward
+- a hex blob of four rings whose back rim is thruster cells (a type with `max_thrust`, their
+  levels set in one call, `set_thrust_levels()`), turned toward
   the same waypoints by the solver's spin servo (`set_spin_servo()` once, with a tip cap of
   500 px/s and a yield of 0.3, then `set_spin_target()` each frame from
   `GooCellCreature.spin_toward()` of its heading error) and pushed only while it roughly faces
@@ -52,7 +53,7 @@ Run it: `godot --path . examples/cells/cells.tscn` (or open the scene in the edi
 - `GooCellWorld2D.spawn()`, `clear()`, `despawn()`, `creatures()`, `creature_at()`,
   `water_source`, `grab()`, `move_grab()`, `release_grab()`, `gravity_scale`.
 - `GooCellCreature.set_swim()`, `set_pose_wave()`, `set_spin_servo()`, `set_spin_target()`,
-  `spin_toward()`, `set_cell_thrust()`, `set_joint_angle()`,
+  `spin_toward()`, `set_thrust_levels()`, `set_joint_angle()`,
   `center()`, `heading()`, `spin()`, `cell_type()`.
 - `GooCellDesign.hex_worm()`, `hex_blob()`, `add_cell()`; `GooCellType` (colour, body mode,
   `swim_weight`).

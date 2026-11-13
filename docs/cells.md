@@ -20,8 +20,9 @@ numbers, the limits and the quirks a game should be designed around.
 | `examples/cells/` | a tank of four creatures (the example) |
 | `addons/goo2d/native/src/couple.rs` | rings and cells colliding (below, "Rings and cells") |
 | `examples/rings_and_cells/` | ring bodies and creatures in one tank |
+| `examples/thrusters/` | thruster cells and spike tips (below, "Thrusters", "Spike tips") |
 | `tools/cell_world_bench.gd` | cost, draw and swimming through the world node |
-| tests | `tests/integration/test_goo_cell_spin_servo.gd` (the spin servo and the contact query), `tests/integration/test_goo_cell_world.gd`, `tests/unit/test_goo_cell_design.gd`, `tests/integration/examples/test_cells.gd`, `tests/unit/test_goo_cells.gd` (the exploration's), cargo tests in `cells.rs`; the coupling's `tests/integration/test_goo_ring_cells.gd`, `tests/integration/examples/test_rings_and_cells.gd`, cargo tests in `couple.rs` |
+| tests | `tests/integration/test_goo_cell_thrust.gd` (thrusters), `tests/integration/test_goo_cell_spikes.gd` (spike tips, the contacts' detail, cells removed mid-fight), `tests/integration/examples/test_thrusters.gd`, cargo tests in `cells.rs`' `thrust_tip_tests`; `tests/integration/test_goo_cell_spin_servo.gd` (the spin servo and the contact query), `tests/integration/test_goo_cell_world.gd`, `tests/unit/test_goo_cell_design.gd`, `tests/integration/examples/test_cells.gd`, `tests/unit/test_goo_cells.gd` (the exploration's), cargo tests in `cells.rs`; the coupling's `tests/integration/test_goo_ring_cells.gd`, `tests/integration/examples/test_rings_and_cells.gd`, cargo tests in `couple.rs` |
 
 A `GooWorld2D`'s ring bodies and a `GooCellWorld2D`'s creatures collide once the two worlds
 are **coupled** (`couple()`, below "Rings and cells"); uncoupled, they pass through each other.
@@ -58,8 +59,9 @@ type different `groups` to joint them; cells of two types meeting are a joint to
 **Muscles**: the **pose wave** (`set_pose_wave()`: the design bent along a curvature wave
 running head to tail; the swimmer's stroke; a curvature bias steers), **joint angles**,
 **radius muscles** (`set_muscles()`: a size scale per cell, the links following), the **swim
-drive** (`set_swim()`: every cell pushed along its own forward, below), **thrust** per cell
-along its heading (`set_cell_thrust()`), and whole-creature **push** and **twist** (kept, or
+drive** (`set_swim()`: every cell pushed along its own forward, below), **thrusters** (a level
+per cell × its type's `max_thrust` along its facing, `set_thrust_levels()`, below
+"Thrusters"), and whole-creature **push** and **twist** (kept, or
 for one step: `push_once()`, `twist_once()`, `add_cell_forces_once()`). A creature's mean
 motion and rigid spin relative to the water can be **damped** (`set_damping()`), and its spin
 held by the solver's **spin servo** (`set_spin_servo()`, below "Turning by the spin servo").
@@ -67,7 +69,9 @@ held by the solver's **spin servo** (`set_spin_servo()`, below "Turning by the s
 **Contacts**: a creature's outline cells collide with other creatures' outline cells
 (rigid, one pass a substep, a broad phase over creatures' boxes); every cell collides with
 the walls; a creature's own unlinked cells that share no neighbour collide (`SelfCollision.FAR`,
-on a Verlet list rebuilt every 4 frames). Nothing has friction.
+on a Verlet list rebuilt every 4 frames). Nothing has friction. A type may give its cells a
+**tip** (a spike: a small disc out along the cell's facing, held rigidly by the cell), which
+collides with everything but its own creature (below, "Spike tips").
 
 **Water**: drag on the outline's edges, the fluid game's law: per edge, the velocity relative
 to the water split across and along the edge,
@@ -132,8 +136,7 @@ serial, and a replay is identical (tested).
 `velocity()`, `turn()`, `heading()`, `spin()`, `mass()`, `cell_count()`, `positions()`,
 `velocities()`, `radii()`, `uids()`, `type_slots()`, `outline()`, `cell_index(uid)`,
 `cell_position(i)`, `cell_angle(i)`, `cell_type(i)`, `is_boundary(i)`, `cell_at(point)`;
-`push(acceleration)`, `twist(angular_acceleration)`, `set_cell_thrust(i, force)`,
-`set_cell_force(i, force)`, `set_swim(acceleration, pulse = 0.3)`, `stop_swim()`,
+`push(acceleration)`, `twist(angular_acceleration)`, `set_cell_force(i, force)`, `set_swim(acceleration, pulse = 0.3)`, `stop_swim()`,
 `push_once(acceleration)`, `twist_once(angular_acceleration)`,
 `add_cell_forces_once(forces)`, `set_damping(linear, angular)`, `set_muscles(scales)`, `set_pose_wave(slope, wavelength,
 frequency, bias, envelope)`, `stop_wave()`, `set_joint_angle(type_a, group_a, type_b,
@@ -146,7 +149,12 @@ target after the tip cap, the yield's scale and contact share), the static
 target); contacts: `contacts()` (what its cells touched in the last step: cell, uid, `Touch`
 kind, id, the thing, normal), `contact_counts()`, `touching_walls()`, `touching(kind)`,
 `set_contact_tracking(on)`, `contact_tracking()`, enum `Touch { WALL, OBSTACLE, RING,
-CREATURE }`; `design`, `axis` (its forward at
+CREATURE }`, `hits(min_speed)` (contacts() closing at least that fast, filtered in the kernel);
+thrusters: `set_thrust_levels(levels) -> bool` (one per cell by index, refused at any other
+size), `set_thrust_levels_by_uid(uids, levels) -> found`, `set_cell_thrust(i, level)`,
+`thrust_levels()`, `thrusters()` (for an allocator: indices, uids, offsets from the centre of
+mass, facings, maximum forces, levels, mass, inertia, centre), `inertia()`, `facings()`,
+`topology_version()`; tips: `tips()` (indices, uids, positions, facings, radii); `design`, `axis` (its forward at
 spawn), `data` (a dictionary for the game; copied to split parts). Forces set stay until
 set again, but the `_once` ones, which add to the next step's and clear themselves (calls
 before a step add up; `add_cell_forces_once()` counts as outside the creature for the break
@@ -164,7 +172,9 @@ overlaps, unlinked cells), the builders `hex_worm(long, wide, radius)` and
 `GooCellType` (a Resource): `name`, `color`, `mass_factor`, `radius_factor`, `stretch`,
 `bend`, `break_factor`, `body`, `collides`, `collides_walls`, `self_collides`,
 `contact_pad`, `join_layer`, `join_mask`, `swim_weight` (its cells' share of the swim drive,
-1), `behaviours` (a free dictionary for a game's
+1), `max_thrust` (a thruster's maximum, px/s² of the cell's own mass at unit 1; 0: not a
+thruster), `tip_length`, `tip_radius` (a spike's tip, × the cell's radius; `tip_length` 0: none),
+`behaviours` (a free dictionary for a game's
 thrusters, spikes, sensors...). The kernel has 16 type slots; a world gives each distinct
 type one the first time it is used (a 17th is an error and gets the default's).
 
@@ -182,8 +192,9 @@ world.water_source = my_flow_field.velocities_at        # water per cell, one ca
 ```
 
 `GooTuning.unit` is read like the ring world's: the capture distance, the solver's margin
-and speed cap, the grab's pick distance, the border width and a type's `contact_pad` are px
-at unit 1, scaled by it; designs' radii are canvas px as drawn (a game at unit 0.5 designs
+and speed cap, the grab's pick distance, the border width, a type's `contact_pad` and its
+`max_thrust` (px/s²) are at unit 1, scaled by it (a tip's length and radius are in the cell's
+radii, so they scale with the design); designs' radii are canvas px as drawn (a game at unit 0.5 designs
 14 px cells); gravity is GooTuning's (× unit) × `gravity_scale`.
 
 
@@ -461,6 +472,126 @@ would pass it (at the game's times the 7-cell blob's tip reaches 527 px/s, the 1
 `a` from the turn time as above; the target each frame `spin_toward(heading_error, max_spin,
 0.8 × a, delta)`.
 
+### Thrusters
+
+A cell whose type has a `max_thrust` (px/s² at unit 1; the kernel gets it × unit) is a
+**thruster**. Each cell has a **thrust level** (−1..1, clamped; 0 at spawn) kept until set
+again; a thruster pushes along its **facing** (its design angle, `GooCellDesign.angles`, turned
+with the cell: `cell_angle()`, `facings()`) with level × `max_thrust` × unit × its mass. The
+force's size is fixed for the frame, its direction taken again every substep from the cell's
+frame (a spinning creature's thrusters turn with it within the frame). A cell whose type has no
+maximum ignores its level. (This replaced `set_cell_thrust(i, force)`, a raw force along the
+cell's heading: `set_cell_thrust(i, level)` now takes a level. The raw `GooCells` kernel keeps
+the old meaning for a type it was never given a maximum, NaN, for the exploration's tools.)
+
+Why an acceleration of the cell's own mass: the creature's acceleration is then
+`max_thrust × unit × (the thrusters' share of its mass)` (× the cosines of their facings
+against the way), whatever the cells' sizes and mass factors, which a designer can read off the
+design; and thrusters of one type on a small and a large creature accelerate their own mass
+alike. The top speed is where the drag (on the outline) takes the push; at these sizes mostly
+its linear term, so about proportional to the push until the quadratic term grows (below).
+
+**What a game calls each frame**: `levels = …; creature.set_thrust_levels(levels)` — one
+`PackedFloat32Array`, one entry per cell by index (`cell_count()`), the non-thrusters' ignored.
+It is refused (returns false, nothing changes) when the array's size is not `cell_count()`,
+because an array built before a topology change would push the wrong cells. Indices change at
+every topology change (a cell removed, a link broken, a split, a join; `topology_version()` is
+bumped): a game keeps uids and rebuilds its index map when the version changes, or calls
+`set_thrust_levels_by_uid(uids, levels)` (a sort of the uids per call, a little dearer). Levels
+are per cell: they follow their cells through removals, splits (each part keeps its own) and
+joins.
+
+**The allocator's query**, `thrusters()`, one call: every thruster's index, uid, offset from the
+centre of mass, facing (unit, world) and maximum force (`max_thrust` × unit × its mass, the cells'
+mass units × px/s²), its level now, the creature's mass, its moment of inertia about the centre
+of mass (Σ m |p − c|², the cells' orbits, not their discs' own spins: what the spin servo and a
+twist use) and the centre. A thruster at full level gives the creature `max_force / mass` px/s²
+along its facing and `offset.cross(facing) × max_force / inertia` rad/s² (clockwise positive).
+
+**The break test**: thrust is the creature's own force (like the swim drive and muscles): it
+never marks the creature as touched, so its links' loads join their envelope and the break test
+leaves them out (quirk 5's learning applies: a sudden full thrust after 2 s of rest can exceed
+the envelope it learned).
+
+**Cost**: nothing for a creature with no level set (one flag); otherwise one pass over the cells
+a frame (their forces) and one cosine and sine per thrusting cell a substep. Threaded == serial
+and a replay identical with thrust, tips and removals (cargo and GDScript tests).
+
+Measured (`tests/integration/test_goo_cell_thrust.gd`, unit 0.5, 7 px cells, the world's default
+drag, top-down; a 37-cell hex blob 98 px wide; steady speed over seconds 6-8):
+
+| thrusters | `max_thrust` (at 0.5) | the blob's acceleration at full level | steady | body lengths/s |
+|---|---|---|---|---|
+| back third (16 % of its mass), facing +x | 600 (300 px/s²) | 48.6 px/s² | 28.7 px/s | 0.29 |
+| | 2400 (1200) | 194.6 | 104.0 | 1.06 |
+| | 6000 (3000) | 486.5 | 224.6 | 2.29 |
+| rim (49 %), each facing inward, level max(0, cos) | 600 | (145.9 at full level, all) | 21.7 | 0.22 |
+| | 2400 | (583.8) | 80.0 | 0.82 |
+| | 6000 | (1459.5) | 178.8 | 1.82 |
+
+Without drag the first half second's acceleration is 48.6 px/s² measured against 48.6
+predicted (Σ max force / mass). At these sizes the steady speed is about 0.55-0.6 × the push
+(px/s per px/s²) until 200 px/s, a little less above (the quadratic drag). The rim allocated by
+cosines is about 75 % as fast as thrusters of a third the mass all facing the way: the cosine
+allocator wastes most of the rim. The back third's upper half alone (off-centre): 0.30 rad/s²
+predicted from `thrusters()`, 0.31 measured over the first 0.1 s, 0.38 rad/s after 2 s.
+**Link strain** under the same push from the back third's thrusters and from the swim drive
+(every cell): steady 28.7 / 28.7 px/s, worst strain 0.0003 / 0.0001, worst load 28 588 /
+10 392 (the thrusters' push is concentrated, and their links carry the rest of the body), its
+envelope 28 395 / 10 371: the own share the break test leaves out. **Cost**
+(`tools/cell_world_bench.gd --thrust=0.1`: every tenth cell a thruster, levels set every frame
+outside the timing; 30 × 150, 4 threads, one machine, load about 1): colliding 2.63-2.77 ms
+against 2.34 without, swimming 3.82-3.87 against 3.59-3.74 (part of the difference is the
+creatures moving faster under the extra push and colliding more). With thrust and tips unused
+the step is bit-identical to the one before them (a state hash of walls, crossings, swim drives
+and waves compared) and costs the same (base / new, interleaved: colliding 2.56, 2.67 / 2.69,
+2.42 ms; swimming 4.18, 4.01 / 4.41, 4.22 ms: noise on a machine slower today than the table
+below).
+
+### Spike tips
+
+A type with `tip_length` > 0 gives each of its cells a **tip**: a disc of `tip_radius` × the
+cell's radius whose centre is `tip_length` × the cell's radius out from the cell's centre along
+its facing (the same facing a thruster pushes along). In radii, so a design scales with its
+cells; keep `tip_length − tip_radius` above 1 for the tip to stand out of its cell, and
+`tip_radius` at most 1 (the creatures' broad phase finds a tip's neighbours in the 3 × 3 grid
+cells round it). Nothing of it runs while no type has a tip.
+
+- **What it meets**: walls (static shapes), moving obstacles (with the reaction given to a
+  rigid body, as a cell's), the coupled ring world's beads (the bead chain as capsules, as a
+  cell meets it), other creatures' colliders (their outline cells) and tips. Never its own
+  creature, so a spike may lie against its own body.
+- **Rigid**: a push on the tip is a position correction at the tip point on the cell **and its
+  linked neighbours** as one rigid piece: they translate and turn about their common centre of
+  mass, by the effective inverse mass `1/M + (r × n)² / I` at the tip (the cluster's mass and
+  moment, the discs' own included), and their frames turn with them. A shape-matched cell's frame
+  is its neighbourhood's fit, so turning the cluster is what turns it; a lone cell turns alone.
+  So a tip pushed side-on turns its cell, and the push reaches the creature through the cell's
+  links like any other contact.
+- **Swept**: against walls and moving obstacles the tip is tested along its path within the
+  substep (from where the cell's position and frame put it at the substep's start), as cells are,
+  so a spinning spike is not tunnelled through a thin wall; against another creature's cell or
+  tip, the two discs' closest approach within the substep is taken when they end it apart, so
+  two tips closing at 2800 px/s (7.8 px a substep against 5.6 px apart touching) meet.
+- **Not drawn**: the skin draws the cell; `tips()` (one call per creature) gives every tip's
+  index, uid, centre, facing and radius for a game's ornaments (examples/thrusters draws a
+  spike to each).
+
+Measured (`tests/integration/test_goo_cell_spikes.gd`, unit 0.5, real physics frames; cargo
+`thrust_tip_tests`):
+
+| case | result |
+|---|---|
+| a 6 × 7 block of 7 px cells pushed at a wall at 150 px/s², its front column spikes (tip 2 radii out, 0.3 wide), heading held by the servo | its cells stop 9.1 px short (the tips' reach past the cells, (2 + 0.3 − 1) × 7 = 9.1 px), the tips on the wall |
+| the boss worm (24 × 5, 14 px cells, 690 px) spun at 4.5 rad/s full power, its three head cells spikes facing outward, a 4 px bar only the tips reach | tips at about 1500 px/s in open water (2874 px/s after the hit flings them), hitting at 1304 px/s; never through the bar, at most 0.09 px into it at a frame's end (cargo, 14 px cells, bars of 2 and 6 px: tips at 2332 px/s, hits at 1592 px/s, 0.00 px, never through) |
+| the same worm's spikes (facing the way it turns) into a 37-cell blob of 14 px cells | hit at 520 px/s (the worm's body meets the blob first and slows it: the head lags the spin); no tip inside the blob's outline at any frame, at most 0.27 px into a cell |
+| into a coupled 28 px ring | hit at 1327 px/s; no tip inside the ring at any frame; `cut_along(ring, point, −normal)` at the contact's point cut it (one split) |
+| into a 60 px crate (RigidBody2D, mass 10 × `body_mass_scale` 1000, `push_bodies`) | hit at 645 px/s; no tip inside it; the crate knocked to 311 px/s; the reaction reported as the tip's impulse |
+| two lone spike cells head on at 1400 px/s each (cargo) | the tips meet (closing 2800 px/s recorded), never pass, both stop, momentum kept to 0.1 %; flying past with only the tips in line: a glancing knock that spins both at 24 rad/s |
+| a lone spike cell thrown tip first at 1400 px/s into a blob of 7 px cells (cargo) | hit at 1400 px/s; the tip never into a cell (0.00 px) |
+| cells removed mid-fight: a spiked blob driven into a single file of 16 (thrusters at both ends, levels told apart), every cell a tip hits faster than 40 px/s removed by its `other_uid` (up to 4) | 3 removed, the file in 3 parts; no later contact names a removed uid; every position finite, no cell inside another creature; the old levels array refused; all 6 thrusters kept their levels by uid in whichever part; no tip of a removed cell |
+| a single file of 9 split in the middle (a thruster facing back at the head, one facing forward at the tail, a spike each side) | each part keeps its thruster at its level and its spike; they thrust apart at ±24.7 px/s after 0.5 s |
+
 ### Contacts
 
 Each creature can record what its cells touched in the last step (`set_contact_tracking(true)`;
@@ -471,13 +602,36 @@ serial passes), so threaded == serial (cargo-tested): the cell, what it touched 
 static shape, its id GooStatics' kernel id; `OBSTACLE`: a moving obstacle, the same; `RING`: the
 ring's kernel key, its Goo2D's instance id; `CREATURE`: the other creature's slot) and the unit
 normal pushing the cell out (for an edge contact between creatures, the edge's nearer cell).
-At the step's end they are sorted by cell, kind and id, one per cell and thing (the last
-substep's normal). `contacts()` returns them with the thing resolved (`touched_thing()`: the
+At the step's end they are sorted by cell, kind, id and whether the cell's tip made it, one per
+cell, thing and tip. `contacts()` returns them with the thing resolved (`touched_thing()`: the
 `PhysicsBody2D` or `TileMapLayer` through `GooStatics.node_of()`, the `Goo2D`, the
-`GooCellCreature`; a first call turns tracking on and returns what the last step recorded);
-`contact_counts()` (`[walls, obstacles, rings, creatures]`), `touching_walls()` and
-`touching(kind)` build no dictionaries. A topology change finds the step's contacts again by
-uid. Rings (`GooWorld2D`) have no such query: their contacts are the kernel's own
+`GooCellCreature`; a first call turns tracking on and returns what the last step recorded),
+and for damage:
+
+- `other_cell`, `other_uid`: the other creature's cell (its index at that step: use the uid; an
+  edge contact names its nearer end), or a ring's nearest bead (uid −1); −1 for walls and
+  obstacles;
+- `tip`, `other_tip`: whether this cell's tip made the contact, and the other creature's;
+- `speed`: the closing speed along the normal at the step's **first** touch (px/s; negative:
+  parting), from the two sides' velocities as the substep predicted them, before its contacts (a
+  tip's: its cell's velocity and its frame's spin at the tip), so earlier pushes in the same
+  substep do not count;
+- `impulse`: summed over the step, the momentum the contact gave the cell (with a tip, its
+  cell and neighbours) along the normals (the cells' mass units, density 1 per px², × px/s; a
+  14 px cell weighs 616): the position corrections over the substep, which is what the
+  cell's velocity takes from them; for a moving obstacle the inelastic impulse the solver
+  computes;
+- `point`: on the other thing: the other cell's or tip's disc, the wall's face, a ring's bead
+  chain (where `GooWorld2D.cut_along(ring, point, axis)` accepts it: a point on the bead chain
+  touches the ring; `-normal` or the tip's facing is a good axis).
+
+`hits(min_speed)` is `contacts()` with only those whose closing speed is at least `min_speed`,
+filtered in the kernel so no dictionary is built for the others (a creature resting on a wall
+has a contact a frame per touching cell; a game dealing damage wants the few fast ones).
+`contact_counts()` (`[walls, obstacles, rings, creatures]`, entries of `contacts()`),
+`touching_walls()` and `touching(kind)` build no dictionaries. A topology change finds the
+step's contacts again by uid (a removed cell's are dropped; the other creature's `other_cell`
+index is not remapped, its `other_uid` stays right). Rings (`GooWorld2D`) have no such query: their contacts are the kernel's own
 (`touched` events, `Goo2D.touching()`), not recorded this way.
 
 ### Two kernel bugs
@@ -885,6 +1039,10 @@ each other more, which a game would pay for any interaction.
 
 ## Limits
 
+- Thrusters and tips have no look of their own (the skin draws the cell; a game draws plumes and
+  spikes from `thrusters()` and `tips()`), and a tip meets nothing of its own creature.
+- A tip is one disc: a long blade is several spike cells, or a game's own geometry.
+
 - Rings (`GooWorld2D`) and cell creatures collide only when coupled; one ring world per cell
   world (a cell world couples to one `GooWorld2D`).
 - No friction: creatures slide off each other and along walls.
@@ -939,3 +1097,18 @@ each other more, which a game would pay for any interaction.
 14. **Contact ids follow the mirror**: a wall's or an obstacle's id is GooStatics' kernel id,
     renumbered when a body comes or goes (the mirror is rebuilt); resolve it in the frame it is
     read (`contacts()` does).
+15. **A thrust levels array is by index**: `set_thrust_levels()` refuses an array whose size is
+    not `cell_count()`, but an array of the right size built before a change that kept the
+    count (a cell removed and one added) would push the wrong cells: rebuild on
+    `topology_version()`, or use `set_thrust_levels_by_uid()`. A split's part is a new creature
+    whose cells keep their levels.
+16. **A creature pushed onto a wall by spikes ahead of its centre turns off them** (an inverted
+    pendulum: a hex blob swung 90° before its body met the wall): hold its heading (the spin
+    servo, as the tests and the example do) or put the spikes where the push is.
+17. **A tip pushed side-on turns its cell cluster**, so a spike can be knocked aside and slip
+    round a thin obstacle's end (it never passes through), and a hard hit flings the tip fast
+    (2874 px/s measured after a 1300 px/s hit). The closing speed of a creature's first touch is
+    what a game should deal damage by, not the tip's speed afterwards.
+18. **Hex blobs under a push turn to their stable orientation** (30° for a hex blob pushed
+    along a row): not new, but it turns thrusters and spikes with them; allocate from
+    `thrusters()`' facings each frame.
