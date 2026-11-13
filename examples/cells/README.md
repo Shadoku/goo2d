@@ -10,9 +10,12 @@ water where it is.
 In the tank, inside four walls and around a concave rock (both plain `StaticBody2D` collision
 shapes, mirrored by `GooStatics`):
 
-- a worm 24 × 5 of body cells with a spine row of another type, swimming by its pose wave alone
-  (`set_pose_wave()`: the design bent by a curvature wave running head to tail) and steered toward
-  waypoints round the tank by the wave's curvature bias;
+- a worm 24 × 5 of body cells with a spine row of another type, driven by its swim drive
+  (`set_swim()`: every cell pushed along its own forward, so the push follows the body's curve;
+  the spine's `swim_weight` 2 makes that row push hardest) under a gentle pose wave
+  (`set_pose_wave()`, slope 0.3: the design bent by a curvature wave running head to tail, the
+  visible stroke, with the drive rippling in step with it), and steered toward waypoints round the
+  tank by the wave's curvature bias alone: the bent body steers itself;
 - a hex blob of four rings whose back rim is thruster cells (`set_cell_thrust()`), turned toward
   the same waypoints by a twist (`twist()`) and pushed only while it roughly faces its goal;
 - a mixed-size creature (cells of 10 to 26 px, two types) from a saved design, `mixed.tres`,
@@ -45,6 +48,7 @@ Run it: `godot --path . examples/cells/cells.tscn` (or open the scene in the edi
 
 - `GooCellWorld2D.spawn()`, `clear()`, `despawn()`, `creatures()`, `creature_at()`,
   `water_source`, `grab()`, `move_grab()`, `release_grab()`, `gravity_scale`.
-- `GooCellCreature.set_pose_wave()`, `twist()`, `set_cell_thrust()`, `set_joint_angle()`,
+- `GooCellCreature.set_swim()`, `set_pose_wave()`, `twist()`, `set_cell_thrust()`, `set_joint_angle()`,
   `center()`, `heading()`, `spin()`, `cell_type()`.
-- `GooCellDesign.hex_worm()`, `hex_blob()`, `add_cell()`; `GooCellType` (colour, body mode).
+- `GooCellDesign.hex_worm()`, `hex_blob()`, `add_cell()`; `GooCellType` (colour, body mode,
+  `swim_weight`).
