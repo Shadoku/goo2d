@@ -88,15 +88,18 @@ func assert_has(container: Variant, item: Variant, msg: String = "") -> bool:
 	return ok
 
 ## Await a signal with a timeout. Returns true if it fired before the timeout.
+## The timeout is game time (the frames' deltas summed), like wait_seconds(): under the
+## runner's simulated time it passes as fast as the frames compute.
 func await_signal(sig: Signal, timeout: float = 1.0) -> bool:
 	var fired := [false]
 	var waiter := func() -> void:
 		await sig
 		fired[0] = true
 	waiter.call()
-	var deadline := Time.get_ticks_msec() + int(timeout * 1000.0)
-	while not fired[0] and Time.get_ticks_msec() < deadline:
+	var waited := 0.0
+	while not fired[0] and waited < timeout:
 		await get_tree().process_frame
+		waited += get_process_delta_time()
 	return fired[0]
 
 ## Wait for a number of frames (physics + process).

@@ -15,10 +15,12 @@ copy. A change the addon needs is made here first, with its test, then copied.
 | What | Command |
 |---|---|
 | Everything (build, import, validate, tests, smoke, render) | `python3 tools/check.py` |
-| Only the unit tests | `python3 tools/check.py --only test` |
+| Quick tier: validate + `tests/unit/` only (seconds; the inner loop) | `python3 tools/check.py --tier quick` |
+| Only the tests (unit and integration) | `python3 tools/check.py --only test` |
 | One test file or method | `python3 tools/check.py --only test --filter=merge` |
 | Fastest loop (no new files since last import) | `python3 tools/check.py --only test --no-import` |
 | Full engine output | `python3 tools/check.py --verbose` |
+| Run again although these exact files already passed | `python3 tools/check.py --fresh` |
 | Compile shaders and draw a few frames with the real renderer (needs `xvfb-run`; the main scene, then each example) | `python3 tools/check.py --only render` |
 | Run the game (needs a display) | `godot --path .` |
 | Open the editor | `godot --path . --editor` |
@@ -37,15 +39,57 @@ the Claude Code session hook and CI both use). The pinned version is in
 ## The development loop
 
 1. Before changing behaviour, write or adjust a test in `tests/` that describes
-   the intended behaviour. Run it and watch it fail for the right reason.
-2. Implement the change.
-3. Run `python3 tools/check.py`. Read the output from the top: the first failing
-   stage usually explains the rest (a parse error makes tests fail too).
+   the intended behaviour. Run it alone (`--only test --filter=<name>`) and watch it
+   fail for the right reason.
+2. Implement the change, re-running that test (`--filter`) and, when the change is in
+   a plain class, `--tier quick`. Do not run the full check after every edit.
+3. When the work is done, run `python3 tools/check.py` once. Read the output from the
+   top: the first failing stage usually explains the rest (a parse error makes tests
+   fail too).
 4. Fix and re-run until the last line is `CHECK: PASS`.
 5. Only then report done, quoting the `TESTS:` summary line.
 
-Never say a change works without a passing check. If you cannot run Godot
-(no binary, no network), say so explicitly instead of guessing.
+Never say a change works without a passing full check (`--tier quick` and `--filter`
+runs do not count). If you cannot run Godot (no binary, no network), say so explicitly
+instead of guessing.
+
+## How the check stays fast
+
+- **Tiers.** `--filter=<name>` (one test or file, about a second) for red and green;
+  `--tier quick` (validate and `tests/unit/`, seconds) while implementing; the full
+  check once, before reporting done. CI always runs the full check.
+- **Simulated time.** The tests run with `--fixed-fps`: every frame is exactly one
+  physics tick of game time and frames run as fast as they compute, so ten seconds of
+  simulation cost what they take to compute, not ten seconds, and a run is repeatable
+  frame for frame. Write waits in game time (`await get_tree().physics_frame` in a loop,
+  `wait_frames`, `wait_seconds`, `await_signal`); never measure game behaviour with
+  `Time.get_ticks_msec()` or `OS.delay_msec()`. `timeout_sec` is still wall-clock time:
+  it only guards against a hang.
+- **Processes.** The test files are spread over one process per CPU (`--jobs`), and the
+  smoke and render stages run beside them. Test files must not depend on which other
+  files ran before them in the same process: reset any static state in `after_each`.
+- **Pass cache.** A passing run stores a fingerprint of every project file (tracked or
+  untracked, not ignored) and of the Godot binary under `~/.cache/godot-check/`. Running
+  the check again on exactly the same files prints `[CACHED]`, the stored report and
+  `CHECK: PASS` without running anything; one changed byte and it runs for real.
+  Failures are never cached. `--fresh` ignores the cache: use it only when you doubt
+  the cache itself, not to double-check.
+
+### Subagents
+
+- A subagent that changes files finishes with `python3 tools/check.py` and reports the
+  `TESTS:` and `CHECK:` lines; tell it so in its brief. While it works it uses
+  `--filter` and `--tier quick` like anyone else.
+- When its work comes back, run `python3 tools/check.py` yourself, without `--fresh`.
+  If the files are what the subagent verified, the answer comes from the cache at once;
+  if anything changed since (your own edits, a merge, another agent's work), the check
+  runs for real, which is exactly when it is needed. Do not re-run tests "to be sure"
+  in any other way.
+- The cache is keyed by content, not by directory, so a subagent's pass in a worktree
+  answers for the main checkout once it holds the same files.
+- Several subagents editing the same checkout at once invalidate each other's runs (a
+  pass is stored only if no file changed while the check ran): give them worktrees, or
+  have them use `--filter` / `--tier quick` and run the full check once yourself.
 
 ## Reading failures
 

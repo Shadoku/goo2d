@@ -1,7 +1,8 @@
 extends SceneTree
 ## Headless unit-test runner. No addons required.
 ##
-##   godot --headless --path . -s tests/framework/runner.gd [-- [--filter=<substr>] [--verbose] [--junit=<path>]]
+##   godot --headless --path . -s tests/framework/runner.gd [-- [--filter=<substr>] [--verbose] [--junit=<path>]
+##       [--files=<a.gd,b.gd>] [--allow-empty] [--real-time]]
 ##
 ## Discovers res://tests/**/test_*.gd, instantiates each (must extend TestCase) once per
 ## test_* method, runs before_each / test / after_each with a per-test timeout, and
@@ -11,6 +12,16 @@ extends SceneTree
 ## (the "inner" run) and reads its combined stdout/stderr. Any ERROR / SCRIPT ERROR
 ## printed while a test is running is attributed to that test and fails it, unless the
 ## test sets `allow_errors = true`. This is why "RESULT: PASS" can be trusted.
+##
+## Simulated time: the inner run gets `--fixed-fps <physics ticks per second>`, so every
+## frame is exactly one physics tick of game time and frames run as fast as the CPU allows
+## instead of waiting for the wall clock. Ten seconds of simulation cost what they take to
+## compute, and a run is repeatable frame for frame. A test's `timeout_sec` stays wall-clock
+## time (it guards against hangs). `--real-time` turns this off.
+##
+## `--files=` limits the run to those test scripts (comma-separated, relative to res://):
+## how tools/check.py splits the tests over several processes. `--allow-empty` makes a run
+## that matched no test pass (one of those processes may hold none of a filter's tests).
 
 const TEST_ROOT := "res://tests"
 
@@ -18,6 +29,9 @@ var _inner := false
 var _filter := ""
 var _verbose := false
 var _junit_path := ""
+var _files: PackedStringArray = []
+var _allow_empty := false
+var _real_time := false
 var _results: Array[Dictionary] = []
 var _orphan_errors: Array[String] = []
 
@@ -38,12 +52,21 @@ func _parse_args() -> void:
 			_verbose = true
 		elif arg.begins_with("--junit="):
 			_junit_path = arg.trim_prefix("--junit=")
+		elif arg.begins_with("--files="):
+			_files = arg.trim_prefix("--files=").split(",", false)
+		elif arg == "--allow-empty":
+			_allow_empty = true
+		elif arg == "--real-time":
+			_real_time = true
 
 # --- outer process: spawn inner, parse its output, report ---------------------------
 
 func _run_outer() -> void:
 	var project_dir := ProjectSettings.globalize_path("res://")
-	var args := ["--headless", "--path", project_dir, "-s", get_script().resource_path, "--", "--inner"]
+	var args := ["--headless", "--path", project_dir]
+	if not _real_time:
+		args.append_array(["--fixed-fps", str(Engine.physics_ticks_per_second)])
+	args.append_array(["-s", get_script().resource_path, "--", "--inner"])
 	args.append_array(OS.get_cmdline_user_args())
 	var output := []
 	var code := OS.execute(OS.get_executable_path(), args, output, true, false)
@@ -134,8 +157,8 @@ func _report(inner_code: int) -> void:
 	print("TESTS: %d passed, %d failed, %d errors, %d skipped (%d total)" % [counts.pass, counts.fail, counts.error, counts.skip, _results.size()])
 	if _junit_path != "":
 		_write_junit()
-	var ok: bool = counts.fail == 0 and counts.error == 0 and _orphan_errors.is_empty() and _results.size() > 0
-	if _results.is_empty():
+	var ok: bool = counts.fail == 0 and counts.error == 0 and _orphan_errors.is_empty() and (_results.size() > 0 or _allow_empty)
+	if _results.is_empty() and not _allow_empty:
 		print("No tests found. Put test_*.gd files extending TestCase under %s" % TEST_ROOT)
 	if inner_code != 0 and ok:
 		print("Inner process exited with code %d" % inner_code)
@@ -158,6 +181,8 @@ func _run_inner() -> void:
 	await process_frame  # root is not in the tree until the first frame
 	var scripts := _find_test_scripts(TEST_ROOT)
 	scripts.sort()
+	if not _files.is_empty():
+		scripts = scripts.filter(func(path: String) -> bool: return _files.has(path.trim_prefix("res://")))
 	for path in scripts:
 		var script = load(path)
 		if script == null or not (script is GDScript) or not script.can_instantiate():
@@ -172,6 +197,7 @@ func _run_inner() -> void:
 			if _filter != "" and not id.contains(_filter):
 				continue
 			await _run_test(script, path, id, method)
+	printerr("::done")  # a marker even when no test matched: the run itself worked
 	quit(0)
 
 func _run_test(script: GDScript, path: String, id: String, method: String) -> void:
