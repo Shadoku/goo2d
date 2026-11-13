@@ -387,3 +387,23 @@ func test_replay_and_threads() -> void:
 	var c := await _replay(4)
 	assert_eq(a, b, "a replay is identical")
 	assert_eq(a, c, "threaded == serial")
+
+func test_small_fast_cells_do_not_tunnel_into_a_ring() -> void:
+	# A lone cell and a 7-cell blob of 6 px cells shot at a 60 px ring at up to 2400 px/s
+	# (the cells' speed cap at unit 0.5 is 3000): no centre ever inside the ring.
+	for c: Array in [[0, 1200.0], [0, 2400.0], [1, 2400.0]]:
+		_scene()
+		var body := rings.spawn(60.0, Vector2(960, 540))
+		var cr := cells.spawn(GooCellDesign.hex_blob(c[0], 6.0), Transform2D(0.0, Vector2(1200, 545)))
+		await _frames(1)
+		cr.set_velocity(Vector2(-c[1], 0.0))
+		var inside := 0
+		var worst := 0.0
+		for f: int in 30:
+			await _frames(1)
+			inside = maxi(inside, _cells_inside(cr, body))
+			worst = maxf(worst, cells.coupling_stats()["worst"])
+		print("  %d cell(s) of 6 px at %d px/s into a 60 px ring: centres inside at most %d, worst overlap found %.1f px, blob v (%.0f, %.0f), ring v (%.0f, %.0f)" % [
+			cr.cell_count(), c[1], inside, worst, cr.velocity().x, cr.velocity().y, body.average_velocity().x, body.average_velocity().y])
+		assert_eq(inside, 0)
+		await _clear()

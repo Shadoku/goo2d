@@ -158,11 +158,12 @@ const GRAB_REACH: float = 3.0
 ## A coupled ring weighs its area × this (a cell weighs its area × its type's mass factor:
 ## 1, a ring weighs what cells of its area weigh).
 @export_range(0.0, 10.0, 0.01, "or_greater") var ring_density: float = 1.0
-## How firmly a coupled ring keeps its shape within a frame against a cell's push (0..1, a
-## substep's pull toward a rigid fit of where its beads would be). 0.15: higher makes a
-## ring resting under a creature buzz (0.3 doubles its beads' jitter, 1 quadruples it),
-## lower lets an impact dent it deeper within the frame (docs/cells.md).
-@export_range(0.0, 1.0, 0.01) var ring_rigidity: float = 0.15
+## How much a coupled ring answers a cell's push as a whole within the frame (0..1 a
+## substep: the push's change of its beads' velocities drawn toward its mean and turn).
+## 0.3: a ring resting on or under a creature buzzes least; 0 lets the touched beads alone
+## take the push (a resting ring's beads jitter 5 times as much), 1 makes it buzz 3 times
+## as much (docs/cells.md, "Rings and cells").
+@export_range(0.0, 1.0, 0.01) var ring_rigidity: float = 0.3
 ## Called with every live creature's cell centres (one PackedVector2Array, slot order) each
 ## frame before the step; returns the water's velocity there (empty: none, one value for
 ## all, or one per point), e.g. a flow field's velocities_at. Invalid: not called.

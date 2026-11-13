@@ -14,9 +14,9 @@
 //! 3. `substep()`, in each of the cells' substeps after their own contacts: the touched
 //!    rings' beads move as ghost particles along the path the kernel gave them (from
 //!    p_end − v·dt to p_end), then the contacts are solved as position corrections
-//!    weighted by inverse mass (both sides move), the touched rings are pulled toward a
-//!    rigid fit of their unperturbed path (`rigidity`: within one frame a ring answers a
-//!    push as a whole, not bead by bead), and the ghosts' velocities follow their moves.
+//!    weighted by inverse mass (both sides move), the ghosts' velocities follow their moves,
+//!    and a touched ring's change of velocity is drawn toward its rigid part (`rigidity`:
+//!    within one frame a ring answers a push as a whole, not bead by bead).
 //!    Cells against a ring: the ring's bead chain as capsules (bead radius), and a cell
 //!    whose centre is inside the bead loop pushed out across the nearest edge. Beads
 //!    against a creature: its outline (the outline cells' centres) as capsules of the cells'
@@ -30,7 +30,7 @@
 //! Everything here is serial and in a fixed order: a replay is identical and the cells'
 //! threaded step stays equal to their serial one.
 
-use crate::cells::{Body, Opt};
+use crate::cells::{grid_query, key, Body, Opt};
 use crate::geom::{centroid, cross, dot, len_sq, Rect};
 use crate::kernel::Kernel;
 use crate::statics::StaticShape;
@@ -78,8 +78,8 @@ pub struct BeadPair {
 pub struct Ghosts {
     /// A kernel's rings are coupled (else none of this runs).
     pub on: bool,
-    /// The pull of a touched ring toward a rigid fit of its unperturbed path, per substep
-    /// (0..1).
+    /// How far a touched ring's change of velocity is drawn toward its rigid part (its mean
+    /// and turn) per substep (0..1).
     pub rigidity: f32,
     /// The kernel's wake thresholds (px, px/s).
     pub wake_depth: f32,
@@ -97,11 +97,17 @@ pub struct Ghosts {
     pub bead_pairs: Vec<BeadPair>,
     /// Per creature this frame: the sign of its outline's winding (0: not computed).
     orient: Vec<f32>,
+    /// Per creature this frame: each cell's place on its outline (u32::MAX: inside).
+    opos: Vec<Vec<u32>>,
+    rmax: Vec<f32>,
     /// This frame: the deepest overlap a contact found before solving it (px), the
     /// contacts solved (summed over substeps), centres found inside the other's outline.
     pub worst: f32,
     pub contacts: u32,
     pub inside: u32,
+    /// Wall-clock µs of this frame's broad phase and substeps (nothing reads it back).
+    pub us: u64,
+    pub broad_us: u64,
 }
 
 /// The nearest point of a closed loop of points to `p`: (edge, t along it, the point, its
@@ -157,6 +163,20 @@ fn outline_normal(b: &Body, e: usize, orient: f32) -> Vector2 {
     if l > 1e-9 { n / l } else { Vector2::ZERO }
 }
 
+/// Whether `q` is inside creature b's outline, judged at its edge e (the nearest): the
+/// edge's outward normal, or at a corner the two edges' normals together (the pseudo-normal).
+fn outline_inside(b: &Body, opt: &Opt, e: usize, q: Vector2, orient: f32) -> bool {
+    let ml = b.outline.len();
+    let (_, _, t, cp, _) = outline_edge(b, opt, e, q);
+    let mut pn = outline_normal(b, e, orient);
+    if t <= 0.0 {
+        pn += outline_normal(b, (e + ml - 1) % ml, orient);
+    } else if t >= 1.0 {
+        pn += outline_normal(b, (e + 1) % ml, orient);
+    }
+    dot(q - cp, pn) < 0.0
+}
+
 fn winding_sign(b: &Body) -> f32 {
     let m = b.outline.len();
     let mut s = 0.0f64;
@@ -205,7 +225,12 @@ impl Ghosts {
 
     /// The candidate pairs for this frame (after the cells' prepare: their boxes and speeds
     /// are this frame's), and every ghost at its path's start.
-    pub fn broad(&mut self, bodies: &[Body], opt: &Opt, dt: f32) {
+    pub fn broad(&mut self, bodies: &[Body], opt: &Opt, dt: f32, cell: f32) {
+        let clock = std::time::Instant::now();
+        let mut near: Vec<u32> = Vec::new();
+        if self.opos.len() < bodies.len() {
+            self.opos.resize(bodies.len(), Vec::new());
+        }
         self.cell_pairs.clear();
         self.bead_pairs.clear();
         self.worst = 0.0;
@@ -213,6 +238,8 @@ impl Ghosts {
         self.inside = 0;
         self.orient.clear();
         self.orient.resize(bodies.len(), 0.0);
+        self.rmax.clear();
+        self.rmax.resize(bodies.len(), 0.0);
         let total = self.p_end.len();
         self.pos.clear();
         self.vel.clear();
@@ -262,29 +289,59 @@ impl Ghosts {
                 }
                 if self.orient[bi] == 0.0 {
                     self.orient[bi] = winding_sign(b);
+                    self.rmax[bi] = b.r.iter().cloned().fold(0.0f32, f32::max) * (1.0 + opt.contact_pad) + 16.0 * opt.contact_pad;
+                    // Each cell's place on the outline (u32::MAX: not on it).
+                    let opos = &mut self.opos[bi];
+                    opos.clear();
+                    opos.resize(b.n, u32::MAX);
+                    for (e, &c) in b.outline.iter().enumerate() {
+                        if opos[c as usize] == u32::MAX {
+                            opos[c as usize] = e as u32;
+                        }
+                    }
                 }
-                let rmax = b.r.iter().cloned().fold(0.0f32, f32::max) * (1.0 + opt.contact_pad) + 16.0 * opt.contact_pad;
-                let near = ring.br + m + rmax;
+                let orient = self.orient[bi];
+                let rmax = self.rmax[bi];
+                let near_box = ring.br + m + rmax;
                 for k in 0..n {
                     let q = self.pos[g0 + k];
-                    if q.x + near < b.lo.x || q.x - near > b.hi.x || q.y + near < b.lo.y || q.y - near > b.hi.y {
+                    if q.x + near_box < b.lo.x || q.x - near_box > b.hi.x || q.y + near_box < b.lo.y || q.y - near_box > b.hi.y {
                         continue;
                     }
-                    let mut inside = false;
-                    let mut best = (0usize, f32::INFINITY);
-                    for e in 0..ml {
-                        let (i, j, _, cp, rr) = outline_edge(b, opt, e, q);
-                        let (a, c) = (b.pos[i], b.pos[j]);
-                        if (a.y > q.y) != (c.y > q.y) && q.x < a.x + (q.y - a.y) * (c.x - a.x) / (c.y - a.y) {
-                            inside = !inside;
+                    // The outline edges at the outline cells near the bead (the colliders'
+                    // grid): the one whose capsule it is deepest in.
+                    near.clear();
+                    grid_query(&b.grid, key(q.x, q.y, cell), &mut near);
+                    let mut best = (usize::MAX, f32::INFINITY);
+                    for &o in near.iter() {
+                        let c = b.colliders[o as usize] as usize;
+                        let e = self.opos[bi][c];
+                        if e == u32::MAX {
+                            continue;
                         }
-                        let gap = len_sq(q - cp).sqrt() - rr;
-                        if gap < best.1 {
-                            best = (e, gap);
+                        for ee in [e as usize, (e as usize + ml - 1) % ml] {
+                            let (_, _, _, cp, rr) = outline_edge(b, opt, ee, q);
+                            let gap = len_sq(q - cp).sqrt() - rr;
+                            if gap < best.1 || (gap == best.1 && ee < best.0) {
+                                best = (ee, gap);
+                            }
                         }
                     }
+                    let (inside, e0) = if best.0 != usize::MAX {
+                        (outline_inside(b, opt, best.0, q, orient), best.0)
+                    } else {
+                        // No outline cell near: far outside, or deep inside.
+                        let mut inside = false;
+                        for e in 0..ml {
+                            let (a, c) = (b.pos[b.outline[e] as usize], b.pos[b.outline[(e + 1) % ml] as usize]);
+                            if (a.y > q.y) != (c.y > q.y) && q.x < a.x + (q.y - a.y) * (c.x - a.x) / (c.y - a.y) {
+                                inside = !inside;
+                            }
+                        }
+                        (inside, 0)
+                    };
                     if inside || best.1 < ring.br + m {
-                        self.bead_pairs.push(BeadPair { g: (g0 + k) as u32, body: bi as u32, e0: best.0 as u32, full: inside });
+                        self.bead_pairs.push(BeadPair { g: (g0 + k) as u32, body: bi as u32, e0: e0 as u32, full: inside });
                         active = true;
                     }
                 }
@@ -294,6 +351,8 @@ impl Ghosts {
             r.touched = false;
             r.wake = false;
         }
+        self.us = clock.elapsed().as_micros() as u64;
+        self.broad_us = self.us;
     }
 
     /// One of the cells' substeps (`s` of them so far, each `h` long): the ghosts moved,
@@ -302,6 +361,7 @@ impl Ghosts {
         if self.cell_pairs.is_empty() && self.bead_pairs.is_empty() {
             return;
         }
+        let clock = std::time::Instant::now();
         for r in &self.rings {
             if !r.active {
                 continue;
@@ -309,43 +369,6 @@ impl Ghosts {
             for k in r.g0 as usize..(r.g0 + r.n) as usize {
                 self.prev[k] = self.pos[k];
                 self.pos[k] += self.vel[k] * h;
-            }
-        }
-        // The touched rings held to their own shape: a rigid fit of where their beads
-        // would be without the cells.
-        let time = (s + 1) as f32 * h - self.dt;
-        if self.rigidity > 0.0 {
-            for r in &self.rings {
-                if !r.active || r.settled {
-                    continue;
-                }
-                let (g0, n) = (r.g0 as usize, r.n as usize);
-                let mut xc = Vector2::ZERO;
-                let mut uc = Vector2::ZERO;
-                for k in g0..g0 + n {
-                    xc += self.pos[k];
-                    uc += self.p_end[k] + self.v0[k] * time;
-                }
-                xc /= n as f32;
-                uc /= n as f32;
-                let (mut sc, mut ss) = (0.0f32, 0.0f32);
-                for k in g0..g0 + n {
-                    let u = self.p_end[k] + self.v0[k] * time - uc;
-                    let x = self.pos[k] - xc;
-                    sc += dot(u, x);
-                    ss += cross(u, x);
-                }
-                let l = (sc * sc + ss * ss).sqrt();
-                if l < 1e-9 {
-                    continue;
-                }
-                let (co, si) = (sc / l, ss / l);
-                for k in g0..g0 + n {
-                    let u = self.p_end[k] + self.v0[k] * time - uc;
-                    let goal = xc + Vector2::new(u.x * co - u.y * si, u.x * si + u.y * co);
-                    let p = self.pos[k];
-                    self.pos[k] = p + (goal - p) * self.rigidity;
-                }
             }
         }
         // Cells against the rings' bead chains.
@@ -431,15 +454,7 @@ impl Ghosts {
             self.bead_pairs[x].e0 = e as u32;
             let (i, j, t, cp, rr) = outline_edge(b, opt, e, q);
             if !bp.full {
-                // Which side of the outline: the edge's normal, or at a corner the two
-                // edges' normals together (the pseudo-normal).
-                let mut pn = outline_normal(b, e, orient);
-                if t <= 0.0 {
-                    pn += outline_normal(b, (e + ml - 1) % ml, orient);
-                } else if t >= 1.0 {
-                    pn += outline_normal(b, (e + 1) % ml, orient);
-                }
-                inside = dot(q - cp, pn) < 0.0;
+                inside = outline_inside(b, opt, e, q, orient);
             }
             let reach = rr + ring.br;
             let d = len_sq(q - cp).sqrt();
@@ -494,14 +509,48 @@ impl Ghosts {
             }
         }
         let ih = 1.0 / h;
+        let kr = self.rigidity;
         for r in &self.rings {
             if !r.active || r.settled {
                 continue;
             }
-            for k in r.g0 as usize..(r.g0 + r.n) as usize {
+            let (g0, n) = (r.g0 as usize, r.n as usize);
+            for k in g0..g0 + n {
                 self.vel[k] = (self.pos[k] - self.prev[k]) * ih;
             }
+            if kr <= 0.0 || !r.touched {
+                continue;
+            }
+            // The ring answers a push as a whole: the change of its beads' velocities
+            // against their unperturbed ones is drawn toward its rigid part (the mean
+            // and the turn about the centre), keeping its momentum and angular momentum
+            // and leaving the dent where it is (the ring's own elasticity, in the kernel,
+            // undoes it).
+            let mut c = Vector2::ZERO;
+            let mut dv = Vector2::ZERO;
+            for k in g0..g0 + n {
+                c += self.pos[k];
+                dv += self.vel[k] - self.v0[k];
+            }
+            c /= n as f32;
+            dv /= n as f32;
+            let (mut l, mut i) = (0.0f32, 0.0f32);
+            for k in g0..g0 + n {
+                let rr = self.pos[k] - c;
+                l += cross(rr, self.vel[k] - self.v0[k] - dv);
+                i += len_sq(rr);
+            }
+            let om = if i > 1e-9 { l / i } else { 0.0 };
+            for k in g0..g0 + n {
+                let rr = self.pos[k] - c;
+                let rigid = dv + Vector2::new(-rr.y, rr.x) * om;
+                let d = self.vel[k] - self.v0[k];
+                let v = self.v0[k] + d + (rigid - d) * kr;
+                self.vel[k] = v;
+                self.pos[k] = self.prev[k] + v * h;
+            }
         }
+        self.us += clock.elapsed().as_micros() as u64;
     }
 
     fn ring_of(&self, g: usize) -> usize {
@@ -597,4 +646,181 @@ fn edge_left(a: Vector2, b: Vector2) -> Vector2 {
     let n = Vector2::new(-d.y, d.x);
     let l = len_sq(n).sqrt();
     if l > 1e-9 { n / l } else { Vector2::new(0.0, -1.0) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cells::{hex_design, Cells};
+
+    fn circle(c: Vector2, r: f32, n: usize) -> Vec<Vector2> {
+        (0..n).map(|k| c + Vector2::from_angle(std::f32::consts::TAU * k as f32 / n as f32) * r).collect()
+    }
+
+    /// A ring of free beads (no ring constraints between frames: what the cells see of a
+    /// ring within one frame, its changes applied by hand) and a blob, thrown together.
+    struct Scene {
+        cl: Cells,
+        pts: Vec<Vector2>,
+        vel: Vec<Vector2>,
+        mass: f32,
+    }
+
+    impl Scene {
+        fn new(threads: usize, speed: f32) -> Scene {
+            let mut cl = Cells::default();
+            cl.set_threads(threads);
+            cl.opt.drag.enabled = false;
+            let r = 7.0;
+            let cells = hex_design(2, r, Vector2::new(90.0, 3.0));
+            let n = cells.len();
+            cl.add_creature(&cells, &vec![r; n], &vec![0u8; n]);
+            for v in cl.bodies[0].vel.iter_mut() {
+                *v = Vector2::new(-speed, 0.0);
+            }
+            cl.ghosts.on = true;
+            cl.ghosts.rigidity = 0.15;
+            cl.ghosts.wake_depth = 0.5;
+            cl.ghosts.wake_speed = 30.0;
+            let pts = circle(Vector2::ZERO, 20.0, 16);
+            let vel = vec![Vector2::new(speed, 0.0); 16];
+            Scene { cl, pts, vel, mass: std::f32::consts::PI * 400.0 }
+        }
+
+        fn frame(&mut self) {
+            let dt = 1.0 / 60.0;
+            for (p, v) in self.pts.iter_mut().zip(&self.vel) {
+                *p += *v * dt;
+            }
+            self.cl.ghosts.begin(dt);
+            self.cl.ghosts.add_ring(1, 0, &self.pts, &self.vel, self.mass, 2.4, false);
+            self.cl.step(dt);
+            let g = &self.cl.ghosts;
+            if g.rings[0].touched {
+                for k in 0..16 {
+                    self.pts[k] += g.pos[k] - g.p_end[k];
+                    self.vel[k] += g.vel[k] - g.v0[k];
+                }
+            }
+        }
+
+        fn momentum(&self) -> Vector2 {
+            let b = &self.cl.bodies[0];
+            let mut p = Vector2::ZERO;
+            for i in 0..b.n {
+                p += b.vel[i] * b.mass[i];
+            }
+            for v in &self.vel {
+                p += *v * (self.mass / 16.0);
+            }
+            p
+        }
+
+        fn cells_inside(&self) -> usize {
+            self.cl.bodies[0].pos.iter().filter(|&&p| crate::geom::point_in_polygon(p, &self.pts)).count()
+        }
+    }
+
+    #[test]
+    fn a_blob_and_a_ring_of_beads_collide_keeping_momentum() {
+        for speed in [300.0f32, 600.0] {
+            let mut s = Scene::new(1, speed);
+            let p0 = s.momentum();
+            let mut inside = 0;
+            let mut touched = 0;
+            for _ in 0..40 {
+                s.frame();
+                inside = inside.max(s.cells_inside());
+                touched += s.cl.ghosts.rings[0].touched as usize;
+            }
+            let p1 = s.momentum();
+            let scale = speed * (s.mass + s.cl.bodies[0].total_mass());
+            println!("{} px/s: momentum {:?} -> {:?}, inside {}, frames touching {}", speed, p0, p1, inside, touched);
+            assert!(touched > 0);
+            assert_eq!(inside, 0);
+            assert!((p1 - p0).length() < 1e-3 * scale, "momentum {:?} -> {:?}", p0, p1);
+            // They no longer close on each other.
+            let vb = s.cl.bodies[0].velocity();
+            let vr = s.vel.iter().fold(Vector2::ZERO, |a, &v| a + v) / 16.0;
+            assert!(vb.x >= vr.x - 1.0, "blob {:?}, ring {:?}", vb, vr);
+        }
+    }
+
+    #[test]
+    fn threaded_equals_serial_with_rings() {
+        let mut a = Scene::new(1, 500.0);
+        let mut b = Scene::new(4, 500.0);
+        for _ in 0..40 {
+            a.frame();
+            b.frame();
+        }
+        assert_eq!(a.cl.state_hash(), b.cl.state_hash());
+        assert_eq!(a.pts, b.pts);
+    }
+
+    #[test]
+    fn a_bead_inside_a_creature_is_pushed_out() {
+        let mut cl = Cells::default();
+        cl.opt.drag.enabled = false;
+        let r = 7.0;
+        let cells = hex_design(3, r, Vector2::ZERO);
+        let n = cells.len();
+        cl.add_creature(&cells, &vec![r; n], &vec![0u8; n]);
+        cl.ghosts.on = true;
+        // A ring whose beads all sit inside the blob, between its cells.
+        let pts = circle(Vector2::new(3.0, 2.0), 12.0, 12);
+        let vel = vec![Vector2::ZERO; 12];
+        let mut pts_now = pts.clone();
+        let mut vel_now = vel.clone();
+        for _ in 0..60 {
+            cl.ghosts.begin(1.0 / 60.0);
+            cl.ghosts.add_ring(1, 0, &pts_now, &vel_now, 400.0, 2.0, false);
+            cl.step(1.0 / 60.0);
+            let g = &cl.ghosts;
+            for k in 0..12 {
+                pts_now[k] += g.pos[k] - g.p_end[k];
+                vel_now[k] += g.vel[k] - g.v0[k];
+                vel_now[k] *= 0.9;
+            }
+        }
+        let b = &cl.bodies[0];
+        let outline: Vec<Vector2> = b.outline.iter().map(|&c| b.pos[c as usize]).collect();
+        let inside = pts_now.iter().filter(|&&p| crate::geom::point_in_polygon(p, &outline)).count();
+        println!("beads inside after 1 s: {}", inside);
+        assert_eq!(inside, 0);
+    }
+
+    #[test]
+    fn an_awake_ring_is_pushed_and_a_settled_one_woken() {
+        // (Kernel::add_ring() needs Godot, so the kernel side, apply(), is tested from
+        // GDScript: tests/integration/test_goo_ring_cells.gd.)
+        let pts = circle(Vector2::ZERO, 20.0, 12);
+        let mut cl = Cells::default();
+        cl.opt.drag.enabled = false;
+        let cells = hex_design(1, 7.0, Vector2::new(42.0, 0.0));
+        cl.add_creature(&cells, &vec![7.0; 7], &vec![0u8; 7]);
+        cl.ghosts.on = true;
+        cl.ghosts.rigidity = 0.15;
+        cl.ghosts.wake_depth = 0.5;
+        cl.ghosts.wake_speed = 30.0;
+        let still = vec![Vector2::ZERO; 12];
+        cl.ghosts.begin(1.0 / 60.0);
+        cl.ghosts.add_ring(7, 0, &pts, &still, 1200.0, 2.4, false);
+        cl.step(1.0 / 60.0);
+        let g = &cl.ghosts;
+        assert!(g.rings[0].touched && !g.rings[0].wake);
+        assert!(g.vel[0].x < 0.0, "the facing bead pushed away: {:?}", g.vel[0]);
+        assert!(g.momentum_given().x < 0.0);
+        // Settled: immovable (the blob takes the whole push), woken by a fast blob.
+        for v in cl.bodies[0].vel.iter_mut() {
+            *v = Vector2::new(-200.0, 0.0);
+        }
+        cl.ghosts.begin(1.0 / 60.0);
+        cl.ghosts.add_ring(7, 0, &pts, &still, 1200.0, 2.4, true);
+        cl.step(1.0 / 60.0);
+        let g = &cl.ghosts;
+        assert_eq!(g.pos[..12].to_vec(), pts, "a settled ring does not move");
+        assert!(g.rings[0].touched && g.rings[0].wake, "woken");
+        assert!(cl.bodies[0].velocity().x > -200.0, "the blob was stopped");
+    }
 }

@@ -2340,7 +2340,8 @@ impl GooCells {
     /// The last step's coupling: rings (gathered), active (near a creature), touched,
     /// cell_pairs, bead_pairs, contacts (solved, over the substeps), inside (centres found
     /// inside the other's outline), worst (the deepest overlap found, px), momentum (what
-    /// the cells handed the rings, cells' units).
+    /// the cells handed the rings, cells' units), us (µs of the coupling's broad phase and
+    /// substeps inside the step).
     #[func]
     fn coupling_stats(&self) -> VarDictionary {
         let g = &self.c.ghosts;
@@ -2355,6 +2356,8 @@ impl GooCells {
         put(&mut d, "inside", g.inside as i64);
         put(&mut d, "worst", g.worst as f64);
         put(&mut d, "momentum", g.momentum_given());
+        put(&mut d, "us", g.us as i64);
+        put(&mut d, "broad_us", g.broad_us as i64);
         d
     }
 

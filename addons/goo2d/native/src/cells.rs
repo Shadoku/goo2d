@@ -476,7 +476,7 @@ impl Default for Cells {
 }
 
 #[inline]
-fn key(x: f32, y: f32, cell: f32) -> (i32, i32) {
+pub(crate) fn key(x: f32, y: f32, cell: f32) -> (i32, i32) {
     ((x / cell).floor() as i32, (y / cell).floor() as i32)
 }
 #[inline]
@@ -484,7 +484,7 @@ fn pack(k: (i32, i32)) -> u64 {
     ((k.0 as u32 as u64) << 32) | (k.1 as u32 as u64)
 }
 
-fn grid_query(grid: &[(u64, u32)], k: (i32, i32), out: &mut Vec<u32>) {
+pub(crate) fn grid_query(grid: &[(u64, u32)], k: (i32, i32), out: &mut Vec<u32>) {
     for dy in -1..=1 {
         for dx in -1..=1 {
             let kk = pack((k.0 + dx, k.1 + dy));
@@ -2095,7 +2095,7 @@ impl Cells {
             self.cross.extend(l);
         }
         if self.ghosts.on {
-            self.ghosts.broad(&self.bodies, &opt, dt);
+            self.ghosts.broad(&self.bodies, &opt, dt, cell);
         }
         let t2 = Instant::now();
         let h = dt / opt.substeps as f32;

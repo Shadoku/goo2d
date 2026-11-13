@@ -12,6 +12,9 @@ extends SceneTree
 ## current. Prints the step's median / p95 (the whole world.step() without drawing, and
 ## the kernel's share), and with --draw (run under xvfb-run with --rendering-driver
 ## opengl3 for the real renderer) the skins' build and hand-over per frame. A RESULT line.
+## --rings=N adds a GooWorld2D of N ring bodies (radius 18-26 px, thrown about every 2 s)
+## in the gaps between the creatures, coupled to the cells (docs/cells.md, "Rings and
+## cells") unless --couple=0, and prints both worlds' steps and the coupling's share.
 ##
 ##   godot --headless --path . -s tools/cell_world_bench.gd -- --swim-test [--body=...]
 ##     [--ratio=20] [--long=24] [--wide=5] [--freq=1] [--slope=1] [--seconds=10]
@@ -19,6 +22,11 @@ extends SceneTree
 ## makes it --segments=6 shape-matched segments joined by joints.
 
 var opts := {}
+
+## The bench's rings never merge (a merge is not what is measured).
+class Rings extends GooWorld2D:
+	func may_merge(_a: Goo2D, _b: Goo2D) -> bool:
+		return false
 
 func _initialize() -> void:
 	for arg: String in OS.get_cmdline_user_args():
@@ -130,6 +138,23 @@ func _bench() -> void:
 		creatures.append(w.spawn(design, Transform2D(turn, at)))
 		targets.append(Vector2(rng.randf() * size.x, rng.randf() * size.y))
 		freqs.append(rng.randf_range(0.8, 1.2))
+	var ring_count := int(o("rings", 0))
+	var ring_world: GooWorld2D = null
+	var ring_bodies: Array[Goo2D] = []
+	if ring_count > 0:
+		ring_world = Rings.new()
+		ring_world.gravity_scale = 0.0
+		root.add_child(ring_world)
+		ring_world.set_physics_process(false)
+		var spots: Array[Vector2] = []
+		for r: int in rows + 1:
+			for c: int in cols + 1:
+				spots.append(offset + Vector2(c * pitch.x, r * pitch.y))
+		for k: int in ring_count:
+			var at := spots[k % spots.size()] + Vector2(0.0, 60.0 * (k / spots.size()))
+			ring_bodies.append(ring_world.spawn(rng.randf_range(18.0, 26.0), at))
+		if bool(o("couple", true)):
+			w.couple(ring_world)
 	var water := String(o("water", "none"))
 	if water == "uniform":
 		w.current = Vector2(20.0, 0.0)
@@ -145,6 +170,12 @@ func _bench() -> void:
 	var warm := 60
 	var times: Array[float] = []
 	var kernel: Array[float] = []
+	var ring_times: Array[float] = []
+	var both: Array[float] = []
+	var couple_us: Array[float] = []
+	var broad_us: Array[float] = []
+	var pairs := 0
+	var touched := 0
 	var mesh_us := 0
 	var submit_us := 0
 	var vertices := 0
@@ -154,6 +185,10 @@ func _bench() -> void:
 		if f % 120 == 0:
 			for k: int in n:
 				targets[k] = Vector2(rng.randf_range(0.15, 0.85) * size.x, rng.randf_range(0.15, 0.85) * size.y)
+		if ring_world != null and f % 120 == 1:
+			for b: Goo2D in ring_bodies:
+				if is_instance_valid(b):
+					b.set_velocity(Vector2.from_angle(rng.randf() * TAU) * 150.0)
 		for k: int in n:
 			var cr := creatures[k]
 			var to := targets[k] - cr.center()
@@ -162,11 +197,24 @@ func _bench() -> void:
 				cr.set_pose_wave(1.0, length, freqs[k], clampf(err, -1.0, 1.0) * 0.003)
 			else:
 				cr.push(to.normalized() * 300.0)
+		var ring_ms := 0.0
+		if ring_world != null:
+			var tr := Time.get_ticks_usec()
+			ring_world._physics_process(1.0 / 60.0)
+			ring_ms = (Time.get_ticks_usec() - tr) / 1000.0
 		var t0 := Time.get_ticks_usec()
 		w.step(1.0 / 60.0)
 		var ms := (Time.get_ticks_usec() - t0) / 1000.0
 		if f >= warm:
 			times.append(ms)
+			ring_times.append(ring_ms)
+			both.append(ms + ring_ms)
+			if ring_world != null:
+				var cs := w.coupling_stats()
+				couple_us.append(int(cs.get("us", 0)) / 1000.0)
+				broad_us.append(int(cs.get("broad_us", 0)) / 1000.0)
+				pairs += int(cs.get("cell_pairs", 0)) + int(cs.get("bead_pairs", 0))
+				touched += int(cs.get("touched", 0))
 			var s := w.cells().stats()
 			var us := 0
 			for key: String in ["prep_us", "broad_us", "solve_us", "vel_us", "topo_us"]:
@@ -191,6 +239,14 @@ func _bench() -> void:
 	print("cell_world_bench %d × %d %s body %s water %s threads %d substeps %d: world.step median %.2f ms, p95 %.2f, min %.2f (kernel median %.2f)%s; walls %d" % [
 		n, design.cell_count(), "swim" if swim else "collide", String(o("body", "shape")), water, w.threads, w.substeps, med, p95, times[0], kernel[cnt / 2], draw, w.wall_count()])
 	print("  soundness (worst, every 20th frame): cross overlap %.1f px, cells inside another creature %d, self overlap %.1f px, strain %.2f, shape err %.2f, wall overlap %.1f px, not finite %d" % [worst[0], int(worst[1]), worst[2], worst[3], worst[4], worst[6], int(worst[7])])
+	if ring_world != null:
+		ring_times.sort()
+		both.sort()
+		couple_us.sort()
+		broad_us.sort()
+		print("  %d rings, coupled %s: ring world step median %.2f ms, p95 %.2f; both worlds median %.2f ms, p95 %.2f; the coupling inside the cells' step median %.3f ms (broad phase %.3f), p95 %.3f; rings touched per frame %.1f, candidate pairs %.0f" % [
+			ring_count, w.coupled_world() != null, ring_times[cnt / 2], ring_times[cnt * 95 / 100], both[cnt / 2], both[cnt * 95 / 100], couple_us[cnt / 2], broad_us[cnt / 2], couple_us[cnt * 95 / 100], float(touched) / cnt, float(pairs) / cnt])
+		print("RINGS rings=%d coupled=%s ring_median=%.2f both_median=%.2f both_p95=%.2f couple_median=%.3f" % [ring_count, w.coupled_world() != null, ring_times[cnt / 2], both[cnt / 2], both[cnt * 95 / 100], couple_us[cnt / 2]])
 	print("RESULT n=%d m=%d mode=%s body=%s threads=%d median=%.2f p95=%.2f inside=%d" % [n, design.cell_count(), "swim" if swim else "collide", String(o("body", "shape")), w.threads, med, p95, int(worst[1])])
 
 func _swim_test() -> void:
