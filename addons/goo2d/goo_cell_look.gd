@@ -53,7 +53,7 @@ const PRESETS: Dictionary = {
 		"bubble_density": 0.15, "bubble_strength": 0.7,
 		"shade_depth": 50.0, "shade_strength": 0.12, "side_light": 0.25,
 		"specular_power": 70.0, "specular_strength": 1.6, "sheen_strength": 0.3,
-		"brightness": 0.15, "corner_radius": 2.0, "cell_light": 0.2, "cell_rim": 0.6, "cell_specular_power": 16.0,
+		"brightness": 0.15, "corner_radius": 4.0, "cell_light": 0.2, "cell_rim": 0.6, "cell_specular_power": 16.0,
 	},
 }
 

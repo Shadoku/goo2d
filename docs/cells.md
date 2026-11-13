@@ -635,7 +635,7 @@ serving the whole world:
 | `cell_refraction_px` (px) | 1 | 1.5 | 4 | | each cell a small lens |
 | `wall_width`, `wall_softness` (px) | 1.5, 1.5 | 1.5, 1 | 2, 1.2 | | the walls |
 | `wall_strength` | 0.2 | 0.16 | 0.3 | 0.26 | how dark (× a type's `wall_strength`) |
-| `corner_radius` (px) | 2 | 0 | 0 | 3 | each cell's corners rounded |
+| `corner_radius` (px) | 4 | 0 | 0 | 3 | each cell's corners rounded |
 | `wall_highlight` | 0 | 0 | 0.2 | | a thin light line beside each wall's lit side |
 | `wall_rim_fade` | 1 | 0.6 | 0.4 | | walls (and the cells' light) fading within the rim |
 | `border_sharpness` | 2.5 | 3 | 4 | | the types' blend: 1 a gradient across a triangle |

@@ -66,7 +66,7 @@ uniform float wall_softness : hint_range(0.0, 8.0) = 1.5;
 // Each cell's corners (where three cells' walls meet) rounded with this radius (px): the
 // walls keep their width away from the corners and widen into a small fillet there. Keep
 // it well under a cell's radius (the corner stays within its triangle: no seams).
-uniform float corner_radius : hint_range(0.0, 8.0) = 2.0;
+uniform float corner_radius : hint_range(0.0, 8.0) = 4.0;
 // A wall's light side: a thin bright line beside it toward the light (0 none).
 uniform float wall_highlight : hint_range(0.0, 1.0) = 0.0;
 // Walls fade out within the rim (0: they reach the skin, 1: gone at the skin).
