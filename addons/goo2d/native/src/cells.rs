@@ -407,6 +407,9 @@ pub struct Body {
     pub topo_dirty: bool,
     /// WAVE_POSE: the bent design positions this frame (shape matching's goals).
     pub bent: Vec<Vector2>,
+    /// WAVE_POSE: each cell's frame turn in the bent pose (the links' rest angles assume a
+    /// cell's frame turned by it; a shape-matched cell's angle adds it to its fit).
+    pub bent_turn: Vec<f32>,
     pub self_age: u32,
     pub self_stale: bool,
     pub near_start: Vec<u32>,
@@ -731,6 +734,23 @@ impl Body {
             self.region[i] = index[r];
         }
         self.regions = count;
+        // A shape-matched cell needs two linked neighbours of its region for a fit: with
+        // fewer its angle would never be updated, and its links (to another region, or
+        // bending ones) would pin the creature's turn to the world. It bends by its links.
+        for i in 0..n {
+            if !self.cell_shape[i] {
+                continue;
+            }
+            let mut same = 0;
+            for q in self.nb_start[i]..self.nb_start[i + 1] {
+                if self.region[self.nb[q as usize].0 as usize] == self.region[i] {
+                    same += 1;
+                }
+            }
+            if same < 2 {
+                self.cell_shape[i] = false;
+            }
+        }
         // Joints: the links between two regions, grouped by the pair.
         self.joints.clear();
         let design = self.rest_local.len() == n;
@@ -1364,7 +1384,9 @@ impl Body {
             self.muscle[i] = (1.0 - v * k).clamp(0.6, 1.5);
         }
         self.bent = bent;
+        self.bent_turn = turn;
         let bent = &self.bent;
+        let turn = &self.bent_turn;
         for l in self.links.iter_mut() {
             let (i, j) = (l.i as usize, l.j as usize);
             let rd = self.rest_local[j] - self.rest_local[i];
@@ -1628,8 +1650,13 @@ impl Body {
                 }
                 let (co, si) = (sc / ll, ss / ll);
                 // The cell's heading follows its neighbourhood's best-fit turn (thrust and
-                // types read it; shape matching has no spin of its own).
-                self.th[centre] = ss.atan2(sc);
+                // types read it; shape matching has no spin of its own); under the pose wave
+                // the fit is against the bent pose, whose own turn at the cell is added (the
+                // links' rest angles expect it).
+                // Kept continuous: a jump of a whole turn would read as a spin in the bend
+                // constraints' damping.
+                let target = ss.atan2(sc) + if posed && self.bent_turn.len() == n { self.bent_turn[centre] } else { 0.0 };
+                self.th[centre] += wrap(target - self.th[centre]);
                 for q in 0..m {
                     let c = self.sm[s + q] as usize;
                     let gp = xc + rot(goal[q], co, si);
@@ -2762,6 +2789,41 @@ mod tests {
     }
 
     #[test]
+    fn shape_matched_regions_swim_by_the_pose_wave() {
+        // A worm 24 × 5, shape matched: one region, then a spine row of another type
+        // between two strips (three regions, joint links along the worm). Both swim ahead
+        // alike; a shape-matched cell's angle once left out the bent pose's turn, so the
+        // joint links fought the stroke and the worm crabbed sideways.
+        let swim = |strips: bool| {
+            let mut cl = Cells::default();
+            // GooCellWorld2D's stiffnesses.
+            cl.opt.bend_mode = BEND_SHAPE;
+            cl.opt.stretch_hz = 60.0;
+            cl.opt.bend_hz = 40.0;
+            let d = worm_design(24, 5, 7.0, Vector2::ZERO);
+            let t: Vec<u8> = d.iter().map(|p| (strips && p.y.abs() < 1.0) as u8).collect();
+            let c = cl.add_creature(&d, &vec![7.0; d.len()], &t);
+            let length = 24.0 * 14.0;
+            cl.bodies[c].wave = Wave { mode: WAVE_POSE, amp: 1.0, k: std::f32::consts::TAU / length, omega: std::f32::consts::TAU, axis: Vector2::new(1.0, 0.0), half_width: 17.0, bias: 0.0, envelope: 0.6, phase: 0.0, age: 0.0 };
+            for _ in 0..120 {
+                cl.step(1.0 / 60.0);
+            }
+            let c0 = cl.bodies[c].center();
+            for _ in 0..240 {
+                cl.step(1.0 / 60.0);
+            }
+            if strips {
+                assert_eq!(cl.bodies[c].regions, 3);
+            }
+            cl.bodies[c].center() - c0
+        };
+        let (one, three) = (swim(false), swim(true));
+        assert!(one.x.abs() > 40.0, "one region {:?}", one);
+        assert!(three.x.abs() > 0.8 * one.x.abs(), "one {:?} three {:?}", one, three);
+        assert!(three.y.abs() < 0.3 * three.x.abs(), "three regions crab: {:?}", three);
+    }
+
+    #[test]
     fn threaded_equals_serial_with_topology() {
         let run = |threads: usize| {
             let mut cl = crash_world(threads);
@@ -2923,6 +2985,34 @@ mod tests {
         cl.step(1.0 / 60.0);
         assert!(cl.bodies[c].links.iter().all(|l| l.bend));
         assert!(cl.bodies[c].cell_shape.iter().all(|&x| !x));
+    }
+
+    #[test]
+    fn a_thin_region_does_not_pin_the_turn() {
+        // A hex blob twisted: one shape-matched type, then with an arc of rim cells of a
+        // second shape-matched type (its end cells have one neighbour of their region). Both turn
+        // alike; a cell too thin to fit used to keep its angle and pin the creature.
+        let turn = |rim: bool| {
+            let mut cl = Cells::default();
+            cl.opt.types[0].body = BEND_SHAPE;
+            cl.opt.types[1].body = BEND_SHAPE;
+            let d = hex_design(4, 7.0, Vector2::ZERO);
+            let reach = d.iter().map(|p| p.length()).fold(0.0f32, f32::max);
+            let t: Vec<u8> = d.iter().map(|p| (rim && p.length() > 0.85 * reach && p.x < -7.0) as u8).collect();
+            let c = cl.add_creature(&d, &vec![7.0; d.len()], &t);
+            cl.bodies[c].twist = 5.0;
+            for _ in 0..120 {
+                cl.step(1.0 / 60.0);
+            }
+            if rim {
+                assert!(cl.bodies[c].regions >= 2);
+                assert!(cl.bodies[c].cell_shape.iter().any(|&x| !x), "the thin rim cells are not shape matched");
+            }
+            cl.bodies[c].spin()
+        };
+        let (plain, rim) = (turn(false), turn(true));
+        assert!(plain > 3.0, "{}", plain);
+        assert!(rim > 0.8 * plain, "plain {} rim {}", plain, rim);
     }
 
     #[test]
