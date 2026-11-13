@@ -15,6 +15,7 @@
 //! implementations on random loops.
 
 mod cells;
+mod cells_draw;
 mod colony;
 mod consts;
 mod forces;
@@ -1958,6 +1959,8 @@ impl GooCells {
     const EVENT_JOINED: i64 = cells::EVENT_JOINED as i64;
     #[constant]
     const EVENT_SPLIT: i64 = cells::EVENT_SPLIT as i64;
+    #[constant]
+    const BODY_DEFAULT: i64 = cells::BODY_DEFAULT as i64;
 
     /// threads, substeps, stretch_hz, bend_hz, bend_mode, shape_k, link_damp, bend_damp,
     /// collide_all, capsules, contact_hz, contact_pad, self_mode, margin, drag (bool),
@@ -1968,6 +1971,7 @@ impl GooCells {
     #[func]
     fn set_options(&mut self, options: VarDictionary) {
         let mut colliders = false;
+        let mut ratio: Option<f32> = None;
         for (key, value) in options.iter_shared() {
             let name = key.to_string();
             let x = cells_num(&value);
@@ -2018,8 +2022,19 @@ impl GooCells {
                 "density" => o.density = x as f32,
                 "ease_time" => o.ease_time = x as f32,
                 "ease_from" => o.ease_from = x as f32,
+                "break_excess" => o.break_excess = x != 0.0,
+                "break_envelope_time" => o.break_envelope_time = x as f32,
+                "break_envelope_scale" => o.break_envelope_scale = x as f32,
+                "drag_ratio" => ratio = Some(x as f32),
                 _ => godot_error!("GooCells: unknown option {}", name),
             }
+        }
+        if let Some(r) = ratio {
+            // The tangential terms (quadratic and linear) a ratio-th of the normal ones.
+            let o = &mut self.c.opt;
+            let r = r.max(1e-3);
+            o.drag.tangent = o.drag.normal / r;
+            o.drag.linear_tangent = o.drag.linear_normal / r;
         }
         if colliders {
             self.c.refresh_colliders();
@@ -2027,13 +2042,26 @@ impl GooCells {
     }
 
     /// A type's factors: stretch, bend, break (× the options), self_collide (bool),
-    /// join_mask (bits of the types it may join), pad (px added to its contact radius).
+    /// join_mask (bits of the types it may join), pad (px added to its contact radius),
+    /// body (BEND_NONE / BEND_LINK / BEND_SHAPE / BODY_DEFAULT), collide (with other
+    /// creatures), walls (with walls), color (the skin's).
     #[func]
     fn set_type(&mut self, t: i64, params: VarDictionary) {
         let tp = &mut self.c.opt.types[(t as usize).min(cells::TYPES - 1)];
+        let mut version = false;
         for (key, value) in params.iter_shared() {
             let x = cells_num(&value);
             match key.to_string().as_str() {
+                "body" => {
+                    tp.body = x as u8;
+                    version = true;
+                }
+                "collide" => tp.collide = x != 0.0,
+                "walls" => tp.walls = x != 0.0,
+                "color" => {
+                    let c = value.try_to::<Color>().unwrap_or(Color::WHITE);
+                    tp.color = [c.r, c.g, c.b, c.a];
+                }
                 "stretch" => tp.stretch = x as f32,
                 "bend" => tp.bend = x as f32,
                 "break" => tp.brk = x as f32,
@@ -2043,6 +2071,220 @@ impl GooCells {
                 other => godot_error!("GooCells: unknown type parameter {}", other),
             }
         }
+        if version {
+            self.c.opt.types_version = self.c.opt.types_version.wrapping_add(1) % (u32::MAX - 1);
+        }
+    }
+
+    /// add_creature() with each cell's group (cells of one type and group linked together
+    /// form a region) and mass factor (× the density; empty: 1).
+    #[func]
+    fn add_creature_ex(&mut self, centers: PackedVector2Array, radii: PackedFloat32Array, types: PackedInt32Array, groups: PackedInt32Array, masses: PackedFloat32Array) -> i64 {
+        let t: Vec<u8> = types.as_slice().iter().map(|&x| x as u8).collect();
+        let g: Vec<u16> = groups.as_slice().iter().map(|&x| x as u16).collect();
+        self.c.add_creature_ex(centers.as_slice(), radii.as_slice(), &t, &g, masses.as_slice()) as i64
+    }
+
+    /// The links a design gets (pairs of cell indices, flat): cells closer than
+    /// (r_a + r_b) × tol, crossing links dropped longest first (GooCellDesign.links()).
+    #[func]
+    fn design_links(centers: PackedVector2Array, radii: PackedFloat32Array, tol: f64) -> PackedInt32Array {
+        let v = cells::design_links(centers.as_slice(), radii.as_slice(), tol as f32);
+        PackedInt32Array::from_iter(v.iter().flat_map(|p| [p.0 as i32, p.1 as i32]))
+    }
+
+    /// GooStatics' interface, as GooKernel's: a convex polygon in `transform`'s space.
+    #[func]
+    fn add_static_shape(&mut self, id: i64, transform: Transform2D, points: PackedVector2Array, friction: f64, bounce: f64, grip: bool) {
+        self.c.add_static_shape(id, transform, points.as_slice().to_vec(), friction as f32, bounce as f32, grip);
+    }
+
+    #[func]
+    fn set_static_transform(&mut self, id: i64, transform: Transform2D) {
+        self.c.set_static_transform(id, transform);
+    }
+
+    #[func]
+    fn remove_static_shape(&mut self, id: i64) {
+        self.c.remove_static_shape(id);
+    }
+
+    #[func]
+    fn clear_static_shapes(&mut self) {
+        self.c.clear_static_shapes();
+    }
+
+    #[func]
+    fn static_shape_count(&self) -> i64 {
+        self.c.statics.len() as i64
+    }
+
+    /// The walls' polygons in global space, in order.
+    #[func]
+    fn static_shape_points(&self, index: i64) -> PackedVector2Array {
+        self.c.statics.get(index as usize).map(|s| PackedVector2Array::from(s.world.as_slice())).unwrap_or_default()
+    }
+
+    /// The water's velocity at creature c's cells: empty (its current, else the options'),
+    /// one value for all, or one per cell.
+    #[func]
+    fn set_water(&mut self, c: i64, water: PackedVector2Array) {
+        let b = &mut self.c.bodies[c as usize];
+        b.water.clear();
+        let w = water.as_slice();
+        if w.len() == 1 {
+            b.water.resize(b.n, w[0]);
+        } else if w.len() == b.n {
+            b.water.extend_from_slice(w);
+        }
+    }
+
+    /// set_water() for every live creature in one call, in centers_all()'s order.
+    #[func]
+    fn set_water_all(&mut self, water: PackedVector2Array) {
+        self.c.set_water_all(water.as_slice());
+    }
+
+    /// A uniform current for creature c (on: false falls back to the options' current).
+    #[func]
+    fn set_creature_current(&mut self, c: i64, current: Vector2, on: bool) {
+        let b = &mut self.c.bodies[c as usize];
+        b.current = current;
+        b.has_current = on;
+    }
+
+    /// [every live creature's cell centres in slot order, cells per slot]
+    #[func]
+    fn centers_all(&self) -> VarArray {
+        let (p, counts) = self.c.centers_all();
+        let mut a = VarArray::new();
+        a.push(&PackedVector2Array::from(p.as_slice()).to_variant());
+        a.push(&PackedInt32Array::from(counts.as_slice()).to_variant());
+        a
+    }
+
+    /// The creature whose outline holds `point` (-1: none).
+    #[func]
+    fn creature_at(&self, point: Vector2) -> i64 {
+        self.c.creature_at(point)
+    }
+
+    /// Creature c's cell nearest `point` within `reach` px of its disc (-1: none).
+    #[func]
+    fn cell_at(&self, c: i64, point: Vector2, reach: f64) -> i64 {
+        self.c.cell_at(c as usize, point, reach as f32)
+    }
+
+    /// A force on one cell, kept until set again.
+    #[func]
+    fn set_cell_force(&mut self, c: i64, i: i64, force: Vector2) {
+        let b = &mut self.c.bodies[c as usize];
+        if let Some(f) = b.user_force.get_mut(i as usize) {
+            *f = force;
+        }
+    }
+
+    #[func]
+    fn creature_mass(&self, c: i64) -> f64 {
+        self.c.bodies[c as usize].total_mass() as f64
+    }
+
+    /// Each cell's group.
+    #[func]
+    fn groups(&self, c: i64) -> PackedInt32Array {
+        PackedInt32Array::from_iter(self.c.bodies[c as usize].group.iter().map(|&g| g as i32))
+    }
+
+    /// Each cell's region (built at the frame's start: call after a step).
+    #[func]
+    fn regions(&self, c: i64) -> PackedInt32Array {
+        PackedInt32Array::from_iter(self.c.bodies[c as usize].region.iter().map(|&g| g as i32))
+    }
+
+    /// Each cell: shape matched (1) or not.
+    #[func]
+    fn shape_matched(&self, c: i64) -> PackedInt32Array {
+        PackedInt32Array::from_iter(self.c.bodies[c as usize].cell_shape.iter().map(|&g| g as i32))
+    }
+
+    /// Each link: its angle constraints solved (1) or not.
+    #[func]
+    fn link_bends(&self, c: i64) -> PackedInt32Array {
+        PackedInt32Array::from_iter(self.c.bodies[c as usize].links.iter().map(|l| l.bend as i32))
+    }
+
+    /// The joints between creature c's regions: [region a, region b, key a, key b, links] each.
+    #[func]
+    fn joints(&self, c: i64) -> PackedInt32Array {
+        let b = &self.c.bodies[c as usize];
+        PackedInt32Array::from_iter(b.joints.iter().flat_map(|j| [j.ra as i32, j.rb as i32, j.ka as i32, j.kb as i32, j.links as i32]))
+    }
+
+    /// The joint between regions of keys (type << 16 | group) key_a and key_b bent by
+    /// `angle` (rad: the second region turned against the first about the joint).
+    #[func]
+    fn set_joint_angle(&mut self, c: i64, key_a: i64, key_b: i64, angle: f64) {
+        let b = &mut self.c.bodies[c as usize];
+        let (ka, kb, a) = if key_a <= key_b { (key_a as u32, key_b as u32, angle as f32) } else { (key_b as u32, key_a as u32, -angle as f32) };
+        match b.joint_angles.iter_mut().find(|x| x.0 == ka && x.1 == kb) {
+            Some(x) => x.2 = a,
+            None => b.joint_angles.push((ka, kb, a)),
+        }
+    }
+
+    /// Each link's envelope (the creature's own share the break test leaves out).
+    #[func]
+    fn link_envelopes(&self, c: i64) -> PackedFloat32Array {
+        PackedFloat32Array::from_iter(self.c.bodies[c as usize].links.iter().map(|l| l.env))
+    }
+
+    /// One cell's thrust (force along its heading turned by its thrust angle).
+    #[func]
+    fn set_thrust_one(&mut self, c: i64, i: i64, thrust: f64) {
+        let b = &mut self.c.bodies[c as usize];
+        if let Some(t) = b.thrust.get_mut(i as usize) {
+            *t = thrust as f32;
+        }
+    }
+
+    /// Each cell's thrust angle (rad, in its own frame).
+    #[func]
+    fn thrust_angles(&self, c: i64) -> PackedFloat32Array {
+        PackedFloat32Array::from(self.c.bodies[c as usize].thrust_angle.as_slice())
+    }
+
+    /// Each cell's thrust.
+    #[func]
+    fn thrusts(&self, c: i64) -> PackedFloat32Array {
+        PackedFloat32Array::from(self.c.bodies[c as usize].thrust.as_slice())
+    }
+
+    /// Removes creature c: its slot stays, dead (alive() false); no events.
+    #[func]
+    fn remove_creature(&mut self, c: i64) {
+        self.c.remove_creature(c as usize);
+    }
+
+    /// add_cell() with its group and mass factor.
+    #[func]
+    fn add_cell_ex(&mut self, c: i64, at: Vector2, radius: f64, typ: i64, group: i64, mass: f64) -> i64 {
+        self.c.add_cell_ex(c as usize, at, radius as f32, typ as u8, group as u16, mass as f32) as i64
+    }
+
+    /// Every live creature's skin mesh (cells_draw.rs): [points, colors, uvs (triangles,
+    /// three vertices each), border lines (pairs), build µs].
+    #[func]
+    fn meshes_all(&self, borders: bool) -> VarArray {
+        let t = std::time::Instant::now();
+        let m = self.c.meshes_all(borders);
+        let us = t.elapsed().as_micros() as i64;
+        let mut a = VarArray::new();
+        a.push(&PackedVector2Array::from(m.points.as_slice()).to_variant());
+        a.push(&PackedColorArray::from(m.colors.as_slice()).to_variant());
+        a.push(&PackedVector2Array::from(m.uvs.as_slice()).to_variant());
+        a.push(&PackedVector2Array::from(m.lines.as_slice()).to_variant());
+        a.push(&us.to_variant());
+        a
     }
 
     #[func]
@@ -2123,6 +2365,7 @@ impl GooCells {
         for i in 0..b.n {
             b.pos[i] += by;
             b.prev[i] += by;
+            b.pred[i] += by;
         }
     }
 

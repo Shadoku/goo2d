@@ -28,7 +28,8 @@ extends RefCounted
 ## collision_enabled matters (off: the goo passes, as Godot's bodies would).
 ##
 ## A GooWorld2D keeps one for its kernel, and the kernel of lone Goo2D bodies
-## another. attach() follows the tree: a static body, shape or tile layer added
+## another; a GooCellWorld2D one for its GooCells (any object with GooKernel's
+## add_static_shape(), set_static_transform() and clear_static_shapes() will do). attach() follows the tree: a static body, shape or tile layer added
 ## or removed anywhere marks the mirror stale, as does a tile layer's `changed`
 ## (its TileSet swapped, its collision_enabled) or its cells changing (Godot
 ## emits no signal for set_cell(): sync() compares the layer's tile_map_data
@@ -55,7 +56,7 @@ const STRAIGHT: float = 0.001
 # Area (px²) a convex split may lose or gain before it counts as failed.
 const AREA_SLACK: float = 0.5
 
-var _kernel: GooKernel
+var _kernel: Object
 var _tree: SceneTree = null
 var _stale: bool = true
 # One entry per kernel shape: { "node": the CollisionShape2D,
@@ -70,7 +71,7 @@ var _next_id: int = 1
 var _layers: Dictionary[int, Dictionary] = {}
 static var _warned: Dictionary[String, bool] = {}
 
-func _init(kernel: GooKernel) -> void:
+func _init(kernel: Object) -> void:
 	_kernel = kernel
 
 ## Follows `tree`: static bodies, shapes and tile layers added to or removed

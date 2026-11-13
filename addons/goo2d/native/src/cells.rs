@@ -28,7 +28,8 @@
 //! threaded step is bit-identical to the serial one.
 
 use crate::geom::{chaikin, cross, dot, len_sq as lsq, point_in_polygon};
-use godot::builtin::Vector2;
+use crate::statics::StaticShape;
+use godot::builtin::{Transform2D, Vector2};
 use rayon::prelude::*;
 use std::time::Instant;
 
@@ -59,6 +60,9 @@ pub const EVENT_JOINED: i32 = 1;
 pub const EVENT_SPLIT: i32 = 2;
 
 pub const TYPES: usize = 16;
+
+/// A type's body mode: the options' bend_mode (TypeParams.body's default).
+pub const BODY_DEFAULT: u8 = 255;
 
 #[inline]
 fn rot(v: Vector2, c: f32, s: f32) -> Vector2 {
@@ -122,11 +126,27 @@ pub struct TypeParams {
     pub join_mask: u16,
     /// Contacts with other creatures: added to the radius (px) of this type's cells.
     pub pad: f32,
+    /// How cells of this type hold their shape: BEND_NONE, BEND_LINK (oriented links),
+    /// BEND_SHAPE (shape matching within their region), BODY_DEFAULT (the options').
+    pub body: u8,
+    /// Collides with other creatures' cells (its boundary cells are colliders).
+    pub collide: bool,
+    /// Collides with the walls.
+    pub walls: bool,
+    /// The skin's colour of this type's cells (r, g, b, a).
+    pub color: [f32; 4],
 }
 
 impl Default for TypeParams {
     fn default() -> Self {
-        TypeParams { stretch: 1.0, bend: 1.0, brk: 1.0, self_collide: false, join_mask: 0xffff, pad: 0.0 }
+        TypeParams { stretch: 1.0, bend: 1.0, brk: 1.0, self_collide: false, join_mask: 0xffff, pad: 0.0, body: BODY_DEFAULT, collide: true, walls: true, color: [0.35, 0.75, 0.45, 1.0] }
+    }
+}
+
+impl TypeParams {
+    #[inline]
+    pub fn mode(&self, opt_mode: u8) -> u8 {
+        if self.body == BODY_DEFAULT { opt_mode } else { self.body }
     }
 }
 
@@ -182,6 +202,16 @@ pub struct Opt {
     pub ease_time: f32,
     pub ease_from: f32,
     pub types: [TypeParams; TYPES],
+    /// Bumped when a type's body mode changes: creatures rebuild their regions.
+    pub types_version: u32,
+    /// The break test leaves out the creature's own share of each link's load (muscles,
+    /// thrust, drag): a link breaks when its load passes break_force over the envelope of
+    /// the loads it carried while the creature touched nothing (see `Link::env`).
+    pub break_excess: bool,
+    /// The envelope's decay time (s) while the creature touches nothing.
+    pub break_envelope_time: f32,
+    /// The envelope counts × this (> 1: a margin over the creature's own peaks).
+    pub break_envelope_scale: f32,
 }
 
 impl Default for Opt {
@@ -220,6 +250,10 @@ impl Default for Opt {
             ease_time: 0.5,
             ease_from: 0.3,
             types: [TypeParams::default(); TYPES],
+            types_version: 0,
+            break_excess: false,
+            break_envelope_time: 2.0,
+            break_envelope_scale: 1.0,
         }
     }
 }
@@ -255,6 +289,28 @@ pub struct Link {
     pub load: f32,
     /// A link of a cell growing in: its length when made; its rest eases from it.
     pub d_from: f32,
+    /// Its angle constraints are solved (a link inside one shape-matched region has none).
+    pub bend: bool,
+    /// A joint between two regions: its index + 1 in the body's joints (0: none); `jflip`:
+    /// its end i is in the joint's second region.
+    pub joint: u32,
+    pub jflip: bool,
+    /// The envelope of the loads it carried while its creature touched nothing (decaying
+    /// over break_envelope_time): the creature's own share, left out of the break test.
+    pub env: f32,
+}
+
+/// Two regions of a creature that meet: the links between them bend about `pivot` (the
+/// mean of their midpoints in the design) when the joint's angle is set.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Joint {
+    pub ra: u32,
+    pub rb: u32,
+    /// The regions' keys (type << 16 | group), ka < kb.
+    pub ka: u32,
+    pub kb: u32,
+    pub pivot: Vector2,
+    pub links: u32,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -275,14 +331,6 @@ pub struct Wave {
     pub age: f32,
 }
 
-#[derive(Clone, Copy)]
-pub struct Wall {
-    pub pts: [Vector2; 8],
-    pub nrm: [Vector2; 8],
-    pub n: usize,
-    pub lo: Vector2,
-    pub hi: Vector2,
-}
 
 #[derive(Clone, Copy, Debug)]
 pub struct Cross {
@@ -299,6 +347,11 @@ pub struct Body {
     pub n: usize,
     pub pos: Vec<Vector2>,
     pub prev: Vec<Vector2>,
+    /// Where the substep's prediction put each cell (prev + vel × h, as stored): the
+    /// substep's velocity is vel + (pos − pred) / h, so the rounding of f32 positions far
+    /// from the origin never feeds back into the velocities (with (pos − prev) / h a blob
+    /// drifting in a current at x ≈ 1000 px fell 0.8 % short of its speed).
+    pub pred: Vec<Vector2>,
     pub vel: Vec<Vector2>,
     pub th: Vec<f32>,
     pub th_prev: Vec<f32>,
@@ -312,6 +365,8 @@ pub struct Body {
     pub w: Vec<f32>,
     pub iw: Vec<f32>,
     pub typ: Vec<u8>,
+    /// Its group: cells of one type and group linked together form one region.
+    pub group: Vec<u16>,
     pub uid: Vec<u32>,
     /// A cell growing in: seconds left of its ease (0: done).
     pub ease: Vec<f32>,
@@ -356,12 +411,30 @@ pub struct Body {
     pub self_stale: bool,
     pub near_start: Vec<u32>,
     pub near_list: Vec<u32>,
+    /// The water's velocity per cell (empty: `current` if has_current, else the options').
+    pub water: Vec<Vector2>,
+    pub current: Vector2,
+    pub has_current: bool,
+    /// Per cell: its region (cells of one type and group linked together), shape matched.
+    pub region: Vec<u32>,
+    pub cell_shape: Vec<bool>,
+    pub regions: u32,
+    pub joints: Vec<Joint>,
+    /// Joint angles by region keys (ka, kb, rad: the second region turned against the first).
+    pub joint_angles: Vec<(u32, u32, f32)>,
+    /// The options' types_version the regions were built for (u32::MAX: stale).
+    pub regions_built: u32,
+    /// Something outside the creature pushed one of its cells this frame (a wall, another
+    /// creature, a script force): its links' envelopes hold still.
+    pub contact: bool,
 }
 
 pub struct Cells {
     pub opt: Opt,
     pub bodies: Vec<Body>,
-    pub walls: Vec<Wall>,
+    /// The walls: convex polygons, GooStatics' (add_static_shape()) or add_wall()'s.
+    pub statics: Vec<StaticShape>,
+    next_wall_id: i64,
     pool: Option<rayon::ThreadPool>,
     pool_threads: usize,
     pub grid_cell: f32,
@@ -391,7 +464,7 @@ pub struct Stats {
 
 impl Default for Cells {
     fn default() -> Self {
-        Cells { opt: Opt::default(), bodies: Vec::new(), walls: Vec::new(), pool: None, pool_threads: 1, grid_cell: 64.0, stats: Stats::default(), cross: Vec::new(), events: Vec::new(), next_uid: 0, frame: 0 }
+        Cells { opt: Opt::default(), bodies: Vec::new(), statics: Vec::new(), next_wall_id: -1, pool: None, pool_threads: 1, grid_cell: 64.0, stats: Stats::default(), cross: Vec::new(), events: Vec::new(), next_uid: 0, frame: 0 }
     }
 }
 
@@ -418,45 +491,82 @@ fn grid_query(grid: &[(u64, u32)], k: (i32, i32), out: &mut Vec<u32>) {
     }
 }
 
-/// The signed distance from p to a convex wall and the outward normal there.
-pub fn wall_distance(w: &Wall, p: Vector2) -> (f32, Vector2) {
-    let mut best_s = f32::NEG_INFINITY;
-    let mut best_n = Vector2::ZERO;
-    for e in 0..w.n {
-        let s = dot(p - w.pts[e], w.nrm[e]);
-        if s > best_s {
-            best_s = s;
-            best_n = w.nrm[e];
+/// The signed distance from p to a convex wall (negative: inside) and the outward
+/// direction there.
+pub fn wall_distance(w: &StaticShape, p: Vector2) -> (f32, Vector2) {
+    w.gap(p, 0.0, f32::INFINITY).unwrap_or((f32::INFINITY, Vector2::ZERO))
+}
+
+/// The face through which the segment a → b first enters convex wall `w`, when a is
+/// outside it and the segment reaches it (Cyrus-Beck); None otherwise. A cell whose centre
+/// crossed into a wall within a substep is pushed back out through this face, never
+/// through the nearest one: a thin wall (or a convex piece of a concave one) is not
+/// tunnelled through at the speed cap.
+#[inline]
+pub fn entry_face(w: &StaticShape, a: Vector2, b: Vector2) -> Option<usize> {
+    let n = w.world.len();
+    if n < 3 {
+        return None;
+    }
+    let d = b - a;
+    let (mut t0, mut t1) = (0.0f32, 1.0f32);
+    let mut face = None;
+    for k in 0..n {
+        let nk = w.normals[k];
+        let sa = dot(nk, a - w.world[k]);
+        let sd = dot(nk, d);
+        if sd.abs() < 1e-12 {
+            if sa > 0.0 {
+                return None;
+            }
+            continue;
+        }
+        let t = -sa / sd;
+        if sd < 0.0 {
+            if t > t0 {
+                t0 = t;
+                face = Some(k);
+            }
+        } else if t < t1 {
+            t1 = t;
+        }
+        if t0 > t1 {
+            return None;
         }
     }
-    if best_s <= 0.0 {
-        return (best_s, best_n);
+    face
+}
+
+/// One cell against one wall: out through the face its centre entered by this substep, or
+/// out of any overlap along the nearest direction.
+#[inline]
+fn push_out_of_wall(w: &StaticShape, prev: Vector2, p: Vector2, r: f32) -> Vector2 {
+    if let Some(k) = entry_face(w, prev, p) {
+        let s = dot(w.normals[k], p - w.world[k]);
+        return p + w.normals[k] * (r - s);
     }
-    let mut best = f32::INFINITY;
-    let mut bn = best_n;
-    for e in 0..w.n {
-        let a = w.pts[e];
-        let b = w.pts[(e + 1) % w.n];
-        let ab = b - a;
-        let t = (dot(p - a, ab) / lsq(ab).max(1e-9)).clamp(0.0, 1.0);
-        let q = a + ab * t;
-        let d = lsq(p - q);
-        if d < best {
-            best = d;
-            bn = p - q;
+    if let Some((g, dir)) = w.gap(p, r, 0.0) {
+        if g < 0.0 {
+            return p - dir * g;
         }
     }
-    let d = best.sqrt();
-    (d, if d > 1e-9 { bn / d } else { best_n })
+    p
 }
 
 impl Body {
     pub fn new(centers: &[Vector2], radii: &[f32], types: &[u8], density: f32, uid0: u32) -> Body {
+        Body::new_ex(centers, radii, types, &[], &[], density, uid0)
+    }
+
+    /// With per-cell groups (regions) and mass factors (× the density; empty: 1).
+    pub fn new_ex(centers: &[Vector2], radii: &[f32], types: &[u8], groups: &[u16], masses: &[f32], density: f32, uid0: u32) -> Body {
         let n = centers.len();
-        let mut b = Body { alive: true, n, ..Default::default() };
+        let mut b = Body { alive: true, n, regions_built: u32::MAX, ..Default::default() };
         for i in 0..n {
             let r = radii.get(i).copied().unwrap_or(10.0).max(0.5);
-            b.push_cell(centers[i], r, *types.get(i).unwrap_or(&0), density, uid0 + i as u32);
+            let m = masses.get(i).copied().unwrap_or(1.0).max(1e-3);
+            b.push_cell(centers[i], r, *types.get(i).unwrap_or(&0), density * m, uid0 + i as u32);
+            b.group[i] = groups.get(i).copied().unwrap_or(0);
         }
         b.rest_local_from_now(false);
         b
@@ -466,6 +576,7 @@ impl Body {
         let m = density * std::f32::consts::PI * r * r;
         self.pos.push(p);
         self.prev.push(p);
+        self.pred.push(p);
         self.vel.push(Vector2::ZERO);
         self.th.push(0.0);
         self.th_prev.push(0.0);
@@ -478,6 +589,7 @@ impl Body {
         self.w.push(1.0 / m);
         self.iw.push(1.0 / (0.5 * m * r * r));
         self.typ.push(t);
+        self.group.push(0);
         self.uid.push(uid);
         self.ease.push(0.0);
         self.force.push(Vector2::ZERO);
@@ -544,22 +656,8 @@ impl Body {
             }
         }
         self.nb_start.push(self.nb.len() as u32);
-        self.sm_start.clear();
-        self.sm.clear();
-        self.sm_off.clear();
-        for i in 0..n {
-            self.sm_start.push(self.sm.len() as u32);
-            self.sm.push(i as u32);
-            self.sm_off.push(Vector2::ZERO);
-            for q in self.nb_start[i]..self.nb_start[i + 1] {
-                let j = self.nb[q as usize].0 as usize;
-                self.sm.push(j as u32);
-                // The design offset, turned into the frame of the design (rest_local).
-                let off = if self.rest_local.len() == n { self.rest_local[j] - self.rest_local[i] } else { self.pos[j] - self.pos[i] };
-                self.sm_off.push(off);
-            }
-        }
-        self.sm_start.push(self.sm.len() as u32);
+        // Regions, shape-matching clusters and joints: built at the next frame's start.
+        self.regions_built = u32::MAX;
         // Cells within two links of each cell, sorted (the own contacts' exclusions).
         self.near_start.clear();
         self.near_list.clear();
@@ -587,6 +685,112 @@ impl Body {
         // Rebuild the creature's own candidates now; stagger later rebuilds by creature.
         self.self_stale = true;
         self.self_age = (self.uid.first().copied().unwrap_or(0).wrapping_mul(2_654_435_761) >> 13) & 0xffff;
+    }
+
+    /// Regions (cells of one type and group joined by links), which cells are shape
+    /// matched (their type's body mode), which links bend (all but those inside one
+    /// shape-matched region), the shape-matching clusters (a cell and its linked
+    /// neighbours of its region) and the joints between regions.
+    pub fn build_regions(&mut self, opt: &Opt) {
+        let n = self.n;
+        let key = |b: &Body, i: usize| ((b.typ[i] as u32) << 16) | b.group[i] as u32;
+        let mode: Vec<u8> = (0..n).map(|i| opt.types[self.typ[i] as usize].mode(opt.bend_mode)).collect();
+        self.cell_shape = mode.iter().map(|&m| m == BEND_SHAPE).collect();
+        let mut parent: Vec<usize> = (0..n).collect();
+        fn find(p: &mut [usize], x: usize) -> usize {
+            let mut x = x;
+            while p[x] != x {
+                p[x] = p[p[x]];
+                x = p[x];
+            }
+            x
+        }
+        for l in &self.links {
+            let (i, j) = (l.i as usize, l.j as usize);
+            if key(self, i) == key(self, j) {
+                let (a, b) = (find(&mut parent, i), find(&mut parent, j));
+                if a != b {
+                    let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+                    parent[hi] = lo;
+                }
+            }
+        }
+        let mut index = vec![u32::MAX; n];
+        self.region = vec![0; n];
+        let mut count = 0u32;
+        for i in 0..n {
+            let r = find(&mut parent, i);
+            if index[r] == u32::MAX {
+                index[r] = count;
+                count += 1;
+            }
+            self.region[i] = index[r];
+        }
+        self.regions = count;
+        // Joints: the links between two regions, grouped by the pair.
+        self.joints.clear();
+        let design = self.rest_local.len() == n;
+        for li in 0..self.links.len() {
+            let (i, j) = (self.links[li].i as usize, self.links[li].j as usize);
+            let (ri, rj) = (self.region[i], self.region[j]);
+            let same = ri == rj;
+            let l = &mut self.links[li];
+            l.bend = !(same && self.cell_shape[i] && self.cell_shape[j]) && (mode[i] != BEND_NONE || mode[j] != BEND_NONE);
+            l.joint = 0;
+            l.jflip = false;
+            if same {
+                continue;
+            }
+            let (ki, kj) = (key(self, i), key(self, j));
+            // The joint's first region: the lower key (the lower region id between equals).
+            let flip = ki > kj || (ki == kj && ri > rj);
+            let (ra, rb, ka, kb) = if flip { (rj, ri, kj, ki) } else { (ri, rj, ki, kj) };
+            let mid = if design { (self.rest_local[i] + self.rest_local[j]) * 0.5 } else { (self.pos[i] + self.pos[j]) * 0.5 };
+            let k = match self.joints.iter().position(|jt| jt.ra == ra && jt.rb == rb) {
+                Some(k) => k,
+                None => {
+                    self.joints.push(Joint { ra, rb, ka, kb, pivot: Vector2::ZERO, links: 0 });
+                    self.joints.len() - 1
+                }
+            };
+            self.joints[k].pivot += mid;
+            self.joints[k].links += 1;
+            let l = &mut self.links[li];
+            l.joint = k as u32 + 1;
+            l.jflip = flip;
+        }
+        for jt in self.joints.iter_mut() {
+            jt.pivot /= jt.links.max(1) as f32;
+        }
+        // Shape-matching clusters: each shape-matched cell and its linked neighbours of its
+        // own region, with their design offsets.
+        self.sm_start.clear();
+        self.sm.clear();
+        self.sm_off.clear();
+        for i in 0..n {
+            self.sm_start.push(self.sm.len() as u32);
+            if !self.cell_shape[i] {
+                continue;
+            }
+            self.sm.push(i as u32);
+            self.sm_off.push(Vector2::ZERO);
+            for q in self.nb_start[i]..self.nb_start[i + 1] {
+                let j = self.nb[q as usize].0 as usize;
+                if self.region[j] != self.region[i] {
+                    continue;
+                }
+                self.sm.push(j as u32);
+                let off = if design { self.rest_local[j] - self.rest_local[i] } else { self.pos[j] - self.pos[i] };
+                self.sm_off.push(off);
+            }
+        }
+        self.sm_start.push(self.sm.len() as u32);
+        self.regions_built = opt.types_version;
+    }
+
+    /// The joint angle set for regions of keys (ka, kb), ka <= kb (0: none).
+    fn joint_angle(&self, ka: u32, kb: u32) -> f32 {
+        self.joint_angles.iter().find(|x| x.0 == ka && x.1 == kb).map(|x| x.2).unwrap_or(0.0)
     }
 
     pub fn linked(&self, a: usize, b: usize) -> bool {
@@ -821,10 +1025,14 @@ impl Body {
 
 impl Body {
     /// Muscles, rest values, compliances, forces, the box and the candidates of a frame.
-    fn prepare(&mut self, opt: &Opt, dt: f32, walls: &[Wall], cell: f32) {
+    fn prepare(&mut self, opt: &Opt, dt: f32, walls: &[StaticShape], cell: f32) {
         let n = self.n;
         let h = dt / opt.substeps as f32;
         self.time += dt;
+        if self.regions_built != opt.types_version {
+            self.build_regions(opt);
+        }
+        self.contact = false;
         // Muscles: a wave, or the scales the script set (muscle[]), times the ease.
         let pose = self.wave.mode == WAVE_POSE;
         self.wave.age += dt;
@@ -842,6 +1050,9 @@ impl Body {
             }
         } else if pose {
             self.pose_wave(opt);
+        }
+        if !self.joints.is_empty() {
+            self.joint_rest(pose);
         }
         for i in 0..n {
             let mut e = 1.0;
@@ -927,6 +1138,9 @@ impl Body {
         // Frame forces.
         for i in 0..n {
             let mut f = self.user_force[i];
+            if f != Vector2::ZERO {
+                self.contact = true;
+            }
             if self.thrust[i] != 0.0 {
                 let a = self.th[i] + self.thrust_angle[i];
                 f += Vector2::new(a.cos(), a.sin()) * self.thrust[i];
@@ -994,17 +1208,20 @@ impl Body {
         let margin = opt.margin + self.vmax * dt;
         self.wall_c.clear();
         for (wi, w) in walls.iter().enumerate() {
-            if w.hi.x < lo.x - margin || w.lo.x > hi.x + margin || w.hi.y < lo.y - margin || w.lo.y > hi.y + margin {
+            let (wlo, whi) = (w.aabb.pos, w.aabb.pos + w.aabb.size);
+            if whi.x < lo.x - margin || wlo.x > hi.x + margin || whi.y < lo.y - margin || wlo.y > hi.y + margin {
                 continue;
             }
             for c in 0..n as u32 {
-                let p = self.pos[c as usize];
-                let r = self.r[c as usize] + margin;
-                if p.x + r < w.lo.x || p.x - r > w.hi.x || p.y + r < w.lo.y || p.y - r > w.hi.y {
+                if !opt.types[self.typ[c as usize] as usize].walls {
                     continue;
                 }
-                let (d, _) = wall_distance(w, p);
-                if d < r {
+                let p = self.pos[c as usize];
+                let r = self.r[c as usize] + margin;
+                if p.x + r < wlo.x || p.x - r > whi.x || p.y + r < wlo.y || p.y - r > whi.y {
+                    continue;
+                }
+                if w.gap(p, self.r[c as usize], margin).is_some() {
                     self.wall_c.push((c, wi as u32));
                 }
             }
@@ -1156,6 +1373,53 @@ impl Body {
         }
     }
 
+    /// The joints' rest values: each joint's second region turned by its angle about the
+    /// joint's pivot in the design; on top of the pose wave's when it runs.
+    fn joint_rest(&mut self, pose: bool) {
+        let design = self.rest_local.len() == self.n;
+        for li in 0..self.links.len() {
+            let l = self.links[li];
+            if l.joint == 0 {
+                continue;
+            }
+            let jt = self.joints[l.joint as usize - 1];
+            let delta = self.joint_angle(jt.ka, jt.kb);
+            let l = &mut self.links[li];
+            if !pose {
+                l.d_design = l.d_base;
+                l.ai_design = l.ai_base;
+                l.aj_design = l.aj_base;
+            }
+            if delta == 0.0 || !design {
+                continue;
+            }
+            let (ri, rj) = (self.rest_local[l.i as usize], self.rest_local[l.j as usize]);
+            let (c, s) = (delta.cos(), delta.sin());
+            let turned = |p: Vector2| jt.pivot + rot(p - jt.pivot, c, s);
+            let (bi, bj) = if l.jflip { (turned(ri), rj) } else { (ri, turned(rj)) };
+            let rd = rj - ri;
+            let bd = bj - bi;
+            let rl = rd.length().max(1e-6);
+            l.d_design *= bd.length() / rl;
+            let dang = wrap(bd.y.atan2(bd.x) - rd.y.atan2(rd.x));
+            let (ti, tj) = if l.jflip { (delta, 0.0) } else { (0.0, delta) };
+            l.ai_design += dang - ti;
+            l.aj_design += dang - tj;
+        }
+    }
+
+    /// The water's velocity at cell i.
+    #[inline]
+    fn water_at(&self, i: usize, current: Vector2) -> Vector2 {
+        if self.water.len() == self.n {
+            self.water[i]
+        } else if self.has_current {
+            self.current
+        } else {
+            current
+        }
+    }
+
     fn apply_drag(&mut self, d: &Drag, current: Vector2, dt: f32) {
         let m = self.outline.len();
         for f in self.drag_f.iter_mut() {
@@ -1179,7 +1443,7 @@ impl Body {
                 continue;
             }
             let t = ex / length;
-            let v = (self.vel[ia] + self.vel[ib]) * 0.5 - current;
+            let v = (self.vel[ia] + self.vel[ib] - self.water_at(ia, current) - self.water_at(ib, current)) * 0.5;
             let vn = v.y * t.x - v.x * t.y;
             let vt = v.x * t.x + v.y * t.y;
             // The outside is on the walk's left in math axes: normal (t.y, -t.x) points out.
@@ -1197,7 +1461,7 @@ impl Body {
         let lim = d.max_step / dt;
         for i in 0..self.n {
             let f = self.drag_f[i];
-            let limit = lim * self.mass[i] * (self.vel[i] - current).length();
+            let limit = lim * self.mass[i] * (self.vel[i] - self.water_at(i, current)).length();
             let s = lsq(f);
             if s > limit * limit {
                 self.drag_f[i] = if s > 0.0 { f * (limit / s.sqrt()) } else { Vector2::ZERO };
@@ -1218,6 +1482,7 @@ impl Body {
             self.vel[i] = v;
             self.prev[i] = self.pos[i];
             self.pos[i] += v * h;
+            self.pred[i] = self.pos[i];
             self.th_prev[i] = self.th[i];
             self.th[i] += self.om[i] * h;
         }
@@ -1227,7 +1492,7 @@ impl Body {
         let ih = 1.0 / h;
         let vmax2 = opt.max_speed * opt.max_speed;
         for i in 0..self.n {
-            let mut v = (self.pos[i] - self.prev[i]) * ih;
+            let mut v = self.vel[i] + (self.pos[i] - self.pred[i]) * ih;
             let s = lsq(v);
             if s > vmax2 {
                 v *= opt.max_speed / s.sqrt();
@@ -1237,12 +1502,13 @@ impl Body {
         }
     }
 
-    fn solve(&mut self, opt: &Opt, walls: &[Wall], h: f32) {
+    fn solve(&mut self, opt: &Opt, walls: &[StaticShape], h: f32) {
         let n = self.n;
         let inv_s = 1.0 / (opt.substeps as f32 * h * h);
         let g = opt.link_damp;
         let gb = opt.bend_damp;
-        let bend_link = opt.bend_mode == BEND_LINK;
+        let bend_link = self.links.iter().any(|l| l.bend);
+        let any_shape = self.cell_shape.iter().any(|&x| x);
         if bend_link {
             self.cs.clear();
             for i in 0..n {
@@ -1259,6 +1525,7 @@ impl Body {
             let th = &mut self.th[..];
             let th_prev = &self.th_prev[..];
             let cs = &mut self.cs[..];
+            let shaped = &self.cell_shape[..];
             for l in self.links.iter() {
                 assert!((l.i as usize) < n && (l.j as usize) < n);
             }
@@ -1281,7 +1548,7 @@ impl Body {
                     *pos.get_unchecked_mut(j) = pj + p * wj;
                     *pos.get_unchecked_mut(i) = pi - p * wi;
                     l.f_frame += dl.abs() * inv_s;
-                    if !bend_link {
+                    if !l.bend {
                         continue;
                     }
                     // Bend: the link's angle in each end's frame.
@@ -1299,7 +1566,10 @@ impl Body {
                         let cerr = angle_to(uw, d, len);
                         let gp = perp(d) / l2;
                         let rel = dot(gp, (pb - *prev.get_unchecked(b)) - (pa - *prev.get_unchecked(a))) - (*th.get_unchecked(a) - *th_prev.get_unchecked(a));
-                        let (wa, wb, iwa) = (*w.get_unchecked(a), *w.get_unchecked(b), *iw.get_unchecked(a));
+                        // A shape-matched end takes its frame from its region's fit: the
+                        // constraint moves the cells only (its own turn is not kept).
+                        let iwa = if *shaped.get_unchecked(a) { 0.0 } else { *iw.get_unchecked(a) };
+                        let (wa, wb) = (*w.get_unchecked(a), *w.get_unchecked(b));
                         let wsum = (wa + wb) / l2 + iwa;
                         let dl = -(cerr + gb * rel) / ((1.0 + gb) * wsum + l.alpha_ang);
                         *pos.get_unchecked_mut(b) = pb + gp * (dl * wb);
@@ -1312,7 +1582,7 @@ impl Body {
                 }
             }
         }
-        if opt.bend_mode == BEND_SHAPE {
+        if any_shape {
             let kk = opt.shape_k;
             let posed = self.wave.mode == WAVE_POSE && self.bent.len() == n;
             let mut goal: [Vector2; 32] = [Vector2::ZERO; 32];
@@ -1323,6 +1593,10 @@ impl Body {
                     continue;
                 }
                 let centre = self.sm[s] as usize;
+                // Positions relative to the cluster's own cell: in world coordinates the
+                // fit's rounding (f32, sums of mass × position) drags a moving creature
+                // (a blob lost a quarter of its speed in 10 s).
+                let base = self.pos[centre];
                 let mut qc = Vector2::ZERO;
                 let mut xc = Vector2::ZERO;
                 let mut ms = 0.0;
@@ -1331,7 +1605,7 @@ impl Body {
                     let f = (self.rscale[c] * self.r0[c] + self.rscale[centre] * self.r0[centre]) / (self.r0[c] + self.r0[centre]);
                     goal[q] = if posed { (self.bent[c] - self.bent[centre]) * (self.sm_off[s + q].length() / (self.rest_local[c] - self.rest_local[centre]).length().max(1e-6)).min(4.0) } else { self.sm_off[s + q] * f };
                     qc += goal[q] * self.mass[c];
-                    xc += self.pos[c] * self.mass[c];
+                    xc += (self.pos[c] - base) * self.mass[c];
                     ms += self.mass[c];
                 }
                 qc /= ms;
@@ -1340,7 +1614,7 @@ impl Body {
                 for q in 0..m {
                     let c = self.sm[s + q] as usize;
                     goal[q] -= qc;
-                    let p = self.pos[c] - xc;
+                    let p = self.pos[c] - base - xc;
                     sc += self.mass[c] * dot(goal[q], p);
                     ss += self.mass[c] * cross(goal[q], p);
                 }
@@ -1355,17 +1629,17 @@ impl Body {
                 for q in 0..m {
                     let c = self.sm[s + q] as usize;
                     let gp = xc + rot(goal[q], co, si);
-                    let here = self.pos[c];
-                    self.pos[c] = here + (gp - here) * kk;
+                    let here = self.pos[c] - base;
+                    self.pos[c] += (gp - here) * kk;
                 }
             }
         }
         for &(c, wi) in &self.wall_c {
             let c = c as usize;
-            let (d, nrm) = wall_distance(&walls[wi as usize], self.pos[c]);
-            let pen = self.r[c] - d;
-            if pen > 0.0 {
-                self.pos[c] += nrm * pen;
+            let p = push_out_of_wall(&walls[wi as usize], self.prev[c], self.pos[c], self.r[c]);
+            if p != self.pos[c] {
+                self.pos[c] = p;
+                self.contact = true;
             }
         }
         for &(a, b) in &self.self_c {
@@ -1390,16 +1664,30 @@ impl Body {
         self.finish_substep(opt, h);
         self.broken.clear();
         let a = (dt / opt.break_smooth.max(1e-6)).min(1.0);
+        let decay = (-dt / opt.break_envelope_time.max(1e-6)).exp();
+        let free = !self.contact;
         for (k, l) in self.links.iter_mut().enumerate() {
             let f = l.f_frame + opt.break_torque * l.t_frame / l.rest.max(1e-3);
             l.load += (f - l.load) * a;
+            // The creature's own share: the envelope of the loads while it touched nothing.
+            if free {
+                l.env = l.load.max(l.env * decay);
+            }
             if opt.break_force.is_finite() {
                 let (ti, tj) = (&opt.types[self.typ[l.i as usize] as usize], &opt.types[self.typ[l.j as usize] as usize]);
-                if l.load > opt.break_force * ti.brk.min(tj.brk) {
+                let test = if opt.break_excess { l.load - opt.break_envelope_scale * l.env } else { l.load };
+                if test > opt.break_force * ti.brk.min(tj.brk) {
                     self.broken.push(k as u32);
                 }
             }
         }
+    }
+}
+
+fn par_bodies<F: Fn(&mut Body) + Sync + Send>(pool: &Option<rayon::ThreadPool>, bodies: &mut [Body], f: F) {
+    match pool {
+        Some(pool) => pool.install(|| bodies.par_iter_mut().filter(|b| b.alive).for_each(|b| f(b))),
+        None => bodies.iter_mut().filter(|b| b.alive).for_each(|b| f(b)),
     }
 }
 
@@ -1446,6 +1734,8 @@ fn solve_cross(bodies: &mut [Body], cr: &[Cross], opt: &Opt, h: f32) {
             let p = d * (pen / (l * ws * (1.0 + kc)));
             a.pos[ai] -= p * a.w[ai];
             b.pos[bi] += p * b.w[bi];
+            a.contact = true;
+            b.contact = true;
         } else {
             let m = b.outline.len();
             let e = x.bi as usize;
@@ -1469,6 +1759,8 @@ fn solve_cross(bodies: &mut [Body], cr: &[Cross], opt: &Opt, h: f32) {
             a.pos[ai] += nrm * (dl * a.w[ai]);
             b.pos[p] -= nrm * (dl * (1.0 - t) * b.w[p]);
             b.pos[q] -= nrm * (dl * t * b.w[q]);
+            a.contact = true;
+            b.contact = true;
         }
     }
 }
@@ -1488,6 +1780,7 @@ impl Body {
         }
         take!(pos);
         take!(prev);
+        take!(pred);
         take!(vel);
         take!(th);
         take!(th_prev);
@@ -1500,6 +1793,7 @@ impl Body {
         take!(w);
         take!(iw);
         take!(typ);
+        take!(group);
         take!(uid);
         take!(ease);
         take!(force);
@@ -1510,6 +1804,13 @@ impl Body {
         take!(rest_local);
         b.drag_f = vec![Vector2::ZERO; b.n];
         b.muscles_set = self.muscles_set;
+        if self.water.len() == self.n {
+            take!(water);
+        }
+        b.current = self.current;
+        b.has_current = self.has_current;
+        b.joint_angles = self.joint_angles.clone();
+        b.regions_built = u32::MAX;
         for l in &self.links {
             let (i, j) = (map[l.i as usize], map[l.j as usize]);
             if i != u32::MAX && j != u32::MAX {
@@ -1602,16 +1903,17 @@ impl Cells {
     }
 
     fn for_each<F: Fn(&mut Body) + Sync + Send>(&mut self, f: F) {
-        let bodies = &mut self.bodies;
-        match &self.pool {
-            Some(pool) => pool.install(|| bodies.par_iter_mut().filter(|b| b.alive).for_each(|b| f(b))),
-            None => bodies.iter_mut().filter(|b| b.alive).for_each(|b| f(b)),
-        }
+        par_bodies(&self.pool, &mut self.bodies, f);
     }
 
     pub fn add_creature(&mut self, centers: &[Vector2], radii: &[f32], types: &[u8]) -> usize {
+        self.add_creature_ex(centers, radii, types, &[], &[])
+    }
+
+    /// A creature from a design: cells, radii, types, groups (regions) and mass factors.
+    pub fn add_creature_ex(&mut self, centers: &[Vector2], radii: &[f32], types: &[u8], groups: &[u16], masses: &[f32]) -> usize {
         let t = Instant::now();
-        let mut b = Body::new(centers, radii, types, self.opt.density, self.next_uid);
+        let mut b = Body::new_ex(centers, radii, types, groups, masses, self.opt.density, self.next_uid);
         self.next_uid += b.n as u32;
         b.build_links(&self.opt);
         b.set_colliders(self.opt.collide_all);
@@ -1640,25 +1942,34 @@ impl Cells {
         self.update_grid_cell();
     }
 
+    /// A convex wall in global space (an id of its own, negative).
     pub fn add_wall(&mut self, pts: &[Vector2]) {
-        let n = pts.len().min(8);
-        if n < 3 {
+        if pts.len() < 3 {
             return;
         }
-        let mut w = Wall { pts: [Vector2::ZERO; 8], nrm: [Vector2::ZERO; 8], n, lo: pts[0], hi: pts[0] };
-        let mut area = 0.0;
-        for k in 0..n {
-            area += cross(pts[k], pts[(k + 1) % n]);
+        let id = self.next_wall_id;
+        self.next_wall_id -= 1;
+        self.statics.push(StaticShape::new(id, Transform2D::IDENTITY, pts.to_vec(), 0.0, 0.0, false));
+    }
+
+    /// GooStatics' interface (as GooKernel's): a convex polygon in `xform`'s space.
+    pub fn add_static_shape(&mut self, id: i64, xform: Transform2D, pts: Vec<Vector2>, friction: f32, bounce: f32, grip: bool) {
+        self.statics.retain(|s| s.id != id);
+        self.statics.push(StaticShape::new(id, xform, pts, friction, bounce, grip));
+    }
+
+    pub fn set_static_transform(&mut self, id: i64, xform: Transform2D) {
+        for s in self.statics.iter_mut().filter(|s| s.id == id) {
+            s.set_transform(xform);
         }
-        for k in 0..n {
-            w.pts[k] = pts[k];
-            let e = pts[(k + 1) % n] - pts[k];
-            let nr = if area > 0.0 { Vector2::new(e.y, -e.x) } else { Vector2::new(-e.y, e.x) };
-            w.nrm[k] = nr.normalized();
-            w.lo = Vector2::new(w.lo.x.min(pts[k].x), w.lo.y.min(pts[k].y));
-            w.hi = Vector2::new(w.hi.x.max(pts[k].x), w.hi.y.max(pts[k].y));
-        }
-        self.walls.push(w);
+    }
+
+    pub fn remove_static_shape(&mut self, id: i64) {
+        self.statics.retain(|s| s.id != id);
+    }
+
+    pub fn clear_static_shapes(&mut self) {
+        self.statics.clear();
     }
 
     pub fn step(&mut self, dt: f32) {
@@ -1666,8 +1977,8 @@ impl Cells {
         let opt = self.opt.clone();
         let cell = self.grid_cell;
         {
-            let walls = self.walls.clone();
-            self.for_each(|b| b.prepare(&opt, dt, &walls, cell));
+            let walls = &self.statics;
+            par_bodies(&self.pool, &mut self.bodies, |b| b.prepare(&opt, dt, walls, cell));
         }
         let t1 = Instant::now();
         let nb = self.bodies.len();
@@ -1700,6 +2011,9 @@ impl Cells {
                 }
                 let (x, y) = (&bodies[sa as usize], &bodies[sb as usize]);
                 for &c in &x.colliders {
+                    if !opt.types[x.typ[c as usize] as usize].collide {
+                        continue;
+                    }
                     let p = x.pos[c as usize];
                     let rc = x.r[c as usize] * pad;
                     if p.x + rc + m < y.lo.x || p.x - rc - m > y.hi.x || p.y + rc + m < y.lo.y || p.y - rc - m > y.hi.y {
@@ -1726,6 +2040,9 @@ impl Cells {
                         near.sort_unstable();
                         for &o in &near {
                             let d = y.colliders[o as usize];
+                            if !opt.types[y.typ[d as usize] as usize].collide {
+                                continue;
+                            }
                             let reach = rc + y.r[d as usize] * pad + m;
                             if lsq(y.pos[d as usize] - p) < reach * reach {
                                 out.push(Cross { a: sa, ai: c, b: sb, bi: d, edge: false });
@@ -1746,14 +2063,13 @@ impl Cells {
         }
         let t2 = Instant::now();
         let h = dt / opt.substeps as f32;
-        let walls = self.walls.clone();
         let mut solve_us = 0u64;
         let mut serial_us = 0u64;
         for s in 0..opt.substeps {
             let ta = Instant::now();
             {
-                let walls = &walls;
-                self.for_each(|b| {
+                let walls = &self.statics;
+                par_bodies(&self.pool, &mut self.bodies, |b| {
                     b.predict(&opt, h, s == 0);
                     b.solve(&opt, walls, h);
                 });
@@ -1926,6 +2242,7 @@ impl Cells {
                 }
                 app!(pos);
                 app!(prev);
+                app!(pred);
                 app!(vel);
                 app!(th);
                 app!(th_prev);
@@ -1938,6 +2255,7 @@ impl Cells {
                 app!(w);
                 app!(iw);
                 app!(typ);
+                app!(group);
                 app!(uid);
                 app!(ease);
                 app!(force);
@@ -1954,6 +2272,14 @@ impl Cells {
                 }
                 x.n += ex.n;
                 x.drag_f = vec![Vector2::ZERO; x.n];
+                // Water per cell is the game's to feed again (each frame); joint angles
+                // of the creature merged in join the first's where it has none.
+                x.water.clear();
+                for ja in &ex.joint_angles {
+                    if !x.joint_angles.iter().any(|y| y.0 == ja.0 && y.1 == ja.1) {
+                        x.joint_angles.push(*ja);
+                    }
+                }
                 for h in home.iter_mut() {
                     if h.0 == b {
                         *h = (a, h.1 + off);
@@ -1990,15 +2316,23 @@ impl Cells {
     /// A cell added to creature c at a world point, linked to the cells it would touch at its
     /// full size, growing in over ease_time. Returns its index.
     pub fn add_cell(&mut self, c: usize, at: Vector2, radius: f32, typ: u8) -> usize {
+        self.add_cell_ex(c, at, radius, typ, 0, 1.0)
+    }
+
+    /// add_cell() with the cell's group and mass factor.
+    pub fn add_cell_ex(&mut self, c: usize, at: Vector2, radius: f32, typ: u8, group: u16, mass: f32) -> usize {
         let opt = self.opt.clone();
         let uid = self.next_uid;
         self.next_uid += 1;
         let b = &mut self.bodies[c];
         let design = b.design_of(at);
-        b.push_cell(at, radius.max(0.5), typ, opt.density, uid);
+        b.push_cell(at, radius.max(0.5), typ, opt.density * mass.max(1e-3), uid);
+        let last = b.group.len() - 1;
+        b.group[last] = group;
         b.rest_local.push(design);
         b.drag_f.push(Vector2::ZERO);
         b.n += 1;
+        b.water.clear();
         let k = b.n - 1;
         b.ease[k] = opt.ease_time;
         b.scale[k] = opt.ease_from;
@@ -2028,6 +2362,13 @@ impl Cells {
         b.set_colliders(opt.collide_all);
         self.update_grid_cell();
         k
+    }
+
+    /// Removes creature c (its slot stays, dead); no events.
+    pub fn remove_creature(&mut self, c: usize) {
+        if let Some(b) = self.bodies.get_mut(c) {
+            *b = Body::default();
+        }
     }
 
     /// Removes cell i of creature c (its links' parted events), splitting what falls apart.
@@ -2137,7 +2478,7 @@ impl Cells {
                     let d = x.r[i] + x.r[o] - (x.pos[o] - p).length();
                     self_max = self_max.max(d);
                 }
-                for w in &self.walls {
+                for w in &self.statics {
                     let (d, _) = wall_distance(w, p);
                     wall_max = wall_max.max(x.r[i] - d);
                 }
@@ -2169,6 +2510,98 @@ impl Cells {
         [cross_max, inside, self_max, strain_max, err_max, err_sum / alive_n.max(1) as f32, wall_max, bad]
     }
 
+    /// The creature whose outline (its boundary cells pushed out by their radii) holds
+    /// `p`, the last such slot (drawn on top); -1 for none.
+    pub fn creature_at(&self, p: Vector2) -> i64 {
+        let mut found = -1;
+        let mut surf = Vec::new();
+        for (c, b) in self.bodies.iter().enumerate() {
+            if !b.alive || b.n == 0 {
+                continue;
+            }
+            let rmax = b.r.iter().cloned().fold(0.0, f32::max);
+            let (mut lo, mut hi) = (b.pos[0], b.pos[0]);
+            for &q in &b.pos {
+                lo = Vector2::new(lo.x.min(q.x), lo.y.min(q.y));
+                hi = Vector2::new(hi.x.max(q.x), hi.y.max(q.y));
+            }
+            if p.x < lo.x - rmax || p.x > hi.x + rmax || p.y < lo.y - rmax || p.y > hi.y + rmax {
+                continue;
+            }
+            b.outline_surface(&mut surf);
+            let inside = if surf.len() >= 3 { point_in_polygon(p, &surf) } else { false };
+            if inside || (0..b.n).any(|i| lsq(b.pos[i] - p) <= b.r[i] * b.r[i]) {
+                found = c as i64;
+            }
+        }
+        found
+    }
+
+    /// The cell of creature c nearest `p` within `reach` px of its disc; -1 for none.
+    pub fn cell_at(&self, c: usize, p: Vector2, reach: f32) -> i64 {
+        let Some(b) = self.bodies.get(c) else { return -1 };
+        let mut best = -1;
+        let mut bd = f32::INFINITY;
+        for i in 0..b.n {
+            let d = (b.pos[i] - p).length() - b.r[i];
+            if d < bd && d <= reach {
+                bd = d;
+                best = i as i64;
+            }
+        }
+        best
+    }
+
+    /// Every live creature's cell centres, in slot order: (points, cells per slot).
+    pub fn centers_all(&self) -> (Vec<Vector2>, Vec<i32>) {
+        let mut p = Vec::new();
+        let mut counts = Vec::with_capacity(self.bodies.len());
+        for b in &self.bodies {
+            if b.alive {
+                p.extend_from_slice(&b.pos);
+                counts.push(b.n as i32);
+            } else {
+                counts.push(0);
+            }
+        }
+        (p, counts)
+    }
+
+    /// The water's velocity per cell for every live creature, in centers_all()'s order:
+    /// empty clears it (each creature's own current or the options'), one value is a
+    /// current for all, else one per cell.
+    pub fn set_water_all(&mut self, w: &[Vector2]) {
+        let mut at = 0;
+        for b in self.bodies.iter_mut() {
+            if !b.alive {
+                continue;
+            }
+            b.water.clear();
+            if w.len() == 1 {
+                b.water.resize(b.n, w[0]);
+            } else if w.len() > 1 && at + b.n <= w.len() {
+                b.water.extend_from_slice(&w[at..at + b.n]);
+            }
+            at += b.n;
+        }
+    }
+
+    /// Every live creature's mesh (cells_draw.rs), threaded, concatenated.
+    pub fn meshes_all(&self, border: bool) -> crate::cells_draw::Mesh {
+        let n = self.bodies.len();
+        let types = &self.opt.types;
+        let f = |c: usize| if self.bodies[c].alive { crate::cells_draw::creature_mesh(&self.bodies[c], types, border) } else { crate::cells_draw::Mesh::default() };
+        let parts: Vec<crate::cells_draw::Mesh> = match &self.pool {
+            Some(pool) => pool.install(|| (0..n).into_par_iter().map(f).collect()),
+            None => (0..n).map(f).collect(),
+        };
+        let mut out = crate::cells_draw::Mesh::default();
+        for part in parts {
+            out.append(part);
+        }
+        out
+    }
+
     /// One creature's skin: its outline surface smoothed (Chaikin, `iterations`).
     pub fn skin(&self, c: usize, iterations: usize) -> Vec<Vector2> {
         let mut s = Vec::new();
@@ -2195,6 +2628,16 @@ impl Cells {
         }
         (p, counts)
     }
+}
+
+/// The links a design gets (pairs of cell indices): cells closer than (r_a + r_b) × tol,
+/// crossing links dropped (longest first).
+pub fn design_links(centers: &[Vector2], radii: &[f32], tol: f32) -> Vec<(u32, u32)> {
+    let mut opt = Opt::default();
+    opt.link_tol = tol;
+    let mut b = Body::new(centers, radii, &[], 1.0, 0);
+    b.build_links(&opt);
+    b.links.iter().map(|l| (l.i, l.j)).collect()
 }
 
 #[allow(dead_code)]
@@ -2384,5 +2827,136 @@ mod tests {
         // Float noise only: the mean velocity stays under 0.05 px/s.
         assert!((m[0].abs() + m[1].abs()) / (mass as f64) < 0.05, "{:?}", m);
         assert!(r1 < 0.9 * r0, "roundness {} -> {}", r0, r1);
+    }
+
+    fn wall(cl: &mut Cells, pts: &[Vector2]) {
+        let id = cl.statics.len() as i64 + 1;
+        cl.add_static_shape(id, Transform2D::IDENTITY, pts.to_vec(), 0.0, 0.0, false);
+    }
+
+    fn rect(x: f32, y: f32, w: f32, h: f32) -> Vec<Vector2> {
+        vec![Vector2::new(x, y), Vector2::new(x + w, y), Vector2::new(x + w, y + h), Vector2::new(x, y + h)]
+    }
+
+    #[test]
+    fn thin_walls_and_concave_seams_are_not_tunnelled() {
+        // A 4 px wall, and an L of two convex pieces whose inner corner is a seam.
+        let mut crossed = 0;
+        for k in 0..12 {
+            let mut cl = Cells::default();
+            cl.opt.drag.enabled = false;
+            wall(&mut cl, &rect(100.0, -500.0, 4.0, 1000.0));
+            wall(&mut cl, &rect(-300.0, 200.0, 400.0, 30.0));
+            wall(&mut cl, &rect(70.0, -100.0, 30.0, 300.0));
+            let c = add(&mut cl, hex_design(1, 7.0, Vector2::ZERO), 7.0);
+            let a = -1.2 + 0.2 * k as f32;
+            let v = Vector2::new(a.cos(), a.sin() + 0.6) * 3000.0;
+            for i in 0..cl.bodies[c].n {
+                cl.bodies[c].vel[i] = v;
+            }
+            for _ in 0..30 {
+                cl.step(1.0 / 60.0);
+                let b = &cl.bodies[c];
+                crossed += (0..b.n).filter(|&i| b.pos[i].x > 104.0 || b.pos[i].y > 230.0).count();
+            }
+            assert!(cl.health()[6] < 1.0, "wall overlap {}", cl.health()[6]);
+        }
+        assert_eq!(crossed, 0);
+    }
+
+    #[test]
+    fn a_moving_wall_pushes_cells() {
+        let mut cl = Cells::default();
+        wall(&mut cl, &rect(-100.0, -100.0, 20.0, 200.0));
+        let c = add(&mut cl, hex_design(1, 7.0, Vector2::ZERO), 7.0);
+        for f in 0..60 {
+            cl.set_static_transform(1, Transform2D::IDENTITY.translated(Vector2::new(3.0 * f as f32, 0.0)));
+            cl.step(1.0 / 60.0);
+        }
+        assert!(cl.bodies[c].center().x > 70.0, "{}", cl.bodies[c].center().x);
+        assert!(cl.health()[6] < 1.0);
+    }
+
+    #[test]
+    fn water_per_cell_carries_a_creature_far_from_the_origin() {
+        // Velocities from the correction, not from f32 positions: exact at x = 5000.
+        let mut cl = Cells::default();
+        let c = add(&mut cl, hex_design(3, 7.0, Vector2::new(5000.0, 0.0)), 7.0);
+        for f in 0..900 {
+            let n = cl.bodies[c].n;
+            cl.set_water_all(&vec![Vector2::new(60.0, 0.0); n]);
+            if f == 0 {
+                assert_eq!(cl.bodies[c].water.len(), n);
+            }
+            cl.step(1.0 / 60.0);
+        }
+        let v = cl.bodies[c].velocity();
+        assert!((v.x - 60.0).abs() < 0.1 && v.y.abs() < 0.1, "{:?}", v);
+    }
+
+    #[test]
+    fn regions_joints_and_bending_links() {
+        let mut cl = Cells::default();
+        cl.opt.types[1].body = BEND_SHAPE;
+        // A worm 12 × 3, columns in three groups of four; type 1 (shape matched).
+        let d = worm_design(12, 3, 7.0, Vector2::ZERO);
+        let n = d.len();
+        let groups: Vec<u16> = (0..n).map(|i| ((i % 12) / 4) as u16).collect();
+        let c = cl.add_creature_ex(&d, &vec![7.0; n], &vec![1; n], &groups, &[]);
+        cl.step(1.0 / 60.0);
+        let b = &cl.bodies[c];
+        assert_eq!(b.regions, 3);
+        assert_eq!(b.joints.len(), 2);
+        assert!(b.cell_shape.iter().all(|&x| x));
+        let joint_links = b.links.iter().filter(|l| l.joint != 0).count();
+        assert_eq!(joint_links, b.links.iter().filter(|l| l.bend).count());
+        assert!(joint_links > 0 && joint_links < b.links.len());
+        // The type made oriented: every link bends, after the version changes.
+        cl.opt.types[1].body = BEND_LINK;
+        cl.opt.types_version += 1;
+        cl.step(1.0 / 60.0);
+        assert!(cl.bodies[c].links.iter().all(|l| l.bend));
+        assert!(cl.bodies[c].cell_shape.iter().all(|&x| !x));
+    }
+
+    #[test]
+    fn the_break_leaves_out_the_creatures_own_share() {
+        let run = |excess: bool| {
+            let mut cl = Cells::default();
+            cl.opt.stretch_hz = 60.0;
+            cl.opt.bend_hz = 40.0;
+            cl.opt.break_force = 2.0e6;
+            cl.opt.break_excess = excess;
+            let c = add(&mut cl, worm_design(20, 4, 7.0, Vector2::ZERO), 7.0);
+            cl.bodies[c].wave = Wave { mode: WAVE_POSE, amp: 1.0, k: std::f32::consts::TAU / 280.0, omega: std::f32::consts::TAU, axis: Vector2::new(1.0, 0.0), half_width: 14.0, bias: 0.0, envelope: 0.6, phase: 0.0, age: 0.0 };
+            for _ in 0..240 {
+                cl.step(1.0 / 60.0);
+            }
+            cl.events.iter().filter(|e| e[0] == EVENT_PARTED).count()
+        };
+        assert_eq!(run(true), 0);
+        assert!(run(false) > 0);
+    }
+
+    #[test]
+    fn mesh_of_a_hex_blob() {
+        let mut cl = Cells::default();
+        let c = add(&mut cl, hex_design(2, 7.0, Vector2::ZERO), 7.0);
+        let faces = crate::cells_draw::inner_faces(&cl.bodies[c]);
+        assert_eq!(faces.len(), 24);
+        assert!(faces.iter().all(|f| f.len() == 3));
+        let m = crate::cells_draw::creature_mesh(&cl.bodies[c], &cl.opt.types, true);
+        // 24 face triangles and 6 per outline cell, no borders in one type.
+        assert_eq!(m.points.len(), 3 * (24 + 6 * 12));
+        assert!(m.lines.is_empty());
+        // Mixed types: borders, and the area kept.
+        let mut cl2 = Cells::default();
+        let d = hex_design(2, 7.0, Vector2::ZERO);
+        let t: Vec<u8> = d.iter().map(|p| (p.x > 0.0) as u8).collect();
+        let c2 = cl2.add_creature(&d, &vec![7.0; d.len()], &t);
+        let m2 = crate::cells_draw::creature_mesh(&cl2.bodies[c2], &cl2.opt.types, true);
+        assert!(!m2.lines.is_empty());
+        let area = |m: &crate::cells_draw::Mesh| m.points.chunks(3).map(|t| 0.5 * cross(t[1] - t[0], t[2] - t[0]).abs()).sum::<f32>();
+        assert!((area(&m) - area(&m2)).abs() < 1.0, "{} {}", area(&m), area(&m2));
     }
 }
