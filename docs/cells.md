@@ -22,7 +22,8 @@ numbers, the limits and the quirks a game should be designed around.
 | `examples/rings_and_cells/` | ring bodies and creatures in one tank |
 | `examples/thrusters/` | thruster cells and spike tips (below, "Thrusters", "Spike tips") |
 | `tools/cell_world_bench.gd` | cost, draw and swimming through the world node |
-| tests | `tests/integration/test_goo_cell_thrust.gd` (thrusters), `tests/integration/test_goo_cell_spikes.gd` (spike tips, the contacts' detail, cells removed mid-fight), `tests/integration/examples/test_thrusters.gd`, cargo tests in `cells.rs`' `thrust_tip_tests`; `tests/integration/test_goo_cell_spin_servo.gd` (the spin servo and the contact query), `tests/integration/test_goo_cell_world.gd`, `tests/unit/test_goo_cell_design.gd`, `tests/integration/examples/test_cells.gd`, `tests/unit/test_goo_cells.gd` (the exploration's), cargo tests in `cells.rs`; the coupling's `tests/integration/test_goo_ring_cells.gd`, `tests/integration/examples/test_rings_and_cells.gd`, cargo tests in `couple.rs` |
+| `examples/elastic/` | elastic bodies and head-led turns (below, "Elastic bodies", "Head-led turning") |
+| tests | `tests/integration/test_goo_cell_elastic.gd` (elastic bodies), `tests/integration/test_goo_cell_head_led.gd` (head-led turns), `tests/integration/examples/test_elastic.gd`, cargo `elastic_tests`; `tests/integration/test_goo_cell_thrust.gd` (thrusters), `tests/integration/test_goo_cell_spikes.gd` (spike tips, the contacts' detail, cells removed mid-fight), `tests/integration/examples/test_thrusters.gd`, cargo tests in `cells.rs`' `thrust_tip_tests`; `tests/integration/test_goo_cell_spin_servo.gd` (the spin servo and the contact query), `tests/integration/test_goo_cell_world.gd`, `tests/unit/test_goo_cell_design.gd`, `tests/integration/examples/test_cells.gd`, `tests/unit/test_goo_cells.gd` (the exploration's), cargo tests in `cells.rs`; the coupling's `tests/integration/test_goo_ring_cells.gd`, `tests/integration/examples/test_rings_and_cells.gd`, cargo tests in `couple.rs` |
 
 A `GooWorld2D`'s ring bodies and a `GooCellWorld2D`'s creatures collide once the two worlds
 are **coupled** (`couple()`, below "Rings and cells"); uncoupled, they pass through each other.
@@ -51,6 +52,9 @@ creature holds its **shape** is chosen per type (`GooCellType.body`, else the wo
 - **LINKS**: oriented links. Each link remembers its direction in both end cells' frames
   (`bend_hz` 40). Local: hinges, per-link bending.
 - **NONE**: lengths only, floppy.
+
+In any mode the world's `elasticity` (0 by default) softens all of it toward an elastic body
+that dents and bends where it is struck and springs back ("Elastic bodies", below).
 
 The links **between two regions** are a **joint**: they always bend (oriented), and a game
 turns one region against the other with `set_joint_angle()`. A design gives two parts of one
@@ -130,7 +134,8 @@ serial, and a replay is identical (tested).
   `break_force`, `break_leaves_out_own_share`, `draw_skins`, `skin_mesh` (GOO, the default,
   or FLAT), `skin_material`, `skin_preset` (GooCellLook's), `draw_borders` (off; lines between
   types), `border_color`, `border_width`, `default_type`; `current_skin_material()`,
-  `look_table()`, `cell_table()` (the goo skin's, "Drawing").
+  `look_table()`, `cell_table()` (the goo skin's, "Drawing"); `elasticity` (0 off) and
+  `elastic_damping` ("Elastic bodies").
 
 `GooCellCreature` (a handle; creatures are not nodes): `is_alive()`, `center()`,
 `velocity()`, `turn()`, `heading()`, `spin()`, `mass()`, `cell_count()`, `positions()`,
@@ -144,7 +149,8 @@ group_b, angle)`, `set_water(velocities)`, `set_current(v)`, `translate()`,
 `set_velocity()`, `add_cell()`, `remove_cell(uid)`; the spin servo: `set_spin_servo(target_spin,
 max_angular_acceleration, max_tip_speed = INF, contact_yield = 1.0)`, `set_spin_target(target_spin)`
 (cheap, every frame), `stop_spin_servo()`, `spin_servo()` (its state: the spin measured, the
-target after the tip cap, the yield's scale and contact share), the static
+target after the tip cap, the yield's scale and contact share, the lead and the lead used),
+`set_turn_lead(lead)` ("Head-led turning"), `set_elasticity(e)` (its own; below 0 the world's), the static
 `spin_toward(angle_error, max_spin, max_angular_acceleration, delta = 0)` (a heading servo's
 target); contacts: `contacts()` (what its cells touched in the last step: cell, uid, `Touch`
 kind, id, the thing, normal), `contact_counts()`, `touching_walls()`, `touching(kind)`,
@@ -174,7 +180,7 @@ overlaps, unlinked cells), the builders `hex_worm(long, wide, radius)` and
 `contact_pad`, `join_layer`, `join_mask`, `swim_weight` (its cells' share of the swim drive,
 1), `max_thrust` (a thruster's maximum, px/s² of the cell's own mass at unit 1; 0: not a
 thruster), `tip_length`, `tip_radius` (a spike's tip, × the cell's radius; `tip_length` 0: none),
-`behaviours` (a free dictionary for a game's
+`elasticity` (the world's × this for its cells, 1), `behaviours` (a free dictionary for a game's
 thrusters, spikes, sensors...). The kernel has 16 type slots; a world gives each distinct
 type one the first time it is used (a 17th is an error and gets the default's).
 
@@ -221,6 +227,11 @@ radii, so they scale with the design); designs' radii are canvas px as drawn (a 
 | spin servo `max_angular_acceleration` | a game's (e.g. 16 rad/s² for a 690 px worm's 1 s half turn, 254 for an 84 px blob's 0.25 s) | the trapezoid `turn_profile()` of the tests: cruise at 1.5 π / T, accelerate at spin × (1 + 1/0.8) / (2 (T − π/spin)), brake at 0.8 of it |
 | spin servo `max_tip_speed` | INF (off) | a game's swat limit; a tip of 300-600 px/s tames a worm most (below), but caps its spin at tip / farthest radius |
 | spin servo `contact_yield` | 1 (off) | 0.1-0.3 tame (below); the release `SERVO_RELEASE` 0.1 s |
+| `elasticity` | 0 (off) | 0.6-0.7 for swimmers, 1 jelly ("Elastic bodies"); every shape stiffness × 0.01^e |
+| `ELASTIC_LIMIT` / `ELASTIC_SQUEEZE` / `ELASTIC_JELLY` | 8 % / 15 % / 0.7 | the elastic links' strain bounds, widening past 0.7 toward jelly |
+| `ELASTIC_AREA` | 0.3 | the area error taken back a substep × the mean elasticity |
+| `elastic_damping` | 0 | measured to change nothing visible |
+| `set_turn_lead()` | 0 (off) | 0.5 recommended for long creatures; `LEAD_ASPECT_MIN` / `_FULL` 1.25 / 2 |
 
 
 ## Walls
@@ -471,6 +482,186 @@ would pass it (at the game's times the 7-cell blob's tip reaches 527 px/s, the 1
 826, the 37-cell blob's 1018, the worm's 1539: a cap of 600 px/s slows all but the smallest);
 `a` from the turn time as above; the target each frame `spin_toward(heading_error, max_spin,
 0.8 × a, delta)`.
+
+### Elastic bodies
+
+By default a creature is nearly rigid: a hex lattice of links held at 60 Hz is a triangulated,
+rigid frame, and the shape matching over every cell's neighbourhood (0.3 a substep, six substeps)
+rigidifies it again, so a crash or a wall bends a long creature a few degrees and dents a blob a
+fraction of a pixel. `GooCellWorld2D.elasticity` (0..1, default **0: exactly as before**, the
+step bit-identical; cargo-tested with every type's factor 0 against the option off) makes
+creatures elastic: they dent where they are struck, bend when hit amidships or run nose first
+into a corner, keep their area and spring back.
+
+**The mechanism.** A cell's elasticity e is the world's (or the creature's own,
+`GooCellCreature.set_elasticity()`, below 0 back to the world's) × its type's `elasticity`
+factor (1; a spine row 0.5 keeps a worm's back while its flanks give), clamped to 0..1. Then:
+
+1. **Every stiffness that holds the shape × 0.01^e** (`ELASTIC_SOFT`, log-interpolated: e 0.5
+   × 0.1, 0.65 × 0.05, 0.75 × 0.03, 1 × 0.01): the shape matching's fraction a substep for the
+   cluster round that cell, and the stretch and bend compliance of its links (a link takes its
+   two cells' mean). Both together, because each alone keeps the lattice rigid (the lab, below).
+2. **Strain limits**: an elastic link is soft within 8 % stretch and 15 % squeeze of its rest
+   length (`ELASTIC_LIMIT`, `ELASTIC_SQUEEZE`) and put back to the bound at once past them (two
+   passes a substep, counted in its load). So a creature bends and dents but is not drawn out
+   by its own spin or a pull: a 24 × 5 worm spun at 7.2 rad/s at e 0.65 stretched 30-60 % (its
+   worst link 77 %) without the limit. Past e 0.7 (`ELASTIC_JELLY`) both bounds widen, to 4 ×
+   the stretch and 2 × the squeeze at e 1: a jelly that squeezes through gaps and is drawn out
+   by a hard spin.
+3. **Area kept**: the outline's area (its cells' centres) is pulled toward the design's
+   (× the cells' radius muscles) by 0.3 a substep × the creature's mean elasticity
+   (`ELASTIC_AREA`), a correction of the outline cells along the area's gradient by their
+   inverse masses (no net force). A dent bulges the body out elsewhere instead of crushing it:
+   a 600 px/s crash of two soft blobs lost 24 % of their area for a moment without it, 2-3 %
+   with it.
+4. `elastic_damping` (1/s at e 1, default 0): a dashpot on every elastic link's relative
+   velocity less the pair's turn. Measured to do almost nothing (below); kept as a knob.
+
+Thrust, the swim drive, the pose wave, spikes, the spin servo and the break test are as before;
+the area pass, the dashpots and the strain limit are internal (momentum kept to 1e-4 of one
+side's in a crash, cargo-tested), threaded == serial and a replay identical (cargo-tested with a
+head-led servo, a creature's own elasticity and a cell added mid-run).
+
+**Alternatives measured** (an ignored cargo lab, `cells_lab.rs`: a 37-cell blob of 7 px cells
+pressed into a wall at 300 / 1000 / 3000 px/s², the 24 × 5 worm struck amidships by a heavy
+7-cell blob at 300 px/s, two blobs crashing at 600 px/s each, gaps, unit 0.5):
+
+| | worm struck: bend | blob at 3000 px/s²: dent, area | crash: area, cells inside | verdict |
+|---|---|---|---|---|
+| as before (shape matching 0.3, links 60 Hz) | 8.4° | 0.35 px, −0.5 % | −4.8 %, 0 | rigid |
+| shape matching 0.03 alone | 13.9° | (small) | | the links keep it rigid |
+| links at 8 Hz alone | 9.7° | (small) | | the shape matching keeps it rigid |
+| no bending at all (NONE) | 15.5° | | | still a rigid triangulated frame |
+| oriented links tuned soft (LINKS, 8 Hz / 8 Hz) | 52.9° | 39 px, **−37 %** | | collapses, 3.7 s to straighten |
+| both soft, no area pass (k 0.01, links 8 Hz) | 37.7° | 17 px, −14.6 % | −37 %, 38 inside | crushes |
+| + the area pass (0.3) | 41° | 15 px, −0.8 % | −2 %, 0 | sound |
+| + an area-kept affine fit blended into the goal (β 0.5 / 0.8) | 45° | 18-27 px, folds (RMS 39 px at β 0.8) | 25-31 inside | **rejected**: folds over in crashes |
+| the chosen mapping at e 0.65 (with the strain limit) | 27° | 4.2 px, −1.1 % | −9 %, 0 | |
+
+The classic alternative, clustered shape matching with larger, overlapping regions (2-3 rings
+round a cell), was not built: the existing clusters already are each cell and its linked
+neighbours, so softening them was the cheaper lever; larger clusters would cost about 3 × the
+shape matching for a stiffer, not softer, body.
+
+**Measured** (`tests/integration/test_goo_cell_elastic.gd`, unit 0.5, 7 px cells, the world's
+drag; a 37-cell blob, the 24 × 5 worm of 345 px, the 10 × 5 thruster ship of 152 px):
+
+| | e 0 | e 0.5 | **e 0.65** | e 0.8 |
+|---|---|---|---|---|
+| blob pressed into a wall at 1000 / 3000 px/s²: dent | 0.42 / 0.37 px | 1.7 / 2.5 px | **4.1 / 3.7 px** | 5.8 / 6.4 px |
+| its area | −0.2 / −0.5 % | −0.2 / −1.1 % | −0.4 / −1.1 % | −0.3 / −0.9 % |
+| round again (within 5 % of the dent) after release | 0.02 s | 0.18 s | 0.27 s | 0.18 s |
+| blob struck by a 28 px ring at 300 px/s: dent (share of a cell) | 0.66 px (5 %) | 3.2 px (23 %) | **4.7 px (34 %)** | 6.5 px (46 %) |
+| round again after the peak; area | 0.20 s; −0.3 % | 0.17 s; −0.5 % | 0.18 s; −0.4 % | 0.15 s; −0.3 % |
+| worm struck amidships by the game's crate (60 px, 10 × 1000) at 300 px/s: bend, straight (5 %) after | 5.4°, 0.12 s | 15.5°, 0.37 s | **20.0°, 0.52 s** | 23.6°, 0.83 s |
+| ship struck the same | 2.5°, 0.02 s | 8.1°, 0.32 s | **10.5°, 0.43 s** | 13.3°, 0.37 s |
+| worm nose first into a rock's corner (its point 12 px off its line) at 300 / 600 px/s | 4.6° / 12.5° | 14.5° / 23.7° | **13.6° / 9.5°** | 13.3° / 9.5° |
+| ship the same | 4.2° / 6.7° | 10.0° / 12.9° | **12.0° / 11.7°** | 12.3° / 17.5° |
+| a crash, blob and worm broadside at 600 px/s each: the blob's dent, area | 6.5 px, −3.9 % | 10.3 px, −4.2 % | **10.6 px, −3.5 %** | 10.7 px, −3.0 % |
+| ... cells inside the other, own overlap, wall overlap | 0, 0, 0 | 0, 0, 0 | 0, 0, 0 | 0, 4.1 px, 0 |
+| worm swimming (slope-0.3 stroke + drive 110 px/s²) | 178 px/s | 151 px/s | **161 px/s** | 165 px/s |
+| its design after it stops: 1.5 s / 4 s | 0.65 / 0.02 px | 3.1 / 0.25 px | 3.5 / 0.44 px | 2.7 / 0.35 px |
+| ship on its rear thrusters at full level | 341 px/s | 340 px/s | **339 px/s** | 337 px/s |
+| ... off its design while thrusting | 0.10 px | 0.72 px | 1.3 px | 2.5 px |
+| a spiked blob thrown at 600 px/s into a blob: the target knocked to | 193 px/s | 146 px/s | **152 px/s** | 150 px/s |
+
+The nose-first numbers are not monotonic because the strain limit and the area pass make a
+head-on blow crumple the nose rather than bend the body; a glancing one bends it. In the corner
+crashes at 600 px/s a soft worm's cells come up to 0.66 px into the rock at a frame's end (0 when
+stiff). No link breaks in any of this at the default `break_force` (INF); the worst strain read
+is 0.47-0.49 in the 600 px/s corner crashes (0.63 when stiff: it is one squeezed link at the
+nose), 0.15-0.18 for the bends.
+
+**Gaps** (the blob pushed at 1000 / 3000 px/s² at a gap of a share of its width; time to be
+through, "stuck" after 4 s): e 0: 1.0 0.68 / 0.37 s, 0.9 stuck / 0.42 s, 0.8 stuck. e 0.65:
+0.9 0.77 / 0.38 s, 0.8 stuck. e 0.8: 0.8 stuck / 0.47 s. e 1: 0.8 1.08 / 0.45 s, 0.7 stuck /
+0.52 s; 0.6 never. The ship on its rear thrusters never passes 0.8. Squeezing needs strain past
+the limit, so it is the jelly's (e above 0.7).
+
+**Thrust and spikes carry through**: the ship's thruster top speed is within 1 % at every
+elasticity (its rear thrusters push the soft body ahead of them, compressing it 1-2.5 px); a
+spiked blob's blow knocks its target to 78 % of the stiff speed at e 0.65 (the soft body gives
+some of the blow to its own dent, 5.4 px behind the spikes).
+
+**Damping**: no tuning was needed for a dent to ring out: a soft blob rounds out within
+0.15-0.3 s with one small overshoot, a struck worm overshoots straight by 3.5-5° once (the
+water's drag and the position solver's own damping). `elastic_damping` up to 1000 /s changed a
+head-led worm's follow-through from −33.5° to −32.3°: bending in this lattice is a rotation
+varying along the body, which a dashpot along each link cannot see. Default 0.
+
+**Cost** (30 × 150, 4 threads, `tools/cell_world_bench.gd --elastic=E`, one machine, interleaved
+runs; the budget held: +20 %): off, the step against the previous kernel built in a scratch
+worktree, colliding 2.30 / 2.48 ms against 2.38 / 2.28 (p95 3.16 / 2.91 against 3.14 / 2.66),
+swimming 3.62 / 3.60 against 3.56 / 3.81: within the noise. On: colliding 2.65 ms at e 0.65
+(+13 %), 2.90 at e 1; swimming 3.84 at e 0.65 (+6 %), 3.03 at e 1 (the jelly worms swim
+differently). 30 servoed worms swimming: 3.61 ms; elastic at 0.65 and head-led at lead 1:
+4.33 ms (+20 %).
+
+**Recommended**: the fluid game's swimmers `elasticity` 0.6-0.7 (0.65 measured above); a blob
+meant to look squishy its own 0.8; a jelly 1; a spine row's type `elasticity` 0.5, armour 0.
+
+### Head-led turning
+
+The spin servo turns a creature as a rigid body: every cell gets the same rigid change of
+velocity about the centre of mass, so a long body rotates as a stick. `set_turn_lead(lead)`
+(0..1, default 0: exactly the rigid turn) gives the turn to the head first:
+
+- each cell's share of the servo's change dw is weighted w = (1 − lead) + lead × t², t 0 at the
+  design's tail along its forward (the creature's `axis`) and 1 at its nose;
+- the velocity change is w × perp(p − c) × dh, less its mean (Σ m w perp(p − c) dh / M, taken
+  evenly off every cell), so **no net force**: a couple, not a shove;
+- dh = dw × I / Σ m w |p − c|², so the creature's angular momentum about its centre changes by
+  exactly I × dw, as the rigid turn's: the servo's target spin, its acceleration cap, the tip
+  cap (measured on the farthest cell's distance, so a led nose moves faster than the cap says)
+  and the contact yield keep their meaning;
+- **only while the turn speeds up toward its target**; braking and holding are rigid. Braking at
+  the head stopped the nose while the tail swung on, and the worm whipped through 55-89° the
+  other way;
+- **a compact design has no head**: the lead is scaled by the design's aspect (its length
+  along its forward over its width), × 0 at 1.25 or less (`LEAD_ASPECT_MIN`), × 1 from 2
+  (`LEAD_ASPECT_FULL`): the 37-cell blob turns exactly as before at any lead; the ship
+  (aspect 2.4), worms (5.5) take it in full. `spin_servo()["lead_used"]` says what was used.
+
+The centre of mass moves only as the water's drag pushes it: the led nose sweeps water the tail
+does not. On a stiff body (elasticity 0) the lead is passed on at once and barely bends it:
+give the creature elasticity 0.5 or more.
+
+Measured (`tests/integration/test_goo_cell_head_led.gd`, unit 0.5, the game's servo profile:
+half turn 0.25 s at 84 px to 1 s at 690 px, max spin 4.77 / (time + 0.09), acceleration that
+over 0.05 of it, steered by `spin_toward()` at 0.8 of it; half turns from rest, elasticity 0.65
+unless noted; the bend is between the lines through the front, middle and back thirds):
+
+| | time to face (within 5°) | overshoot | bend into the turn (at a tenth of the turn time) | follow-through the other way | under 3° after facing | the centre moved | tail speed |
+|---|---|---|---|---|---|---|---|
+| ship, e 0, lead 0 | 0.32 s | 1.7° | 0.1° | 0.1° | 0.07 s | 21 px | 796 px/s |
+| ship, lead 0 | 0.30 s | 1.8° | 2.0° (0.1°) | 1.2° | 0.07 s | 26 px | 845 |
+| ship, lead 0.5 | 0.30 s | 1.8° | 11.0° (6.6°) | 5.3° | 0.07 s | 26 px | 902 |
+| ship, lead 1 | 0.30 s | 1.9° | 30.8° (23.5°) | 11.3° | 0.20 s | 27 px | 972 |
+| worm, e 0, lead 0 | 0.45 s | 2.3° | 1.2° | 0.8° | 0.07 s | 39 px | 1205 |
+| worm, lead 0 | 0.45 s | 2.3° | 2.1° | 0.6° | 0.07 s | 55 px | 1307 |
+| worm, lead 0.5 | 0.45 s | 2.3° | 14.8° (6.3°) | 14.1° | 0.10 s | 115 px | 1382 |
+| worm, lead 1 | 0.45 s | 2.4° | 41.8° (22.3°) | 33.2° | 0.12 s | 173 px | 1453 |
+| boss worm (14 px), e 0, lead 0 | 0.73 s | 1.9° | 0.5° | 0.3° | 0.05 s | 49 px | 1457 |
+| boss worm, lead 0.5 | 0.73 s | 1.9° | 13.1° (8.0°) | 5.4° | 0.12 s | 123 px | 1748 |
+| boss worm, lead 1 | 0.73 s | 1.9° | 37.1° (27.6°) | 19.9° | 0.13 s | 232 px | 1847 |
+| blob 37, any lead | 0.25 s | 2.3° | 0.1° | 0.1° | | 0 px | 570 |
+
+Quarter turns: the ship 0.15 s at every lead, the worm 0.23 s, the boss 0.38 s, the blob 0.13 s;
+the follow-through is larger after a quarter turn (the worm's 25-34° at lead 0.5-1). **Head-led
+turns are not slower** (within a frame at every size; the boss's at lead 1 0.75 s against 0.73 s
+swimming). Every heading held to 0.0° a second later. **Swimming through the turn**: the ship on
+its rear thrusters keeps 221 / 222 / 227 / 234 px/s through a half turn at e 0 / lead 0 / 0.5 / 1
+(the thrusters go on working, turned with their cells); the worm by drive and pose wave 67 / 85 /
+125 / 161 px/s (a led worm swims round the turn instead of pivoting); the boss 79 / 104 / 132 /
+170 px/s.
+
+The **follow-through** is the elastic bend unwinding once the spin is held: the heading servo
+(on the whole body's fit, `turn()`) holds the heading while the nose springs back and the tail
+swings past straight, then settles within 0.1-0.2 s at lead 0.5. A servo on the head's heading
+instead oscillated (the nose's heading answers the rigid hold too quickly); the follow-through is
+the price of a heading on the whole body. Recommended: **lead 0.5** for the ship and worms
+(11-15° into a half turn, 5-14° back), lead 1 for a showy, whippy turn.
+
 
 ### Thrusters
 
@@ -1056,8 +1247,10 @@ each other more, which a game would pay for any interaction.
   shows about ±0.15 ms of noise between runs).
 - Damping is an exponential decay: one rate cannot stop a creature both short and soon (see
   "Braking"); a game shapes the stop by changing the rate over time.
-- The spin servo turns the creature as a rigid body: a bent worm turns about its centre of mass,
-  not along its curve; it holds the world-frame spin, not the spin relative to a vortex.
+- The spin servo turns the creature as a rigid body unless head-led (`set_turn_lead()`), and
+  even then it brakes and holds rigidly; it holds the world-frame spin, not the spin relative to
+  a vortex.
+- Elasticity has no per-cell squash in the skin (cells stay discs; the body bends and dents).
 - The yield reads the last substep's contacts: the first substep of a contact is at full power,
   and what a turning creature already carries (its angular momentum) hits at full power
   whatever the yield (only `max_tip_speed` limits that).
@@ -1073,8 +1266,8 @@ each other more, which a game would pay for any interaction.
    worms over 5 s. Colliding blobs stay at 0.1-0.2 px.
 3. **No friction, very inelastic**: nothing grips; two creatures meeting at 600 px/s each
    leave at about a tenth of it.
-4. **Gaps jam**: stiff creatures jam at 0.8 of their width (exploration); soft types
-   (lower `stretch` / `bend`) pass 0.6.
+4. **Gaps jam**: stiff creatures jam between 0.8 and 0.9 of their width; elastic ones at 0.65
+   pass 0.9, jelly (elasticity 1) 0.7 with a hard push, never 0.6 ("Elastic bodies").
 5. **Breaking learns the muscles' share**: the envelope is what the link carried over the
    last 2 s untouched; a sudden harder stroke can break links a gentler one never did.
 6. **Ids move**: creature slots die on merges, splits get new ones; cell indices change at
@@ -1089,8 +1282,13 @@ each other more, which a game would pay for any interaction.
 9. **Commanded curls are clamped**: the pose wave never squeezes a side below half its length.
 10. **The skin may cover a wall by up to about 0.43 radius** at a concave corner.
 11. **A type edited after first use** needs `update_type()`; the 17th type is refused.
-12. **Shape-matched regions bend only at joints**: a long region is stiff; give a part
-    several groups to make it bendable, or use LINKS.
+12. **Shape-matched regions bend only at joints**: a long region is stiff; give it
+    `elasticity` (or several groups, or LINKS).
+19. **Elastic creatures bend where the lattice allows**: the short ship kinks across its middle
+    third rather than arcing; a head-led turn springs back past straight once the spin is held
+    (the follow-through, 5-33°); a soft creature spun hard is drawn out up to its strain limit
+    (8 %, more past elasticity 0.7); a soft spiked creature delivers about 78 % of a stiff one's
+    blow; deep dents at 600 px/s put soft cells up to 0.7 px into a rock at a frame's end.
 13. **The spin servo owns the spin**: while it is on, `set_damping()`'s angular part is ignored and
     `twist()` / `twist_once()` add to what it holds against (it takes them back within its
     acceleration). Stop it (`stop_spin_servo()`) to let a creature spin freely.
