@@ -1,7 +1,7 @@
 //! PoseSolver: an as-rigid-as-possible (ARAP) pose of a link graph driven by handle cells,
 //! in 2D (the fluid game's docs/pose-solve-plan.md, milestone 1). A plain module: no
-//! creature, no Godot object; nothing in the kernel calls it yet (milestone 2 wires it into
-//! cells.rs's pose wave behind an option).
+//! creature, no Godot object; cells_pose.rs wires it into cells.rs's pose wave behind
+//! Opt::pose_solve (milestones 2 and 3).
 //!
 //! The problem. `n` cells with design positions d_i, links (i, j) with weights w_ij, and a
 //! set of handle cells whose posed positions are given (fixed handles: each sits exactly on
@@ -67,7 +67,8 @@
 //! Determinism: one thread, a fixed order and a fixed iteration count, no allocation in
 //! solve(): the same inputs give the same bits.
 
-// Not called by the kernel yet (milestone 2 of the pose solve plan wires it in).
+// Some of its API (reset_to_rigid_fit(), the seed modes, the queries) is used only by its
+// tests so far.
 #![allow(dead_code)]
 
 use godot::builtin::Vector2;

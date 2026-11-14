@@ -82,15 +82,15 @@ pub const ELASTIC_SQUEEZE: f32 = 0.15;
 pub const ELASTIC_JELLY: f32 = 0.7;
 
 #[inline]
-fn rot(v: Vector2, c: f32, s: f32) -> Vector2 {
+pub(crate) fn rot(v: Vector2, c: f32, s: f32) -> Vector2 {
     Vector2::new(c * v.x - s * v.y, s * v.x + c * v.y)
 }
 #[inline]
-fn perp(v: Vector2) -> Vector2 {
+pub(crate) fn perp(v: Vector2) -> Vector2 {
     Vector2::new(-v.y, v.x)
 }
 #[inline]
-fn wrap(a: f32) -> f32 {
+pub(crate) fn wrap(a: f32) -> f32 {
     let mut a = a;
     while a > std::f32::consts::PI {
         a -= std::f32::consts::TAU;
@@ -165,11 +165,14 @@ pub struct TypeParams {
     pub tip_rad: f32,
     /// The world's elasticity × this for its cells (0: as stiff as without elasticity).
     pub elastic: f32,
+    /// Its cells are the creature's spine for the handle-driven pose (Opt::pose_solve): the
+    /// pose wave positions them and the rest follows (cells_pose.rs).
+    pub pose_handle: bool,
 }
 
 impl Default for TypeParams {
     fn default() -> Self {
-        TypeParams { stretch: 1.0, bend: 1.0, brk: 1.0, self_collide: false, join_mask: 0xffff, pad: 0.0, body: BODY_DEFAULT, collide: true, walls: true, color: [0.35, 0.75, 0.45, 1.0], swim: 1.0, thrust: f32::NAN, tip_len: 0.0, tip_rad: 0.0, elastic: 1.0 }
+        TypeParams { stretch: 1.0, bend: 1.0, brk: 1.0, self_collide: false, join_mask: 0xffff, pad: 0.0, body: BODY_DEFAULT, collide: true, walls: true, color: [0.35, 0.75, 0.45, 1.0], swim: 1.0, thrust: f32::NAN, tip_len: 0.0, tip_rad: 0.0, elastic: 1.0, pose_handle: false }
     }
 }
 
@@ -274,6 +277,12 @@ pub struct Opt {
     /// squeeze past `el_squeeze` (soft within, stiff beyond; 0: no limit that way).
     pub el_limit: f32,
     pub el_squeeze: f32,
+    /// The handle-driven pose (cells_pose.rs): the pose wave positions only each creature's
+    /// handle cells (its spine) and an as-rigid-as-possible solve places the rest; off (the
+    /// default): the whole design bent as one ribbon, exactly as before.
+    pub pose_solve: bool,
+    /// Bumped when a type's pose_handle flag changes: creatures pick their handles again.
+    pub pose_version: u32,
 }
 
 impl Default for Opt {
@@ -323,6 +332,8 @@ impl Default for Opt {
             el_area: ELASTIC_AREA,
             el_limit: ELASTIC_LIMIT,
             el_squeeze: ELASTIC_SQUEEZE,
+            pose_solve: false,
+            pose_version: 0,
         }
     }
 }
@@ -686,6 +697,9 @@ pub struct Body {
     /// servo's own copy is what runs).
     pub lead: f32,
     pub lead_axis: Vector2,
+    /// The handle-driven pose's state (Opt::pose_solve; cells_pose.rs): the handles, the
+    /// solver, the warm start. A new body (a split's part, a cell removed) starts without.
+    pub pose_st: crate::cells_pose::PoseState,
 }
 
 pub struct Cells {
@@ -1350,6 +1364,10 @@ impl Body {
         } else if pose {
             self.pose_wave(opt);
         }
+        if !pose || !opt.pose_solve {
+            // The handle-driven pose's warm start is good only while it runs unbroken.
+            self.pose_st.warm = false;
+        }
         if !self.joints.is_empty() {
             self.joint_rest(pose);
         }
@@ -2012,7 +2030,10 @@ impl Body {
 
     /// WAVE_POSE: the design bent along a travelling curvature wave; sets the links' design
     /// lengths and anchors and the cells' radius muscles (the stretch along the centreline).
-    fn pose_wave(&mut self, _opt: &Opt) {
+    fn pose_wave(&mut self, opt: &Opt) {
+        if opt.pose_solve && self.pose_wave_solved(opt) {
+            return;
+        }
         const G: usize = 64;
         let n = self.n;
         let wv = self.wave;
@@ -2110,6 +2131,19 @@ impl Body {
             let dang = wrap(bd.y.atan2(bd.x) - rd.y.atan2(rd.x));
             l.ai_design = l.ai_base + dang - turn[i];
             l.aj_design = l.aj_base + dang - turn[j];
+        }
+    }
+
+    /// A wave stopped: the muscles at 1 and the links' design lengths and angles as built
+    /// (set_wave(WAVE_OFF)).
+    pub fn design_pose_back(&mut self) {
+        for i in 0..self.n {
+            self.muscle[i] = 1.0;
+        }
+        for l in self.links.iter_mut() {
+            l.d_design = l.d_base;
+            l.ai_design = l.ai_base;
+            l.aj_design = l.aj_base;
         }
     }
 
@@ -3539,6 +3573,15 @@ impl Cells {
             }
             h ^= b.links.len() as u64;
             h = h.wrapping_mul(0x100000001b3);
+            // The handle-driven pose's warm start shapes later frames (only while it runs).
+            if b.pose_st.warm {
+                for i in 0..b.pose_st.pose.len() {
+                    for v in [b.pose_st.pose[i].x, b.pose_st.pose[i].y, b.pose_st.turns[i]] {
+                        h ^= v.to_bits() as u64;
+                        h = h.wrapping_mul(0x100000001b3);
+                    }
+                }
+            }
         }
         h as i64
     }
@@ -3820,7 +3863,7 @@ pub fn worm_design(long: i32, wide: i32, r: f32, at: Vector2) -> Vec<Vector2> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn add(cl: &mut Cells, c: Vec<Vector2>, r: f32) -> usize {

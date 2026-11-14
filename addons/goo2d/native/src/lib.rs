@@ -16,6 +16,7 @@
 
 mod cells;
 mod cells_draw;
+mod cells_pose;
 mod cells_lab;
 mod colony;
 mod consts;
@@ -1990,7 +1991,8 @@ impl GooCells {
     /// link_tol, max_speed, density, ease_time, ease_from; elastic bodies (cells.rs'
     /// `Opt::elastic`): elastic (0..1, 0 off), elastic_soft (every stiffness × this at
     /// elasticity 1), elastic_damping (1/s), elastic_area (the share of the area kept),
-    /// elastic_stretch_limit and elastic_squeeze_limit (the links' strain bounds).
+    /// elastic_stretch_limit and elastic_squeeze_limit (the links' strain bounds);
+    /// pose_solve (bool: the handle-driven pose, cells_pose.rs; off: the ribbon).
     #[func]
     fn set_options(&mut self, options: VarDictionary) {
         let mut colliders = false;
@@ -2056,6 +2058,7 @@ impl GooCells {
                 "elastic_area" => o.el_area = (x as f32).clamp(0.0, 1.0),
                 "elastic_stretch_limit" => o.el_limit = (x as f32).max(0.0),
                 "elastic_squeeze_limit" => o.el_squeeze = (x as f32).clamp(0.0, 0.9),
+                "pose_solve" => o.pose_solve = x != 0.0,
                 _ => godot_error!("GooCells: unknown option {}", name),
             }
         }
@@ -2082,11 +2085,13 @@ impl GooCells {
     /// thrust (a thruster's maximum, px/s² of its cell's own mass: a level × this × the mass
     /// is its force; NaN, the default, takes the level as a raw force; 0 never), tip_len and
     /// tip_rad (a tip's distance out along the cell's facing and its radius, × the cell's
-    /// radius; 0: none), elastic (the world's elasticity × this for its cells).
+    /// radius; 0: none), elastic (the world's elasticity × this for its cells), pose_handle
+    /// (bool: its cells are the creature's spine for the handle-driven pose).
     #[func]
     fn set_type(&mut self, t: i64, params: VarDictionary) {
         let tp = &mut self.c.opt.types[(t as usize).min(cells::TYPES - 1)];
         let mut version = false;
+        let mut handles = false;
         for (key, value) in params.iter_shared() {
             let x = cells_num(&value);
             match key.to_string().as_str() {
@@ -2111,8 +2116,15 @@ impl GooCells {
                 "tip_len" => tp.tip_len = (x as f32).max(0.0),
                 "tip_rad" => tp.tip_rad = (x as f32).max(0.0),
                 "elastic" => tp.elastic = (x as f32).max(0.0),
+                "pose_handle" => {
+                    handles |= tp.pose_handle != (x != 0.0);
+                    tp.pose_handle = x != 0.0;
+                }
                 other => godot_error!("GooCells: unknown type parameter {}", other),
             }
+        }
+        if handles {
+            self.c.opt.pose_version = self.c.opt.pose_version.wrapping_add(1);
         }
         if version {
             self.c.opt.types_version = self.c.opt.types_version.wrapping_add(1) % (u32::MAX - 1);
@@ -2821,15 +2833,45 @@ impl GooCells {
             age: if b.wave.mode == mode as u8 { b.wave.age } else { 0.0 },
         };
         if mode as u8 == cells::WAVE_OFF {
-            for i in 0..b.n {
-                b.muscle[i] = 1.0;
-            }
-            for l in b.links.iter_mut() {
-                l.d_design = l.d_base;
-                l.ai_design = l.ai_base;
-                l.aj_design = l.aj_base;
-            }
+            b.design_pose_back();
         }
+    }
+
+    /// The length a pose wave's wavelength is measured in for creature c about `axis` (design
+    /// frame): with the handle-driven pose on (pose_solve), its handles' extent along the
+    /// axis edge to edge; otherwise, or with no handles, every cell's (the design's length).
+    #[func]
+    fn pose_length(&self, c: i64, axis: Vector2) -> f64 {
+        self.c.bodies[c as usize].pose_length(&self.c.opt, axis) as f64
+    }
+
+    /// The handle cells (indices now) the handle-driven pose would use for creature c about
+    /// `axis`, picked now from its cells and the types' pose_handle flags whether the option
+    /// is on or not (cells_pose.rs: flagged cells, else the centreline, else the chain).
+    #[func]
+    fn pose_handles(&self, c: i64, axis: Vector2) -> PackedInt32Array {
+        let (h, _) = self.c.bodies[c as usize].pick_pose_handles(&self.c.opt, axis);
+        PackedInt32Array::from(h.iter().map(|&i| i as i32).collect::<Vec<_>>().as_slice())
+    }
+
+    /// The handle-driven pose's state of creature c: handles (PackedInt32Array, as last
+    /// picked), source (0 none, 1 flagged cells, 2 the centreline, 3 the chain), built (the
+    /// solver), warm (posed by it last frame), solves, fallbacks (frames the ribbon posed it
+    /// with the option on), picks (times its handles were picked), error (why the solver
+    /// could not be built, "" when it could).
+    #[func]
+    fn pose_info(&self, c: i64) -> VarDictionary {
+        let st = &self.c.bodies[c as usize].pose_st;
+        let mut d = VarDictionary::new();
+        put(&mut d, "handles", PackedInt32Array::from(st.handles.iter().map(|&i| i as i32).collect::<Vec<_>>().as_slice()));
+        put(&mut d, "source", st.source as i64);
+        put(&mut d, "built", st.solver.is_some());
+        put(&mut d, "warm", st.warm);
+        put(&mut d, "solves", st.solves as i64);
+        put(&mut d, "fallbacks", st.fallbacks as i64);
+        put(&mut d, "picks", st.picks as i64);
+        put(&mut d, "error", st.error.map(|e| format!("{:?}", e)).unwrap_or_default());
+        d
     }
 
     /// Radius muscles per cell (1 at rest), kept until set again.
