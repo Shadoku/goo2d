@@ -27,6 +27,7 @@ mod kernel;
 mod links;
 mod obstacles;
 mod pinch;
+mod pose_solve;
 mod skin;
 mod statics;
 
