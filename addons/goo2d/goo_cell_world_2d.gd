@@ -106,6 +106,16 @@ const GRAB_REACH: float = 3.0
 	set(value):
 		elastic_damping = value
 		_send_options()
+## The handle-driven pose (docs/cells.md, "The handle-driven pose"): the pose wave
+## (GooCellCreature.set_pose_wave()) positions only each creature's handle cells (its
+## spine: cells of a type with GooCellType.pose_handle, else an automatic centreline) and an
+## as-rigid-as-possible solve places every other cell, so wings, fins and spikes keep their
+## shape and size instead of bending with the body as one ribbon. Off (the default): the
+## ribbon, exactly as before. Measure a wave's wavelength in GooCellCreature.pose_length().
+@export var pose_solve: bool = false:
+	set(value):
+		pose_solve = value
+		_send_options()
 ## Which of a creature's own cells collide.
 @export var self_collision: SelfCollision = SelfCollision.FAR:
 	set(value):
@@ -346,6 +356,7 @@ func _send_options() -> void:
 		"current": current, "break_force": break_force if break_force > 0.0 else INF,
 		"break_excess": break_leaves_out_own_share,
 		"elastic": elasticity, "elastic_damping": elastic_damping,
+		"pose_solve": pose_solve,
 	}
 	if drag_linear_tangent >= 0.0:
 		options["drag_linear_tangent"] = drag_linear_tangent

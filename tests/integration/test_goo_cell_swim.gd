@@ -33,8 +33,9 @@ func _steps(w: GooCellWorld2D, frames: int) -> void:
 ## [px/s along its path, rad/s, px/s along its first heading] of a 24 × 5 worm over 8 s
 ## after 2 s: a pose wave of `slope` (and `bias`
 ## 1/px) at 1 Hz, a body length long, and a swim drive of `acc` px/s².
-func _swim(slope: float, acc: float, bias: float = 0.0, spawn_turn: float = 0.0) -> Array:
+func _swim(slope: float, acc: float, bias: float = 0.0, spawn_turn: float = 0.0, solve: bool = false) -> Array:
 	var w := _world()
+	w.pose_solve = solve
 	var d := GooCellDesign.hex_worm(24, 5, R)
 	var cr := w.spawn(d, Transform2D(spawn_turn, Vector2.ZERO))
 	if slope > 0.0 or bias != 0.0:
@@ -87,20 +88,28 @@ func test_the_swim_drive_carries_a_worm_with_a_toned_down_stroke() -> void:
 	assert_lt(back[2], -0.9 * force[0])
 
 func test_a_bent_body_steers_itself() -> void:
+	_bent_body_steers(false)
+
+## The same with the handle-driven pose (GooCellWorld2D.pose_solve; the worm's automatic
+## centreline its spine).
+func test_a_bent_body_steers_itself_with_the_pose_solve() -> void:
+	_bent_body_steers(true)
+
+func _bent_body_steers(solve: bool) -> void:
 	var lines := PackedStringArray()
 	var last := 0.0
 	for bias: float in [0.0005, 0.001, 0.002, 0.004]:
-		var both := _swim(SLOPE, SWIM, bias)
-		var force := _swim(0.0, SWIM, bias)
+		var both := _swim(SLOPE, SWIM, bias, 0.0, solve)
+		var force := _swim(0.0, SWIM, bias, 0.0, solve)
 		lines.append("bias %.4f /px: %.3f rad/s at %.0f px/s (the drive alone, the body bent %.3f rad/s at %.0f px/s; v × bias %.3f)" % [bias, both[1], both[0], force[1], force[0], both[0] * bias])
 		assert_gt(both[1], last, "more bias, a faster turn")
 		assert_gt(force[1], 0.5 * both[1], "the drive follows the bend")
 		last = both[1]
-	var mirrored := _swim(SLOPE, SWIM, -0.002)
-	print("    a worm swimming by the drive and the toned-down stroke, steered by the pose wave's curvature bias alone (no twist):\n      %s\n      bias −0.002: %.3f rad/s" % ["\n      ".join(lines), mirrored[1]])
+	var mirrored := _swim(SLOPE, SWIM, -0.002, 0.0, solve)
+	print("    a worm swimming by the drive and the toned-down stroke, steered by the pose wave's curvature bias alone (no twist)%s:\n      %s\n      bias −0.002: %.3f rad/s" % [", the handle-driven pose" if solve else "", "\n      ".join(lines), mirrored[1]])
 	assert_lt(mirrored[1], 0.0, "a negative bias turns it counter-clockwise")
 	# Turned at spawn: the drive goes its way.
-	var turned := _swim(0.0, SWIM, 0.0, PI / 2)
+	var turned := _swim(0.0, SWIM, 0.0, PI / 2, solve)
 	assert_gt(turned[2], 0.98 * turned[0])
 
 func test_swim_weights_share_the_drive() -> void:

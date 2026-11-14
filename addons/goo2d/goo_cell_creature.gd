@@ -253,9 +253,12 @@ func set_muscles(scales: PackedFloat32Array) -> void:
 
 ## The pose wave (the swimmer's muscle): the design bent along a curvature wave running
 ## from head to tail. `slope` the wave's slope (amplitude × wavenumber; 1 is a strong
-## stroke), `wavelength` px (a body length swims well), `frequency` Hz, `bias` a constant
-## curvature (1/px; positive turns it clockwise), `envelope` how much the amplitude grows
-## from head to tail (0..1). Set it every frame to steer; the phase carries on.
+## stroke), `wavelength` px (a body length swims well: wavelength × pose_length()),
+## `frequency` Hz, `bias` a constant curvature (1/px; positive turns it clockwise),
+## `envelope` how much the amplitude grows from head to tail (0..1). Set it every frame to
+## steer; the phase carries on. With the world's pose_solve on the wave bends the
+## creature's spine (its handle cells) and the rest follows rigidly (docs/cells.md, "The
+## handle-driven pose").
 func set_pose_wave(slope: float, wavelength: float, frequency: float, bias: float = 0.0, envelope: float = 0.6) -> void:
 	_c().set_wave(id, GooCells.WAVE_POSE, slope, wavelength, frequency, axis, 0.0, bias, envelope)
 
@@ -328,6 +331,27 @@ func set_spin_servo(target_spin: float, max_angular_acceleration: float, max_tip
 ## Kept until set again, across set_spin_servo() and stop_spin_servo().
 func set_turn_lead(lead: float) -> void:
 	_c().set_spin_lead(id, lead, axis)
+
+## The length its pose wave's wavelength is measured in (px): with the world's pose_solve on,
+## its spine's (the handle cells') extent along its axis, edge to edge; otherwise the
+## design's length (its cells' extent along its axis, edge to edge, as at its spawn:
+## GooCellDesign.length() for a creature spawned unscaled). Pass `wavelength × pose_length()`
+## to set_pose_wave() to scale a wave by the spine.
+func pose_length() -> float:
+	return _c().pose_length(id, axis)
+
+## The cell indices the handle-driven pose uses as its spine (picked now from its cells, the
+## types' pose_handle flags and its axis, whether pose_solve is on or not; empty: none, the
+## ribbon poses it).
+func pose_handles() -> PackedInt32Array:
+	return _c().pose_handles(id, axis)
+
+## The handle-driven pose's state (GooCells.pose_info()): handles (as last picked), source
+## (0 none, 1 flagged cells, 2 the centreline, 3 the chain), built, warm (posed by the solve
+## last frame), solves, fallbacks (frames the ribbon posed it with pose_solve on), picks,
+## error.
+func pose_info() -> Dictionary:
+	return _c().pose_info(id)
 
 ## The creature's own elasticity in place of the world's (0..1; below 0: the world's
 ## again). See GooCellWorld2D.elasticity.

@@ -15,6 +15,8 @@ extends SceneTree
 ## --twist=A  an angular acceleration about the centre of mass (rad/s²), no net force
 ## --station  in a 60 px/s current (--current=60), a controller holding the start point
 ## --crowd=N  N swimmers at once, timed
+## --pose-solve  the handle-driven pose (docs/cells.md): the pose wave bends the automatic
+##   centreline and the rest follows; the wavelength measured in its pose_length()
 ## Prints one SWIM line per run.
 
 const D := preload("res://tools/cells_design.gd")
@@ -70,12 +72,15 @@ func make_world() -> GooCells:
 	if opts.has("stretch-hz"): options["stretch_hz"] = float(o("stretch-hz", 20.0))
 	if opts.has("shape-k"): options["shape_k"] = float(o("shape-k", 0.3))
 	if opts.has("self"): options["self_mode"] = int(o("self", 0))
+	if opts.has("pose-solve"): options["pose_solve"] = bool(o("pose-solve", false))
 	cl.set_options(options)
 	return cl
 
 func start_gait(cl: GooCells, c: int, d: Array[Vector3], freq: float, axis: Vector2) -> void:
 	var length := D.length_x(d)
 	var gait := String(o("gait", "pose"))
+	if bool(o("pose-solve", false)):
+		length = cl.pose_length(c, axis)
 	var wavelength := length / float(o("waves", 1.0))
 	var half := D.width_y(d) * 0.5
 	match gait:

@@ -195,11 +195,24 @@ func _fit_angle(cr: GooCellCreature, design: GooCellDesign, group: int) -> float
 	return atan2(ss, sc)
 
 func test_shape_regions_and_joints() -> void:
+	_shape_regions_and_joints(false, false)
+
+## The joints on top of the pose wave (a straight one, slope 0, so the segments' angles are
+## the joints' alone): with the ribbon and with the handle-driven pose (pose_solve).
+func test_joints_under_the_pose_wave_and_the_pose_solve() -> void:
+	for solve: bool in [false, true]:
+		print("    %s:" % ("the handle-driven pose" if solve else "the ribbon"))
+		_shape_regions_and_joints(true, solve)
+
+func _shape_regions_and_joints(pose_wave: bool, solve: bool) -> void:
 	var w := _world()
+	w.pose_solve = solve
 	var body := GooCellType.new()
 	body.body = GooCellType.Body.SHAPE
 	var d := _segmented_worm(3, body)
 	var cr := w.spawn(d, Transform2D(0, Vector2.ZERO))
+	if pose_wave:
+		cr.set_pose_wave(0.0, d.length(), 1.0)
 	_steps(w, 1)
 	var regions := {}
 	for r: int in w.cells().regions(cr.id):
@@ -226,6 +239,10 @@ func test_shape_regions_and_joints() -> void:
 	cr.set_joint_angle(body, 1, body, 2, 0.0)
 	_steps(w, 120)
 	assert_almost_eq(_fit_angle(cr, d, 1) - _fit_angle(cr, d, 0), 0.0, 0.05)
+	if solve:
+		assert_gt(cr.pose_info()["solves"], 0, "the solve posed it")
+		assert_eq(cr.pose_info()["fallbacks"], 0)
+	w.queue_free()
 
 func test_link_bodies_bend_every_link() -> void:
 	var w := _world()

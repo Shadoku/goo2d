@@ -135,7 +135,7 @@ serial, and a replay is identical (tested).
   or FLAT), `skin_material`, `skin_preset` (GooCellLook's), `draw_borders` (off; lines between
   types), `border_color`, `border_width`, `default_type`; `current_skin_material()`,
   `look_table()`, `cell_table()` (the goo skin's, "Drawing"); `elasticity` (0 off) and
-  `elastic_damping` ("Elastic bodies").
+  `elastic_damping` ("Elastic bodies"); `pose_solve` (off; "The handle-driven pose").
 
 `GooCellCreature` (a handle; creatures are not nodes): `is_alive()`, `center()`,
 `velocity()`, `turn()`, `heading()`, `spin()`, `mass()`, `cell_count()`, `positions()`,
@@ -146,7 +146,8 @@ serial, and a replay is identical (tested).
 `add_cell_forces_once(forces)`, `set_damping(linear, angular)`, `set_muscles(scales)`, `set_pose_wave(slope, wavelength,
 frequency, bias, envelope)`, `stop_wave()`, `set_joint_angle(type_a, group_a, type_b,
 group_b, angle)`, `set_water(velocities)`, `set_current(v)`, `translate()`,
-`set_velocity()`, `add_cell()`, `remove_cell(uid)`; the spin servo: `set_spin_servo(target_spin,
+`set_velocity()`, `add_cell()`, `remove_cell(uid)`; `pose_length()` (what a wave's wavelength
+is measured in), `pose_handles()`, `pose_info()` ("The handle-driven pose"); the spin servo: `set_spin_servo(target_spin,
 max_angular_acceleration, max_tip_speed = INF, contact_yield = 1.0)`, `set_spin_target(target_spin)`
 (cheap, every frame), `stop_spin_servo()`, `spin_servo()` (its state: the spin measured, the
 target after the tip cap, the yield's scale and contact share, the lead and the lead used),
@@ -599,6 +600,74 @@ differently). 30 servoed worms swimming: 3.61 ms; elastic at 0.65 and head-led a
 
 **Recommended**: the fluid game's swimmers `elasticity` 0.6-0.7 (0.65 measured above); a blob
 meant to look squishy its own 0.8; a jelly 1; a spine row's type `elasticity` 0.5, armour 0.
+
+### The handle-driven pose
+
+The pose wave bends the whole design as one ribbon: a cell at offset v across the axis has its
+links scaled by (1 − v × curvature), and its radius too (clamped to 0.6..1.5). A worm hardly
+notices; fins, wings and spikes far from the axis strain 35-60 % and their cells shrink and
+inflate every stroke. The world's **`pose_solve`** (off by default; off, the step is bit for bit
+what it was) makes the wave position only the creature's **spine**, its handle cells, and places
+every other cell by an as-rigid-as-possible solve (`native/src/pose_solve.rs`, wired in by
+`native/src/cells_pose.rs`), so a protrusion turns with the body where it is attached and keeps
+its shape and size. What the wave writes is unchanged in kind (the goal positions and turns
+that shape matching fits, the links' design lengths and angles, the radius muscles), so the swim
+drive, the lean, head-led turning, joints and elasticity work as before.
+
+- **The spine.** A type's **`pose_handle`** flag marks its cells as the spine. With fewer than
+  two flagged cells, or with them spanning under a third of the creature's length (centres,
+  along its axis), the spine is automatic: the cells within their own diameter of the axis
+  through the design centroid (three rows of a 5-wide hex worm), else the single-file chain
+  nearest that axis (one cell per mean diameter along it). A creature with no two such cells at
+  different places along the axis (one cell, two side by side across it) is posed by the ribbon.
+  Picked again whenever its topology changes (a cell destroyed or added, a split, a join) or a
+  type's flag does; a split's part picks from its own cells about its own design centroid, along
+  the axis it inherits.
+- **The wave over the spine.** The centreline's span and envelope run over the spine's extent,
+  not the whole design's (a fin swept past the tail no longer moves the envelope's peak onto
+  itself); the phase is k·u from the design centroid, as the swim drive's pulse reads it. Each
+  spine cell sits where the ribbon would put it (the centreline point plus its own offset along
+  the normal). The curvature clamp is by the half width of the body attached sideways to the
+  spine: a cell counts at the station of its nearest spine cell through the links, and only if
+  it lies at least as far across the axis from it as along; so a thick body keeps its limit and a
+  fin swept back sets none (one swept out at 60° counts until it turns back).
+- **The wavelength.** `GooCellCreature.pose_length()` is the spine's extent edge to edge with
+  the option on (the design's length otherwise): pass `wavelength × pose_length()` to
+  `set_pose_wave()` to scale a wave by the spine rather than by fins that trail past the tail.
+- **The solve.** Fixed handles; the free cells' Laplacian factored once per topology (banded);
+  each frame the handles' turns spread harmonically, then 3 local/global iterations
+  warm-started from the last frame's pose (2 measured nearly the same). A cell's radius muscle
+  is the mean of its links' posed over design lengths, clamped as before: about 1 on a part that
+  moves rigidly, what the ribbon gave on a thick body's inner and outer sides.
+- **State.** Per creature: the spine and clamp, the solver, the warm start (in `state_hash()`).
+  The warm start goes back to the design when the wave starts or stops, when the spine is picked
+  again, and in a split's parts or a creature that lost a cell; a merge is a topology change of
+  the creature merged into, so its pose starts again from the merged design. When the solver
+  cannot be built (a free cell no link joins to the spine) the ribbon poses it that frame
+  (`pose_info()["fallbacks"]`). The threaded step stays bit-identical to the serial one.
+
+Measured (cargo tests in `cells_pose.rs`, 7 px cells, the game's stiffnesses, elasticity 0.65,
+a swim drive; a burst: slope 0.55, 1.7 Hz, wavelength 1.4 × the pose length, envelope 1, two
+cycles; protrusion cells more than 2 links from the spine):
+
+| design | goal strain, protrusions | radius, protrusions | live strain, protrusions | goal strain, body |
+|---|---|---|---|---|
+| the fluid game's `thruster_ship_edit` (85 cells, a bone core, two fins 2 × 15 swept past the tail): ribbon → solve | 46.6 % → 0.5 % | 0.60..1.47 → 1.00 | 58.5 % → 15.9 % | 26.4 % → 26.8 % |
+| the game's manta (31 cells, a 4-cell spine of 10 px cells, wings tapering to 5 px) | 34.1 % → 3.7 % | 0.60..1.46 → 0.98..1.02 | 39.2 % → 4.9 % | 18.1 % → 8.8 % |
+| a plain 10 × 5 hex ship (no flag: the automatic centreline), whole body | 38.2 % → 23.9 % | 0.61..1.39 → 0.86..1.12 | | |
+
+The ship's body strains a hair more because its bone core reaches the body's edge (cells the
+wave places as the ribbon would) and now takes the envelope's full amplitude. A 24 × 5 worm
+(middle row flagged) swims at 101-104 % of the ribbon's speed at slopes 0.3-0.6 (alone, or with
+the drive) and 110 % at slope 1. The cost: about 20 µs a frame for a 150-cell creature (30 × 150
+cells: +0.5-0.7 ms a frame serial, +0.15-0.2 ms on 4 threads). `tools/cells_swim.gd --pose-solve`
+swims a design with it.
+
+**Limits.** The spine follows the wave exactly (no soft handles); a creature whose spine is
+cut off from part of its body by a break is posed by the ribbon until the split; the clamp
+counts a protrusion leaving the body more across than along the axis; a solve each frame of
+3 iterations converges a protrusion's own small turn against its root slowly (a degree or so
+behind the converged pose, a few px at a long fin's tip).
 
 ### Head-led turning
 
@@ -1280,6 +1349,9 @@ each other more, which a game would pay for any interaction.
    exploration); blobs swim by thrust, not undulation. The swim drive (`set_swim()`) sidesteps
    all of this: it is as fast at any stroke, and the stroke can stay a gentle show of it.
 9. **Commanded curls are clamped**: the pose wave never squeezes a side below half its length.
+   As one ribbon it bends fins and wings with the body, straining them 35-60 % and swinging
+   their cells' size 0.6-1.5 at a burst; `pose_solve` keeps them rigid ("The handle-driven
+   pose").
 10. **The skin may cover a wall by up to about 0.43 radius** at a concave corner.
 11. **A type edited after first use** needs `update_type()`; the 17th type is refused.
 12. **Shape-matched regions bend only at joints**: a long region is stiff; give it

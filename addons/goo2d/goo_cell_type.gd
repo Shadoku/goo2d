@@ -70,6 +70,11 @@ enum Body {
 ## The join layers it joins at a retopology: two cells may join when each one's mask
 ## holds a layer of the other.
 @export_flags("1", "2", "3", "4", "5", "6", "7", "8") var join_mask: int = 255
+## Its cells are the creature's spine for the handle-driven pose (GooCellWorld2D.pose_solve,
+## docs/cells.md): the pose wave positions them and the rest follows. A creature with fewer
+## than two such cells, or with them bunched in under a third of its length, gets an
+## automatic centreline instead.
+@export var pose_handle: bool = false
 ## Its cells' share of the swim drive (GooCellCreature.set_swim()): × their mass; 1 a
 ## plain cell, more a fin or spine that pushes harder, 0 none. The creature's whole push
 ## stays what set_swim() asks; the weights only share it out.
@@ -103,7 +108,7 @@ func kernel_params() -> Dictionary:
 		"pad": contact_pad * GooTuning.unit, "body": modes[body], "collide": collides,
 		"walls": collides_walls, "color": color, "swim": swim_weight,
 		"thrust": max_thrust * GooTuning.unit, "tip_len": tip_length, "tip_rad": tip_radius if tip_length > 0.0 else 0.0,
-		"elastic": elasticity,
+		"elastic": elasticity, "pose_handle": pose_handle,
 	}
 
 ## The look table's row of this type (goo_honeycomb.gdshader's type_look): wall_strength,

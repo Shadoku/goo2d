@@ -78,9 +78,10 @@ static func bend(cr: GooCellCreature, rest: PackedVector2Array) -> float:
 ## where it began (px), the speed while turning (px/s, swimming), the error 1 s after facing
 ## (rad), lead used, worst strain, the follow-through (the bend the other way at most, rad),
 ## the time after facing until the bend is under 3°].
-func _turn(name: String, angle: float, lead: float, e: float, swim: bool) -> Array:
+func _turn(name: String, angle: float, lead: float, e: float, swim: bool, solve: bool = false) -> Array:
 	var d: GooCellDesign = designs()[name]
 	var w := GooCellWorld2D.new()
+	w.pose_solve = solve
 	w.gravity_scale = 0.0
 	w.draw_skins = false
 	w.elasticity = e
@@ -185,3 +186,21 @@ func test_half_and_quarter_turns_led_by_the_head() -> void:
 	var blob1: Array = got[["blob 37", false, half, Vector2(ELASTIC, 1.0)]]
 	assert_eq(blob1[8], 0.0, "a round blob is not led")
 	assert_almost_eq(blob1[0], blob0[0], 0.02, "and turns as before")
+
+## The swimming worms' turns again with the handle-driven pose (GooCellWorld2D.pose_solve:
+## the gentle pose wave bends their automatic centreline, the rest follows): they face their
+## heading and hold it as with the ribbon, and lead the turn with the head as much.
+func test_swimming_turns_with_the_pose_solve() -> void:
+	var rows: Array[String] = []
+	for name: String in ["worm 24 × 5", "boss worm 24 × 5 (14 px)"]:
+		for angle: float in [PI - 0.001, PI / 2.0]:
+			for lead: float in [0.0, 1.0]:
+				var ribbon := await _turn(name, angle, lead, ELASTIC, true, false)
+				var solved := await _turn(name, angle, lead, ELASTIC, true, true)
+				rows.append("%s %s, lead %.1f: faces in %.2f s with the ribbon, %.2f s with the solve; bent into the turn %.1f° / %.1f°; overshoot %.1f° / %.1f°; 1 s later %.2f° / %.2f° off" % [name, "half" if angle > 2.0 else "quarter", lead, ribbon[0], solved[0], rad_to_deg(ribbon[2]), rad_to_deg(solved[2]), rad_to_deg(ribbon[1]), rad_to_deg(solved[1]), rad_to_deg(ribbon[7]), rad_to_deg(solved[7])])
+				assert_lt(solved[0], 3.0, "%s faces its heading" % name)
+				assert_lt(absf(solved[7]), deg_to_rad(5.0), "%s holds it" % name)
+				assert_lt(solved[0], 1.25 * ribbon[0] + 0.05, "%s turns about as fast" % name)
+				assert_almost_eq(solved[8], ribbon[8], 1e-6, "the same lead used")
+	for r: String in rows:
+		print("    " + r)
